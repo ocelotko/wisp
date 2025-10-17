@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["wisp-core", "wisp-node", "wisp-wallet", "wisp-flame"]
+default-members = ["wisp-wallet"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Jakub Hachlinec"]
+edition = "2021"
+rust-version = "1.84.1"
+repository = "https://github.com/ocelotko/wisp"
+license = "MIT"
+description = "A lightweight, proof-of-work cryptocurrency implemented in Rust"

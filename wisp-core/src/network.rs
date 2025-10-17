@@ -1,0 +1,175 @@
+use crate::{
+    blockchain::Block,
+    sha256::Hash,
+    signatures::PublicKey,
+    transactions::{OutPoint, Transaction, TransactionOutput},
+    MAX_MESSAGE_SIZE,
+};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::io::{Error as IoError, Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum TransactionStatus {
+    Pending,
+    Confirmed { block_hash: Hash, block_index: u64 },
+    Invalid,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WalletTransactionInfo {
+    pub transaction: Transaction,
+    pub status: TransactionStatus,
+    pub block_timestamp: Option<DateTime<Utc>>,
+    pub block_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WalletStateSnapshot {
+    pub transactions: Vec<WalletTransactionInfo>,
+    pub utxos: Vec<(OutPoint, TransactionOutput)>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum Message {
+    // --- Wallet & Transaction Messages ---
+    SubmitTransaction(Transaction),
+    NewTransaction(Transaction),
+    FetchWalletState(PublicKey),
+    WalletState(WalletStateSnapshot),
+    TransactionAcceptedConfirmation,
+    TransactionRejected(Hash, String),
+    FetchTransactionStatus(Hash),
+    TransactionStatus {
+        hash: Hash,
+        status: TransactionStatus,
+    },
+
+    // --- Mining Messages ---
+    FetchTemplate(PublicKey),
+    Template(Block),
+    NewTemplate(Block), // Pushed from node to miner when tip changes
+    ValidateTemplate(Block),
+    TemplateValidity(bool),
+    SubmitTemplate(Block),
+    BlockSubmittedConfirmation,
+    BlockRejected(String),
+
+    // --- Chain & Block Sync Messages ---
+    NewBlock(Block),
+    FetchBlock(u64),
+    FetchBlockByHash(Hash),
+    FetchBlockInfo(u64),
+    BlockInfo(Option<Block>),
+    FetchLatestBlock,
+    LatestBlock(Option<(Block, u64)>),
+    FetchChainSegment(u64),   // Request blocks from a certain index onwards
+    ChainSegment(Vec<Block>), // Response with the requested blocks
+
+    // --- General & Peer Discovery Messages ---
+    Ping,
+    Pong,
+    DiscoverNodes,
+    NodeList(Vec<String>),
+    FetchMempoolInfo,
+    MempoolInfo(usize),
+}
+
+impl Message {
+    /// Serializes the message into a byte vector using bincode.
+    pub fn encode(&self) -> Result<Vec<u8>, IoError> {
+        bincode::serialize(self).map_err(|e| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to encode message with bincode: {}", e),
+            )
+        })
+    }
+
+    /// Deserializes a byte slice into a `Message`.
+    pub fn decode(data: &[u8]) -> Result<Self, IoError> {
+        bincode::deserialize(data).map_err(|e| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to decode message with bincode: {}", e),
+            )
+        })
+    }
+
+    /// Sends the message over a synchronous stream, prepending its length.
+    pub fn send(&self, stream: &mut impl Write) -> Result<(), IoError> {
+        let bytes = self
+            .encode()
+            .map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))?;
+        let len = bytes.len() as u64;
+        stream.write_all(&len.to_be_bytes())?;
+        stream.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Receives a message from a synchronous stream, first reading the length.
+    pub fn receive(stream: &mut impl Read) -> Result<Self, IoError> {
+        let mut len_bytes = [0u8; 8];
+        stream.read_exact(&mut len_bytes)?;
+        let len = u64::from_be_bytes(len_bytes) as usize;
+
+        if len > MAX_MESSAGE_SIZE {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Received message too large: {} bytes, max is {} bytes",
+                    len, MAX_MESSAGE_SIZE
+                ),
+            ));
+        }
+
+        let mut data = vec![0u8; len];
+        stream.read_exact(&mut data)?;
+
+        Self::decode(&data).map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))
+    }
+
+    /// Sends the message over an asynchronous stream, prepending its length.
+    pub async fn send_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> Result<(), IoError> {
+        let bytes = self
+            .encode()
+            .map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))?;
+        let len = bytes.len() as u64;
+        stream.write_all(&len.to_be_bytes()).await?;
+        stream.write_all(&bytes).await?;
+        Ok(())
+    }
+
+    /// Receives a message from an asynchronous stream, first reading the length.
+    pub async fn receive_async(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, IoError> {
+        let mut len_bytes = [0u8; 8];
+        stream.read_exact(&mut len_bytes).await?;
+        let len = u64::from_be_bytes(len_bytes) as usize;
+
+        if len > MAX_MESSAGE_SIZE {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Received message too large: {} bytes, max is {} bytes",
+                    len, MAX_MESSAGE_SIZE
+                ),
+            ));
+        }
+
+        let mut data = Vec::with_capacity(len);
+        let mut stream_reader = stream.take(len as u64);
+        stream_reader.read_to_end(&mut data).await?;
+
+        if data.len() != len {
+            return Err(IoError::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Failed to read the full message body",
+            ));
+        }
+
+        Self::decode(&data)
+    }
+}

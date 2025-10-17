@@ -1,0 +1,23 @@
+[package]
+name = "wisp-flame"
+description = "A standalone miner for the Wisp blockchain, connecting to a node to mine blocks."
+include = ["src/**/*", "README.md"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.98"
+wisp-core = { path = "../wisp-core" }
+clap = { version = "4.5.37", features = ["derive"] }
+env_logger = "0.11.8"
+flume = "0.11.1"
+hex = "0.4.3"
+log = "0.4.27"
+tokio = { version = "1.44.2", features = ["full"] }
+k256 = { version = "0.13.4", features = ["serde", "pem"] }
+chrono = "0.4.41"
+num_cpus = "1.17.0"
