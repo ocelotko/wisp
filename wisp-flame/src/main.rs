@@ -16,11 +16,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
 use wisp_core::network::Message;
-use wisp_core::transactions::Transaction;
-use wisp_core::utils::MerkleRoot;
 use wisp_core::{
-    blockchain::Block, currency::Amount, pow::mine_block_parallel, signatures::PublicKey,
-    utils::calculate_block_reward, MAX_BLOCK_FUTURE_TIMESTAMP,
+    blockchain::Block, pow::mine_block_parallel, signatures::PublicKey, MAX_BLOCK_FUTURE_TIMESTAMP,
 };
 
 #[derive(Parser, Debug)]
@@ -174,42 +171,6 @@ impl Miner {
                     }
 
                     let mut block_to_mine = template_block;
-                    // Recalculate fees and update coinbase transaction value
-                    // This is a simplified fee calculation for the miner. It assumes the node
-                    // has provided valid transactions in the template.
-                    let mut total_fees = Amount::zero();
-                    for tx in block_to_mine.transactions.iter().skip(1) {
-                        // Simplified fee calculation logic for the miner.
-                        // We can't use blockchain.calculate_transaction_fee because the miner doesn't have the full state.
-                        // We have to trust the node sent valid transactions.
-                        // A more robust solution would be for the node to provide fee data.
-                        // For now, we assume the template is correct and we just need to update the coinbase.
-                        // This part is tricky without full UTXO access.
-                        // A better approach is to have the node provide the total fees.
-                        // Let's assume for now the template from the node is mostly correct and we just need to refresh it.
-                        // The key is to get a fresh coinbase if the template changes.
-                    }
-
-                    if let Some(coinbase_tx) = block_to_mine.transactions.get_mut(0) {
-                        if coinbase_tx.is_coinbase() {
-                            if let Some(coinbase_output) = coinbase_tx.outputs.get_mut(0) {
-                                let block_reward = calculate_block_reward(block_to_mine.index);
-                                // In a real-world scenario, the node would provide total_fees.
-                                // Since it doesn't, we'll just use the block_reward. This is a simplification.
-                                // The core issue is staleness, and getting a new template from the node solves that.
-                                // The node *does* calculate fees, so the template is correct on arrival.
-                                // The main thing is to use the *new* template's data.
-                            }
-                        }
-                    }
-
-                    // After potentially modifying transactions (like the coinbase), we MUST recalculate the Merkle root.
-                    if let Ok(merkle_root) = MerkleRoot::calculate(&block_to_mine.transactions) {
-                        block_to_mine.merkle_root = merkle_root;
-                    } else {
-                        error!("Failed to recalculate Merkle root for new template. Skipping mining cycle.");
-                        continue;
-                    }
                     // CRITICAL: Update the timestamp before each mining cycle.
                     block_to_mine.timestamp = Utc::now();
 

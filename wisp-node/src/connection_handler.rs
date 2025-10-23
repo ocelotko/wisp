@@ -4,6 +4,7 @@ use log::{debug, error, info, warn};
 use std::time::Duration;
 use std::{io::ErrorKind, sync::Arc};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use uuid::Uuid;
 use wisp_core::{
     blockchain::{AddBlockResult, Block},
     currency::Amount,
@@ -461,9 +462,7 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                         });
                         info!("Sent BlockSubmittedConfirmation to miner {}.", addr);
 
-                        // Drop the write lock before awaiting the next message.
                         drop(blockchain);
-                        // Continue to the next loop iteration to be ready for the miner's next message.
                         continue;
                     }
 
@@ -671,8 +670,8 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 coinbase_data.extend_from_slice(&next_block_index.to_le_bytes());
 
                 // Add a unique ID to the coinbase data.
-                // let unique_id = Uuid::new_v4();
-                // coinbase_data.extend_from_slice(unique_id.as_bytes());
+                let unique_id = Uuid::new_v4();
+                coinbase_data.extend_from_slice(unique_id.as_bytes());
 
                 let coinbase_tx_output = TransactionOutput {
                     pubkey: pubkey.clone(),
@@ -692,15 +691,16 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                     Transaction::new(vec![coinbase_input], vec![coinbase_tx_output]),
                 );
 
+                let previous_hash = match blockchain.get_tip_hash()? {
+                    Some(hash) => hash,
+                    None => Hash::zero(),
+                };
+
                 // Construct the block template.
                 // The miner is responsible for recalculating the final Merkle root after
                 // inserting its extra_nonce, but we provide an initial valid one.
                 let merkle_root = MerkleRoot::calculate(&transactions)
                     .context("Failed to calculate Merkle root for template")?;
-                let previous_hash = match blockchain.get_tip_hash()? {
-                    Some(hash) => hash,
-                    None => Hash::zero(),
-                };
 
                 let next_target = blockchain
                     .calculate_next_target()

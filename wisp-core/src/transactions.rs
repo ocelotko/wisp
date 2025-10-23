@@ -74,8 +74,9 @@ impl Hashable for Transaction {
     fn update_hasher(&self, hasher: &mut Sha256) {
         for input in &self.inputs {
             input.outpoint.update_hasher(hasher);
-            // The signature and coinbase_data are explicitly NOT hashed to prevent malleability
-            // and to ensure the txid is stable.
+            if let Some(coinbase) = &input.coinbase_data {
+                hasher.update(coinbase);
+            }
         }
         for output in &self.outputs {
             output.update_hasher(hasher);

@@ -32,7 +32,7 @@ tempfile = "3.22.0"
 tokio = { version = "1.44.1", features = ["full"] }
 tower = { version = "0.5.2", features = ["full"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
-uuid = { version = "1.16.0", features = ["v4"] }
+uuid = { version = "1.13.1", features = ["v4", "serde"] }
 wisp-core = { path = "../wisp-core" }
 
 [dev-dependencies]

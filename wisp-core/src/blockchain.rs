@@ -491,10 +491,10 @@ impl Blockchain {
 
         info!("Database updated atomically for block {}.", new_block_hash);
 
-        // If the DB transaction was successful, commit the in-memory changes.
-        // This is the critical fix: apply the block to the live UTXO set.
+        // If the DB transaction was successful, commit the in-memory changes:
+        // 1. Apply the block to the live UTXO set.
         self.utxo_set.apply_block(&new_block)?;
-
+        // 2. Remove transactions from the mempool that were included in the block.
         self.clear_mempool_of_block_transactions(&new_block);
         self.target = expected_next_target;
 
