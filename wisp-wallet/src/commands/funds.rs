@@ -220,6 +220,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         let tx = &tx_info.transaction;
         let tx_hash = tx.txid()?;
         let is_pending = tx_info.status == TransactionStatus::Pending;
+        let is_coinbase = tx.is_coinbase();
 
         let display_date_time = if is_pending {
             format!("{} (Pending)", Utc::now().format("%d.%m.%Y %H:%M:%S"))
@@ -230,61 +231,57 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .unwrap_or_else(|| "Unknown Date/Time".to_string())
         };
 
-        let mut value_from_us = Amount::zero(); // Value of inputs we owned and are now spending
+        let mut value_from_us = Amount::zero(); // Value of inputs we owned
         let mut value_to_us = Amount::zero(); // Value of new outputs being sent to us (e.g., change)
-        let mut is_our_tx = false; // Did we sign for at least one input?
 
-        // To determine if we are the sender, we must check the ownership of the inputs.
-        // This requires looking up the transactions that created those inputs.
+        // Calculate value from us (inputs we owned)
         for input in &tx.inputs {
-            // We need to find the transaction that this input is spending.
-            // It could be in our current history (`all_txs`).
             if let Some(source_tx_info) = all_txs.get(&input.outpoint.txid) {
                 if let Some(spent_output) = source_tx_info
                     .transaction
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
-                    // If the public key of the spent output matches our wallet's key,
-                    // then we are (at least partially) the sender of this transaction.
                     if spent_output.pubkey == wallet_public_key {
-                        is_our_tx = true; // We own one of the inputs, so we are a sender.
                         value_from_us = (value_from_us + spent_output.value)?;
                     }
                 }
             }
         }
 
-        // Sum up outputs to us and to others
+        // Calculate value to us (outputs we received)
         for output in &tx.outputs {
             if output.pubkey == wallet_public_key {
                 value_to_us = (value_to_us + output.value)?;
             }
         }
 
-        let net_effect = if is_our_tx {
-            // If we are the sender, net effect is `total_out - total_in`
-            (value_to_us.as_smallest_unit() as i64) - (value_from_us.as_smallest_unit() as i64)
-        } else {
-            // If we are not the sender, net effect is just what we received
-            value_to_us.as_smallest_unit() as i64
-        };
+        // If we didn't send or receive anything, it's not our transaction.
+        if value_from_us == Amount::zero() && value_to_us == Amount::zero() {
+            continue;
+        }
 
-        let (tx_type, amount_str, counterparty_info) = if tx.inputs.is_empty() {
+        let net_effect =
+            (value_to_us.as_smallest_unit() as i64) - (value_from_us.as_smallest_unit() as i64);
+
+        let (tx_type, amount_str, counterparty_info) = if is_coinbase {
             (
                 "Coinbase".to_string(),
-                format!("+{} WISP", Amount(net_effect as u64)),
+                format!("+{} WISP", value_to_us),
                 "Coinbase Reward".to_string(),
             )
         } else if net_effect < 0 {
+            // We sent more than we received (net outgoing)
+            let amount_sent = Amount::from_smallest_unit(net_effect.abs() as u64);
             let recipients: HashSet<_> = tx
                 .outputs
                 .iter()
                 .filter(|o| o.pubkey != wallet_public_key)
                 .map(|o| o.pubkey.fingerprint())
                 .collect();
+
             let recipient_info = if recipients.is_empty() {
-                "to (Self)".to_string()
+                "to Self".to_string() // Sent to ourself
             } else if recipients.len() == 1 {
                 format!("to {}", recipients.iter().next().unwrap())
             } else {
@@ -292,14 +289,36 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             };
             (
                 "Sent".to_string(),
-                format!("{} WISP", Amount(net_effect.abs() as u64)),
+                format!("-{} WISP", amount_sent),
                 recipient_info,
             )
         } else {
+            // We received more than we sent (net incoming)
+            let amount_received = Amount::from_smallest_unit(net_effect as u64);
+            let senders: HashSet<_> = tx
+                .inputs
+                .iter()
+                .filter_map(|i| all_txs.get(&i.outpoint.txid))
+                .flat_map(|source_tx_info| {
+                    source_tx_info
+                        .transaction
+                        .outputs
+                        .iter()
+                        .map(|o| o.pubkey.fingerprint())
+                })
+                .collect();
+
+            let sender_info = if senders.is_empty() {
+                "from Unknown".to_string()
+            } else if senders.len() == 1 {
+                format!("from {}", senders.iter().next().unwrap())
+            } else {
+                format!("from ({} senders)", senders.len())
+            };
             (
                 "Received".to_string(),
-                format!("+{} WISP", Amount(net_effect as u64)),
-                "from Unknown".to_string(),
+                format!("+{} WISP", amount_received),
+                sender_info,
             )
         };
 

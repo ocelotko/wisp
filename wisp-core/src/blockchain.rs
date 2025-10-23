@@ -7,7 +7,7 @@ use crate::{
     utxo::UtxoSet,
     U256,
 };
-
+use anyhow::anyhow;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
@@ -172,6 +172,17 @@ impl Blockchain {
 
     pub fn mempool(&self) -> &HashMap<Hash, (DateTime<Utc>, Transaction, Amount)> {
         &self.mempool
+    }
+
+    /// Returns a list of transactions from the mempool, ordered by fee (highest first)
+    /// and then by timestamp (oldest first) for tie-breaking.
+    /// This is suitable for inclusion in a block template.
+    pub fn get_mempool_transactions_for_block(&self) -> Vec<Transaction> {
+        let mut transactions: Vec<(DateTime<Utc>, Transaction, Amount)> =
+            self.mempool.values().cloned().collect();
+        // Sort by fee (descending), then by timestamp (ascending)
+        transactions.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        transactions.into_iter().map(|(_, tx, _)| tx).collect()
     }
 
     pub fn get_target(&self) -> U256 {
@@ -362,8 +373,8 @@ impl Blockchain {
         }
 
         // Pre-validate UTXO application on a temporary copy to ensure it won't fail mid-transaction.
-        let mut temp_utxo_set = self.utxo_set.clone();
-        temp_utxo_set.apply_block(&new_block)?;
+        // This is a pre-check. The actual update happens after the DB transaction succeeds.
+        self.utxo_set.clone().apply_block(&new_block)?;
 
         let tx_count_in_block = new_block.transactions.len() as u64;
         let initial_tx_count = self.get_total_transaction_count_from_db()?;
@@ -391,6 +402,7 @@ impl Blockchain {
                     )?;
 
                     // Store transaction locations and chronological order.
+                    // Process each transaction in the new block to update various indices.
                     let mut current_tx_index = initial_tx_count;
                     for tx in &new_block.transactions {
                         let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
@@ -398,15 +410,57 @@ impl Blockchain {
                             .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
                         // Chronological transaction index.
-                        tx_db.insert(
-                            format!("tx_by_order_{}", current_tx_index).as_bytes(),
-                            tx_hash_bytes.clone(),
-                        )?;
+                        // Update history index for all outputs (including coinbase outputs).
+                        for output in &tx.outputs {
+                            let key = format!("history_{}", output.pubkey.fingerprint());
+                            self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                        }
+
+                        // For non-coinbase transactions:
+                        // - Update history index for inputs (the public key whose UTXO is being spent).
+                        // - Store chronological transaction index.
+                        // - Increment total transaction count.
+                        if !tx.is_coinbase() {
+                            for input in &tx.inputs {
+                                // Find the original output being spent to get its public key for history indexing.
+                                let spent_output = Self::find_output_for_reorg_static(
+                                    tx_db,
+                                    &input.outpoint,
+                                    &[], // No new chain segment when adding a direct extension
+                                )
+                                .map_err(|e| match e {
+                                    sled::transaction::ConflictableTransactionError::Abort(
+                                        reorg_err,
+                                    ) => reorg_err,
+                                    sled::transaction::ConflictableTransactionError::Storage(
+                                        err,
+                                    ) => ReorgError::Anyhow(err.into()),
+                                    _ => ReorgError::Anyhow(anyhow!(
+                                        "Unexpected error type during history indexing"
+                                    )),
+                                })?
+                                .ok_or_else(|| {
+                                    ReorgError::Anyhow(anyhow!(
+                                        "UTXO {} not found for history indexing during block add",
+                                        input.outpoint
+                                    ))
+                                })?;
+
+                                let key = format!("history_{}", spent_output.pubkey.fingerprint());
+                                self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                            }
+                            tx_db.insert(
+                                format!("tx_by_order_{}", current_tx_index).as_bytes(),
+                                tx_hash_bytes.clone(),
+                            )?;
+                            current_tx_index += 1;
+                        }
+
+                        // Store transaction location (for all transactions, including coinbase).
                         tx_db.insert(
                             format!("tx_location_{}", tx_hash).as_bytes(),
                             &new_block.index.to_be_bytes(),
                         )?;
-                        current_tx_index += 1;
                     }
 
                     // Update chain-wide metadata.
@@ -417,7 +471,7 @@ impl Blockchain {
 
                     // Update total supply.
                     let current_supply_bytes = tx_db.get(b"total_supply")?.unwrap_or_default();
-                    let current_supply = u64::from_be_bytes(
+                    let current_supply = u64::from_le_bytes(
                         current_supply_bytes.as_ref().try_into().unwrap_or([0; 8]),
                     );
                     let block_reward = crate::utils::calculate_block_reward(new_block.index);
@@ -425,7 +479,7 @@ impl Blockchain {
                         + block_reward.as_smallest_unit()
                         + total_fees.as_smallest_unit();
 
-                    tx_db.insert(b"total_supply", &new_supply.to_be_bytes())?;
+                    tx_db.insert(b"total_supply", &new_supply.to_le_bytes())?;
 
                     Ok(())
                 },
@@ -438,7 +492,8 @@ impl Blockchain {
         info!("Database updated atomically for block {}.", new_block_hash);
 
         // If the DB transaction was successful, commit the in-memory changes.
-        self.utxo_set = temp_utxo_set;
+        // This is the critical fix: apply the block to the live UTXO set.
+        self.utxo_set.apply_block(&new_block)?;
 
         self.clear_mempool_of_block_transactions(&new_block);
         self.target = expected_next_target;

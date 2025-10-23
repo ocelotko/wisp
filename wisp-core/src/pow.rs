@@ -169,46 +169,22 @@ pub fn mine_block_parallel(
 ) -> Result<(bool, usize)> {
     block.nonce = block.nonce.wrapping_add(start_nonce);
 
-    let header = block.header();
-
-    // 1. Create a hasher and hash all parts of the header that come *before* the nonce.
-    let mut prefix_hasher = sha2::Sha256::new();
-    header.version.update_hasher(&mut prefix_hasher);
-    prefix_hasher.update(&header.timestamp.timestamp().to_be_bytes());
-    prefix_hasher.update(&header.timestamp.timestamp_subsec_nanos().to_be_bytes());
-    header.previous_hash.update_hasher(&mut prefix_hasher);
-    header.merkle_root.update_hasher(&mut prefix_hasher);
-    header.target.update_hasher(&mut prefix_hasher);
-
-    // 2. The main mining loop.
     for i in 0..max_attempts_per_call {
         if !mining_active.load(Ordering::Relaxed) {
             return Ok((false, i));
         }
 
-        // 3. In the hot loop, clone the prefix hasher and update only with the nonce.
-        let mut hasher = prefix_hasher.clone();
-        block.nonce.update_hasher(&mut hasher);
+        // In the hot loop, we must reconstruct the header and hash it correctly every time
+        // to ensure the nonce is in the right position as defined by the Hashable trait.
+        let header = block.header();
+        let mut hasher = sha2::Sha256::new();
+        header.update_hasher(&mut hasher);
 
-        // 4. Perform the double SHA-256 hash and check against the target.
         let first_pass = hasher.finalize();
         let mut hasher2 = sha2::Sha256::new();
         hasher2.update(&first_pass);
         let hash_bytes: [u8; 32] = hasher2.finalize().into();
         let hash_u256 = U256::from_big_endian(&hash_bytes);
-
-        // Debug-only sanity check: print hash and target as big-endian hex to ensure consistent interpretation.
-        // This will not run in release builds.
-        debug_assert!({
-            let target_be = U256::to_big_endian(&block.target);
-            log::debug!(
-                "mining debug — nonce: {}, hash: {}, target: {}",
-                block.nonce,
-                hex::encode(hash_bytes),
-                hex::encode(target_be)
-            );
-            true
-        });
 
         if hash_u256 <= block.target {
             return Ok((true, i + 1));
@@ -232,13 +208,13 @@ impl Blockchain {
     /// The calculation is based on the window of blocks ending at the specified `height`.
     pub fn calculate_next_target_from_height(&self, height: u64) -> Result<U256> {
         // Special case: genesis block (height 0) or early blocks before full DAA window
-        if height == 0 || height < DAA_WINDOW as u64 {
-            return Ok(crate::MAX_TARGET);
-        }
-
         // Safe indices for the DAA window
         let last_block_index = height;
         let first_block_index = height.saturating_sub(DAA_WINDOW as u64 - 1);
+
+        if first_block_index == 0 {
+            return Ok(crate::MAX_TARGET);
+        }
 
         let last_block = self.get_block_by_index(last_block_index)?.ok_or_else(|| {
             anyhow::anyhow!(

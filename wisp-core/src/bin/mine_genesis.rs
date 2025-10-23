@@ -21,7 +21,7 @@ use wisp_core::{
 /// A utility to find a valid nonce for the genesis block.
 fn main() -> Result<()> {
     // --- Step 1: CONFIGURE YOUR GENESIS BLOCK PARAMETERS HERE ---
-    let genesis_message = "Sic Mundus Creatus Est // 16.10.2025 //";
+    let genesis_message = "Sic Mundus Creatus Est // 20.10.2025 //";
     let genesis_timestamp = Utc::now();
     // ---
 
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let genesis_block = Block::new(
         1,
         genesis_timestamp,
-        0, // Start nonce at 0
+        0,
         Hash::zero(),
         merkle_root,
         MAX_TARGET,

@@ -1,4 +1,3 @@
-
 use crate::{
     blockchain::Block,
     transactions::{OutPoint, TransactionOutput},
@@ -42,8 +41,12 @@ impl UtxoSet {
     where
         F: FnMut(&OutPoint) -> Result<Option<TransactionOutput>>,
     {
+        // Iterate through transactions in reverse order to correctly handle dependencies.
         for transaction in block.transactions.iter().rev() {
             let txid = transaction.txid()?;
+
+            // 1. Remove the outputs created by this transaction.
+            // This makes them no longer spendable.
             for (vout, _) in transaction.outputs.iter().enumerate() {
                 let outpoint = OutPoint {
                     txid,
@@ -51,9 +54,9 @@ impl UtxoSet {
                 };
                 self.utxos.remove(&outpoint);
             }
-        }
 
-        for transaction in block.transactions.iter().rev() {
+            // 2. Re-add the inputs that this transaction spent.
+            // This makes the previously spent UTXOs available again.
             for input in &transaction.inputs {
                 if let Some(spent_output) = find_spent_output(&input.outpoint)? {
                     self.utxos.insert(input.outpoint, (false, spent_output));

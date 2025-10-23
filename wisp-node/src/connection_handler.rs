@@ -103,7 +103,7 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                     .await
                     .context("Failed to send NewBlock")?;
             }
-            // A peer is requesting a block by index (likely for an API or wallet).
+            // A peer is requesting a block by index.
             FetchBlockInfo(index) => {
                 let blockchain_read = BLOCKCHAIN.get().unwrap().read().await;
                 debug!("Peer {} requested block info for index {}.", addr, index);
@@ -416,22 +416,29 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 let mut blockchain = BLOCKCHAIN.get().unwrap().write().await;
                 let add_result = blockchain.add_block(block.clone())?;
                 match add_result {
+                    // The block was successfully added to the chain.
                     AddBlockResult::Added => {
+                        // The block was successfully added to the chain.
                         let originating_peer_addr = socket_guard.peer_addr()?.to_string();
+                        let block_for_broadcast = block.clone();
 
                         // Broadcast the newly mined block to the network.
                         tokio::spawn(async move {
-                            let block_hash_for_log = block.id().unwrap_or_default();
+                            let block_hash_for_log = block_for_broadcast.id().unwrap_or_default();
                             let peer_keys: Vec<String> =
                                 NODES.iter().map(|p| p.key().clone()).collect();
 
                             for key in &peer_keys {
                                 if *key == originating_peer_addr {
+                                    debug!(
+                                        "Skipping broadcast of mined block back to originator {}",
+                                        key
+                                    );
                                     continue;
                                 }
 
                                 if let Some(mut peer) = NODES.get_mut(key) {
-                                    let message = Message::NewBlock(block.clone());
+                                    let message = Message::NewBlock(block_for_broadcast.clone());
                                     if message.send_async(peer.value_mut()).await.is_err() {
                                         warn!(
                                             "Failed to broadcast mined block {} to peer {}",
@@ -447,24 +454,15 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                             );
                         });
 
-                        // Drop the write lock before sending the confirmation and awaiting the next message.
-                        drop(blockchain);
-
                         // Confirm to the miner that their block was accepted.
                         let confirmation_message = Message::BlockSubmittedConfirmation;
-                        if confirmation_message
-                            .send_async(&mut *socket_guard)
-                            .await
-                            .is_err()
-                        {
-                            warn!(
-                                "Failed to send BlockSubmittedConfirmation back to miner {}.",
-                                addr
-                            );
-                        } else {
-                            info!("Sent BlockSubmittedConfirmation to miner {}.", addr);
-                        }
+                        confirmation_message.send_async(&mut *socket_guard).await.unwrap_or_else(|e| {
+                            warn!("Failed to send BlockSubmittedConfirmation back to miner {}: {}", addr, e);
+                        });
+                        info!("Sent BlockSubmittedConfirmation to miner {}.", addr);
 
+                        // Drop the write lock before awaiting the next message.
+                        drop(blockchain);
                         // Continue to the next loop iteration to be ready for the miner's next message.
                         continue;
                     }
@@ -645,12 +643,11 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                     blockchain.mempool().len()
                 );
 
-                // Gather transactions from the mempool.
+                // Gather transactions from the mempool, prioritized by fee.
                 let mut transactions: Vec<Transaction> = blockchain
-                    .mempool()
-                    .iter()
-                    .take(wisp_core::MAX_BLOCK_TRANSACTIONS - 1)
-                    .map(|(_, (_timestamp, tx, _amount))| tx.clone())
+                    .get_mempool_transactions_for_block() // Assumes this method exists and sorts by fee
+                    .into_iter()
+                    .take(wisp_core::MAX_BLOCK_TRANSACTIONS - 1) // Convert to iterator before taking
                     .collect();
 
                 let next_block_index = blockchain.block_height()? + 1;
@@ -673,6 +670,10 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 let mut coinbase_data = Vec::new();
                 coinbase_data.extend_from_slice(&next_block_index.to_le_bytes());
 
+                // Add a unique ID to the coinbase data.
+                // let unique_id = Uuid::new_v4();
+                // coinbase_data.extend_from_slice(unique_id.as_bytes());
+
                 let coinbase_tx_output = TransactionOutput {
                     pubkey: pubkey.clone(),
                     value: (block_reward + total_fees)?,
@@ -692,9 +693,10 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 );
 
                 // Construct the block template.
+                // The miner is responsible for recalculating the final Merkle root after
+                // inserting its extra_nonce, but we provide an initial valid one.
                 let merkle_root = MerkleRoot::calculate(&transactions)
                     .context("Failed to calculate Merkle root for template")?;
-
                 let previous_hash = match blockchain.get_tip_hash()? {
                     Some(hash) => hash,
                     None => Hash::zero(),
@@ -707,7 +709,7 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 let block = Block::new(
                     1,
                     Utc::now(),
-                    0,
+                    0, // nonce, will be overwritten by miner
                     previous_hash,
                     merkle_root,
                     next_target,

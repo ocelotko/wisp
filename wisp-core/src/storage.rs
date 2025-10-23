@@ -218,16 +218,17 @@ impl Blockchain {
         // Iterate through every block from the snapshot height (or genesis) to the tip.
         for i in start_height..=height {
             if let Some(block) = self.get_block_by_index(i)? {
-                for transaction in &block.transactions {
-                    if !transaction.inputs.is_empty() {
-                        for input in &transaction.inputs {
+                for tx in &block.transactions {
+                    // For regular transactions, remove the inputs they spend from the UTXO set.
+                    if !tx.is_coinbase() {
+                        for input in &tx.inputs {
                             new_utxos.remove(&input.outpoint);
                         }
                     }
 
                     // Add all new outputs from this transaction to the UTXO set.
-                    let txid = transaction.txid()?;
-                    for (vout, output) in transaction.outputs.iter().enumerate() {
+                    let txid = tx.txid()?;
+                    for (vout, output) in tx.outputs.iter().enumerate() {
                         let outpoint = OutPoint {
                             txid,
                             vout: vout as u32,

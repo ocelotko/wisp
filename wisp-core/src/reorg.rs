@@ -356,7 +356,7 @@ impl Blockchain {
     }
     /// Adds a transaction hash to a list stored under a given key in the database.
     /// This is used to maintain the `history_` index for wallet transaction lookups.
-    fn add_hash_to_history_list(
+    pub fn add_hash_to_history_list(
         &self,
         tx_db: &sled::transaction::TransactionalTree,
         key: &str,

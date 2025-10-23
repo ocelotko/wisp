@@ -1,7 +1,7 @@
 use crate::{
     blockchain::Block,
     currency::Amount,
-    sha256::{Hash, Hashable},
+    sha256::Hash,
     signatures::PublicKey,
     transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
 };
@@ -9,7 +9,6 @@ use crate::{
 use anyhow::{Context, Result as AnyhowResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::{
     fs::File,
     io::{Read, Result as IoResult, Write},
@@ -42,17 +41,10 @@ impl MerkleRoot {
                 // If there's an odd number of hashes, duplicate the last one.
                 let right = pair.get(1).unwrap_or(&pair[0]);
 
-                let mut combined_hasher = crate::sha256::Sha256::new();
-                left.update_hasher(&mut combined_hasher);
-                right.update_hasher(&mut combined_hasher);
-
-                // Perform the second hash of the double-SHA256 manually.
-                // This is more direct and avoids the deprecated `as_slice` method.
-                let first_pass = combined_hasher.finalize();
-                let mut second_hasher = crate::sha256::Sha256::new();
-                second_hasher.update(&first_pass);
-                let combined_hash = Hash::from_bytes(&second_hasher.finalize().into());
-                new_layer.push(combined_hash);
+                // Use the canonical hash function, which correctly handles double-SHA256.
+                // We explicitly create a slice `&[Hash]` to satisfy the `Hashable` trait bound.
+                let hashes_to_combine: &[Hash] = &[left, *right];
+                new_layer.push(crate::sha256::hash(hashes_to_combine));
             }
             layer = new_layer;
         }
@@ -86,7 +78,7 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     let genesis_verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(&genesis_pubkey_bytes)
         .context("Failed to create verifying key from genesis bytes")?;
 
-    let genesis_message = "Sic Mundus Creatus Est // 16.10.2025 //";
+    let genesis_message = "Sic Mundus Creatus Est // 20.10.2025 //";
     let mut coinbase_data = Vec::new();
     coinbase_data.extend_from_slice(&0u64.to_le_bytes()); // Block height 0
     coinbase_data.extend_from_slice(genesis_message.as_bytes());
@@ -107,14 +99,14 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     );
 
     let merkle_root = MerkleRoot::calculate(&[coinbase_tx.clone()])?;
-    let genesis_timestamp = DateTime::parse_from_rfc3339("2025-10-16T20:50:17.261079162Z")
+    let genesis_timestamp = DateTime::parse_from_rfc3339("2025-10-20T18:28:48.811829571Z")
         .unwrap()
         .with_timezone(&Utc);
 
     let genesis_block = Block::new(
         1,
         genesis_timestamp,
-        1624937,
+        54033315,
         Hash::zero(),
         merkle_root,
         crate::MAX_TARGET,

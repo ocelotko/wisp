@@ -100,9 +100,15 @@ impl Block {
                 "First transaction in block is not a coinbase transaction."
             ));
         }
-        let total_fees_in_block = self
-            .calculate_total_fees(blockchain.utxos())
-            .context("Failed to calculate total fees during block validation")?;
+
+        // Correctly calculate total fees by iterating through non-coinbase transactions
+        // and using the blockchain's reliable fee calculation method.
+        let mut total_fees_in_block = Amount::zero();
+        for tx in self.transactions.iter().skip(1) {
+            let fee = blockchain.calculate_transaction_fee(tx)?;
+            total_fees_in_block = (total_fees_in_block + fee)
+                .context("Fee summation overflow during block validation")?;
+        }
 
         self.verify_coinbase_transaction(total_fees_in_block)
             .context("Coinbase transaction verification failed")?;
@@ -175,22 +181,22 @@ impl Block {
                     ));
                 }
 
-                // Find the output being spent. It could be from a previous block (in `current_utxos`)
+                // Find the output being spent. It could be from a previous block (in `chain_utxos`)
                 // or from an earlier transaction in this same block (in `new_outputs_in_block`).
-                let prev_output = new_outputs_in_block
-                    .get(outpoint)
-                    .or_else(|| chain_utxos.get(outpoint).map(|(_, output)| output));
-
-                // Ensure the UTXO exists.
-                let prev_output = match prev_output {
-                    Some(output) => output,
-                    None => {
-                        return Err(anyhow!(
-                            "Transaction input UTXO {} not found in current UTXO set or within this block",
-                            outpoint
-                        ));
-                    }
+                let prev_output = if let Some(output) = new_outputs_in_block.get(outpoint) {
+                    output.clone()
+                } else if let Some((_, output)) = chain_utxos.get(outpoint) {
+                    output.clone()
+                } else {
+                    return Err(anyhow!(
+                        "Transaction input UTXO {} not found in current UTXO set or within this block",
+                        outpoint
+                    ));
                 };
+
+                // After confirming the UTXO exists, mark it as spent for this block's context.
+                // This must be done *after* finding the UTXO but *before* signature verification.
+                inputs_in_block.insert(*outpoint);
 
                 // Verify the signature.
                 let is_signature_valid = match input.signature.as_ref() {
@@ -217,7 +223,6 @@ impl Block {
                 }
 
                 input_value = (input_value + prev_output.value)?;
-                inputs_in_block.insert(*outpoint);
             }
 
             for output in &transaction.outputs {
@@ -323,7 +328,7 @@ impl Block {
         let start_index = block_index.saturating_sub(1);
         let end_index = start_index.saturating_sub(10);
 
-        for i in (end_index..=start_index).rev() {
+        for i in end_index..=start_index {
             if let Some(block) = blockchain.get_block_by_index(i)? {
                 timestamps.push(block.timestamp.timestamp());
                 if block.index == 0 {
