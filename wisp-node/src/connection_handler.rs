@@ -4,7 +4,6 @@ use log::{debug, error, info, warn};
 use std::time::Duration;
 use std::{io::ErrorKind, sync::Arc};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use uuid::Uuid;
 use wisp_core::{
     blockchain::{AddBlockResult, Block},
     currency::Amount,
@@ -265,16 +264,6 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                                 error!("Error during chain reorganization task: {:?}", e);
                             }
                         });
-
-                        // The original block that triggered this is part of the new segment, so we add it too.
-                        let mut blockchain = BLOCKCHAIN.get().unwrap().write().await;
-                        if let Err(e) =
-                            blockchain.reorganize_chain(vec![block], common_ancestor_index)
-                        {
-                            error!("Chain reorganization failed for single block fork: {}", e);
-                        } else {
-                            info!("Chain reorganization successful for single block fork.");
-                        }
                     }
                     AddBlockResult::Rejected(reason) => {
                         warn!(
@@ -668,10 +657,6 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                 // Create the coinbase transaction rewarding the miner.
                 let mut coinbase_data = Vec::new();
                 coinbase_data.extend_from_slice(&next_block_index.to_le_bytes());
-
-                // Add a unique ID to the coinbase data.
-                let unique_id = Uuid::new_v4();
-                coinbase_data.extend_from_slice(unique_id.as_bytes());
 
                 let coinbase_tx_output = TransactionOutput {
                     pubkey: pubkey.clone(),

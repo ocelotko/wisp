@@ -1,21 +1,17 @@
 use crate::sha256::Hash;
 use crate::{
     currency::Amount,
-    signatures::serde_signature_bytes,
     signatures::PublicKey,
     signatures::{PrivateKey, Signature},
-    utils::Saveable,
 };
 use anyhow::Result;
-use ecdsa::Signature as ECDSASignature;
-use k256::Secp256k1;
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::hash::Hash as StdHash;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write};
 
 /// Represents a transaction, which is a collection of inputs and outputs.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub inputs: Vec<TransactionInput>,
     pub outputs: Vec<TransactionOutput>,
@@ -23,7 +19,9 @@ pub struct Transaction {
 
 /// An "OutPoint" is a pointer to a specific transaction output. It consists of the hash of the transaction
 /// that created the output and the output's index within that transaction (`vout`).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash, Copy, Default)]
+#[derive(
+    Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash, Copy, Default,
+)]
 pub struct OutPoint {
     pub txid: Hash,
     pub vout: u32,
@@ -35,11 +33,10 @@ impl fmt::Display for OutPoint {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionInput {
     pub outpoint: OutPoint,
-    #[serde(with = "serde_signature_bytes")]
-    pub signature: Option<ECDSASignature<Secp256k1>>,
+    pub signature: Option<Signature>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub coinbase_data: Option<Vec<u8>>,
@@ -47,7 +44,7 @@ pub struct TransactionInput {
 
 /// A transaction output, which creates new spendable value. It specifies the amount, the public key
 /// that can spend it (the "lock script"), and an optional message.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash)]
+#[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash)]
 pub struct TransactionOutput {
     pub value: Amount,
     pub pubkey: PublicKey,
@@ -89,7 +86,7 @@ impl WitnessHashable for Transaction {
         for input in &self.inputs {
             input.outpoint.update_hasher(hasher);
             if let Some(sig) = &input.signature {
-                hasher.update(sig.to_bytes());
+                hasher.update(sig.0.to_bytes());
             }
         }
         for output in &self.outputs {
@@ -135,7 +132,7 @@ impl Transaction {
             .iter()
             .map(|outpoint| TransactionInput {
                 outpoint: *outpoint,
-                signature: Some(signature.0),
+                signature: Some(signature.clone()),
                 coinbase_data: None,
             })
             .collect();
@@ -155,25 +152,5 @@ impl Transaction {
     /// This is used for the Merkle Root calculation to prevent malleability.
     pub fn wtxid(&self) -> Result<Hash, anyhow::Error> {
         Ok(witness_hash(self))
-    }
-}
-
-impl Saveable for Transaction {
-    fn load<I: Read>(reader: I) -> IoResult<Self> {
-        bincode::deserialize_from(reader).map_err(|e| {
-            IoError::new(
-                IoErrorKind::InvalidData,
-                format!("Failed to deserialize Transaction with bincode: {}", e),
-            )
-        })
-    }
-
-    fn save<O: Write>(&self, writer: O) -> IoResult<()> {
-        bincode::serialize_into(writer, self).map_err(|e| {
-            IoError::new(
-                IoErrorKind::InvalidData,
-                format!("Failed to serialize Transaction with bincode: {}", e),
-            )
-        })
     }
 }

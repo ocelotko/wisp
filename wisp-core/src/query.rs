@@ -1,5 +1,6 @@
 use crate::blockchain::Blockchain;
 use anyhow::Result;
+use bincode::config::standard as bincode_config;
 use chrono::{DateTime, Utc};
 use log::{debug, error};
 use std::collections::HashSet;
@@ -143,12 +144,14 @@ impl Blockchain {
             // Nested logic to get block from index
             let hash_key = format!("index_{}", block_index);
             if let Some(hash_ivec) = db.get(hash_key)? {
-                let hash: Hash = bincode::deserialize(&hash_ivec)?;
+                let (hash, _): (Hash, _) =
+                    bincode::decode_from_slice(&hash_ivec, bincode_config())?;
 
                 // Nested logic to get block from hash
                 let block_key = format!("block_{}", hash);
                 if let Some(block_ivec) = db.get(block_key)? {
-                    let block: crate::blockchain::Block = bincode::deserialize(&block_ivec)?;
+                    let (block, _): (crate::blockchain::Block, _) =
+                        bincode::decode_from_slice(&block_ivec, bincode_config())?;
                     if let Some(tx) = block
                         .transactions
                         .iter()

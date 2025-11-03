@@ -1,4 +1,3 @@
-// wisp-wallet/src/wallet/storage.rs
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -15,7 +14,7 @@ use base64::{engine::general_purpose, Engine as Base64Engine};
 use hex;
 use log::info;
 use password_hash::Result as PwHashResult;
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use serde_json;
 

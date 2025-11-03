@@ -6,12 +6,13 @@ use crate::{
     MAX_MESSAGE_SIZE,
 };
 
+use bincode::{config::standard as bincode_config, Decode, Encode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::{Error as IoError, Read, Write};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum TransactionStatus {
     Pending,
     Confirmed { block_hash: Hash, block_index: u64 },
@@ -19,21 +20,22 @@ pub enum TransactionStatus {
     NotFound,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletTransactionInfo {
     pub transaction: Transaction,
     pub status: TransactionStatus,
+    #[bincode(with_serde)]
     pub block_timestamp: Option<DateTime<Utc>>,
     pub block_index: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletStateSnapshot {
     pub transactions: Vec<WalletTransactionInfo>,
     pub utxos: Vec<(OutPoint, TransactionOutput)>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Message {
     // --- Wallet & Transaction Messages ---
     SubmitTransaction(Transaction),
@@ -81,7 +83,7 @@ pub enum Message {
 impl Message {
     /// Serializes the message into a byte vector using bincode.
     pub fn encode(&self) -> Result<Vec<u8>, IoError> {
-        bincode::serialize(self).map_err(|e| {
+        bincode::encode_to_vec(self, bincode_config()).map_err(|e| {
             IoError::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to encode message with bincode: {}", e),
@@ -91,12 +93,14 @@ impl Message {
 
     /// Deserializes a byte slice into a `Message`.
     pub fn decode(data: &[u8]) -> Result<Self, IoError> {
-        bincode::deserialize(data).map_err(|e| {
-            IoError::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to decode message with bincode: {}", e),
-            )
-        })
+        bincode::decode_from_slice(data, bincode_config())
+            .map(|(msg, _)| msg)
+            .map_err(|e| {
+                IoError::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to decode message with bincode: {}", e),
+                )
+            })
     }
 
     /// Sends the message over a synchronous stream, prepending its length.

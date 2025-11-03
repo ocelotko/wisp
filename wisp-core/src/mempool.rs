@@ -17,8 +17,8 @@ pub const MAX_MEMPOOL_TRANSACTION_AGE: u64 = 172800; // Two days in seconds
 impl Blockchain {
     /// Adds a transaction to the mempool after performing a series of validations.
     pub fn add_to_mempool(&mut self, transaction: Transaction) -> Result<()> {
-        // Coinbase transactions are only allowed in blocks, not in the mempool.
-        if transaction.inputs.is_empty() {
+        // Use the canonical check for a coinbase transaction.
+        if transaction.is_coinbase() {
             return Err(anyhow!("Coinbase transaction cannot be added to mempool"));
         }
 
@@ -75,7 +75,7 @@ impl Blockchain {
                 Some(sig) => prev_output
                     .pubkey
                     .0
-                    .verify(&transaction_hash_for_verification.as_bytes(), sig)
+                    .verify(&transaction_hash_for_verification.as_bytes(), &sig.0)
                     .is_ok(),
                 None => false,
             };
@@ -176,5 +176,146 @@ impl Blockchain {
             initial_mempool_size - self.mempool.len(),
             block.id().unwrap_or_default()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{signatures::PrivateKey, transactions::TransactionOutput};
+    use tempfile::tempdir;
+
+    // Helper to create a temporary DB and a Blockchain instance for testing.
+    fn setup_test_blockchain() -> (Blockchain, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let blockchain = Blockchain::new(db);
+        (blockchain, dir)
+    }
+
+    // Helper to create a funded UTXO for a given private key.
+    fn fund_utxo(
+        blockchain: &mut Blockchain,
+        private_key: &PrivateKey,
+        amount: Amount,
+    ) -> OutPoint {
+        let pubkey = private_key.public_key();
+        let tx = Transaction::new(
+            vec![], // Dummy tx, not a real coinbase
+            vec![TransactionOutput {
+                value: amount,
+                pubkey,
+            }],
+        );
+        let txid = tx.txid().unwrap();
+        let outpoint = OutPoint { txid, vout: 0 };
+
+        // Manually insert into the UTXO set for testing purposes.
+        blockchain
+            .utxo_set
+            .utxos
+            .insert(outpoint, (false, tx.outputs[0].clone()));
+        outpoint
+    }
+
+    #[test]
+    fn test_add_valid_transaction_to_mempool() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let key = PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
+        let utxo_to_spend = fund_utxo(&mut blockchain, &key, Amount::from_smallest_unit(1000));
+
+        let tx = Transaction::new_signed_from_utxos(
+            &[utxo_to_spend],
+            vec![TransactionOutput {
+                value: Amount::from_smallest_unit(900),
+                pubkey: key.public_key(), // Sending back to self for simplicity
+            }],
+            &key,
+        )
+        .unwrap();
+
+        assert!(blockchain.add_to_mempool(tx.clone()).is_ok());
+        assert_eq!(blockchain.mempool.len(), 1);
+        assert!(blockchain.mempool.contains_key(&tx.txid().unwrap()));
+        // Check that the UTXO is now marked as spent in the mempool
+        assert_eq!(
+            blockchain.utxo_set.utxos.get(&utxo_to_spend).unwrap().0,
+            true
+        );
+    }
+
+    #[test]
+    fn test_reject_mempool_double_spend() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let key = PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
+        let utxo_to_spend = fund_utxo(&mut blockchain, &key, Amount::from_smallest_unit(1000));
+
+        // First transaction, valid
+        let tx1 = Transaction::new_signed_from_utxos(
+            &[utxo_to_spend],
+            vec![TransactionOutput {
+                value: Amount::from_smallest_unit(500),
+                pubkey: key.public_key(),
+            }],
+            &key,
+        )
+        .unwrap();
+        assert!(blockchain.add_to_mempool(tx1).is_ok());
+
+        // Second transaction, attempts to spend the same UTXO
+        let tx2 = Transaction::new_signed_from_utxos(
+            &[utxo_to_spend],
+            vec![TransactionOutput {
+                value: Amount::from_smallest_unit(400),
+                pubkey: key.public_key(),
+            }],
+            &key,
+        )
+        .unwrap();
+
+        let result = blockchain.add_to_mempool(tx2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("already spent by a transaction in mempool"));
+        assert_eq!(blockchain.mempool.len(), 1); // Only the first tx should be in the mempool
+    }
+
+    #[test]
+    fn test_reject_insufficient_funds() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let key = PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
+        let utxo_to_spend = fund_utxo(&mut blockchain, &key, Amount::from_smallest_unit(1000));
+
+        // Try to spend more than we have
+        let tx = Transaction::new_signed_from_utxos(
+            &[utxo_to_spend],
+            vec![TransactionOutput {
+                value: Amount::from_smallest_unit(1001), // More than the input
+                pubkey: key.public_key(),
+            }],
+            &key,
+        )
+        .unwrap();
+
+        let result = blockchain.add_to_mempool(tx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient funds"));
+    }
+
+    #[test]
+    fn test_reject_coinbase_in_mempool() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let coinbase_tx = crate::utils::genesis_block().unwrap().transactions[0].clone();
+        let result = blockchain.add_to_mempool(coinbase_tx);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Coinbase transaction cannot be added"));
     }
 }

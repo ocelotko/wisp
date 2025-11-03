@@ -19,7 +19,7 @@ struct ApiBlock {
     version: u32,
     height: u64,
     hash: Hash,
-    timestamp: i64, 
+    timestamp: i64,
     transactions: Vec<Hash>,
     size: usize,
     nonce: u64,
@@ -32,18 +32,18 @@ struct ApiBlock {
 #[derive(Serialize, Clone)]
 struct ApiTransactionSummary {
     hash: Hash,
-    block_height: Option<u64>, 
+    block_height: Option<u64>,
     input_count: usize,
     output_count: usize,
     is_coinbase: bool,
     total_output_wisp: String,
-    timestamp: i64, 
+    timestamp: i64,
 }
 
 #[derive(Serialize, Clone)]
 struct ApiTransactionInput {
     outpoint: String,
-    signature: Option<String>, 
+    signature: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -91,7 +91,7 @@ struct PaginatedTransactionsResponse {
     data: Vec<ApiTransactionSummary>,
     page: u64,
     limit: u64,
-    total_transactions: u64, 
+    total_transactions: u64,
 }
 
 #[derive(Serialize)]
@@ -121,7 +121,6 @@ impl From<Block> for ApiBlock {
         let difficulty_str = if block.target.is_zero() {
             "inf".to_string()
         } else {
-            
             let scaling_factor = wisp_core::U256::from(1_000_000u64);
             let max_target = wisp_core::MAX_TARGET;
 
@@ -137,13 +136,13 @@ impl From<Block> for ApiBlock {
             version: block.version,
             height: block.index,
             hash: block.id().unwrap_or_default(),
-            timestamp: block.timestamp.timestamp(), 
+            timestamp: block.timestamp.timestamp(),
             difficulty: difficulty_str,
             transactions: tx_hashes,
             size: block_size,
             nonce: block.nonce,
             previous_hash: block.previous_hash,
-            time_to_mine_secs: None, 
+            time_to_mine_secs: None,
         }
     }
 }
@@ -215,10 +214,10 @@ async fn get_network_vitals(
                 last_block.timestamp.timestamp() - first_block.timestamp.timestamp();
             (actual_timespan as f64 / DAA_WINDOW as f64).max(0.0)
         } else {
-            IDEAL_BLOCK_TIME as f64 
+            IDEAL_BLOCK_TIME as f64
         }
     } else {
-        IDEAL_BLOCK_TIME as f64 
+        IDEAL_BLOCK_TIME as f64
     };
 
     let reward_per_block = calculate_block_reward(current_height);
@@ -285,7 +284,6 @@ async fn get_block_by_height(
         Ok(Some(block)) => {
             let mut api_block: ApiBlock = block.clone().into();
 
-            
             if height > 0 {
                 match blockchain.get_block_by_index(height - 1) {
                     Ok(Some(prev_block)) => {
@@ -381,7 +379,8 @@ async fn get_transaction_by_hash(
         Ok(Some((tx, block_height, timestamp))) => {
             let is_coinbase = tx.inputs.is_empty();
             let coinbase_message = if is_coinbase {
-                tx.inputs.first()
+                tx.inputs
+                    .first()
                     .and_then(|i| i.coinbase_data.as_ref())
                     .and_then(|data| String::from_utf8(data.clone()).ok())
             } else {
@@ -409,7 +408,10 @@ async fn get_transaction_by_hash(
                 vec![ApiTransactionInput {
                     outpoint: format!(
                         "Coinbase (New Coins){}",
-                        coinbase_message.as_ref().map(|m| format!(": {}", m)).unwrap_or_default()
+                        coinbase_message
+                            .as_ref()
+                            .map(|m| format!(": {}", m))
+                            .unwrap_or_default()
                     ),
                     signature: None,
                 }]
@@ -435,8 +437,8 @@ async fn get_transaction_by_hash(
                     .outputs
                     .iter()
                     .map(|o| ApiTransactionOutput {
-                        value: o.value.to_string_wisp(), 
-                        lock_script: format!("OP_CHECKSIG for pubkey {}", o.pubkey.fingerprint()), 
+                        value: o.value.to_string_wisp(),
+                        lock_script: format!("OP_CHECKSIG for pubkey {}", o.pubkey.fingerprint()),
                         pubkey: o.pubkey.clone(),
                     })
                     .collect(),
@@ -474,7 +476,7 @@ async fn get_blocks_paginated(
 
     let blockchain = blockchain_lock.read().await;
     let total_blocks = match blockchain.block_height() {
-        Ok(height) => height + 1, 
+        Ok(height) => height + 1,
         Err(e) => {
             log::error!("Failed to get chain height for pagination: {}", e);
             return (
@@ -503,7 +505,7 @@ async fn get_blocks_paginated(
                     }
                     blocks.push(api_block);
                 }
-                Ok(None) => { }
+                Ok(None) => {}
                 Err(e) => {
                     log::error!("Error fetching block {} for paginated response: {}", i, e);
                 }
@@ -524,7 +526,7 @@ async fn get_recent_transactions(
     State(blockchain_lock): State<Arc<RwLock<wisp_core::blockchain::Blockchain>>>,
 ) -> impl IntoResponse {
     let blockchain = blockchain_lock.read().await;
-    let max_recent_txs = 100; 
+    let max_recent_txs = 100;
     let mempool = blockchain.mempool();
     let mut api_transactions: Vec<ApiTransactionSummary> = mempool
         .iter()
@@ -540,9 +542,9 @@ async fn get_recent_transactions(
 
             ApiTransactionSummary {
                 hash: tx.txid().unwrap_or_default(),
-                block_height: None, 
+                block_height: None,
                 input_count: tx.inputs.len(),
-                is_coinbase: false, 
+                is_coinbase: false,
                 output_count: tx.outputs.len(),
                 total_output_wisp: total_output.to_string_wisp(),
                 timestamp: timestamp.timestamp(),
@@ -559,7 +561,7 @@ async fn get_recent_transactions(
 
     for i in (start_block..=current_height).rev() {
         if api_transactions.len() >= max_recent_txs {
-            break; 
+            break;
         }
 
         if let Ok(Some(block)) = blockchain.get_block_by_index(i) {
@@ -584,7 +586,7 @@ async fn get_recent_transactions(
                 });
 
                 if api_transactions.len() >= max_recent_txs {
-                    break; 
+                    break;
                 }
             }
         }
@@ -616,7 +618,7 @@ async fn get_transactions_paginated(
     }
 
     let blockchain = blockchain_lock.read().await;
-    let mempool = blockchain.mempool().clone(); 
+    let mempool = blockchain.mempool().clone();
     let confirmed_tx_count = blockchain
         .get_total_transaction_count_from_db()
         .unwrap_or(0);
@@ -635,7 +637,7 @@ async fn get_transactions_paginated(
                 hash: tx.txid().unwrap_or_default(),
                 block_height: None,
                 input_count: tx.inputs.len(),
-                is_coinbase: false, 
+                is_coinbase: false,
                 output_count: tx.outputs.len(),
                 total_output_wisp: total_output.to_string_wisp(),
                 timestamp: timestamp.timestamp(),
@@ -656,7 +658,7 @@ async fn get_transactions_paginated(
     let needed_from_db = limit.saturating_sub(transactions_for_page.len() as u64);
     if needed_from_db > 0 {
         let db_tx_to_skip = page_start_index.saturating_sub(mempool_count);
-        if confirmed_tx_count > 0 { 
+        if confirmed_tx_count > 0 {
             let highest_confirmed_idx = confirmed_tx_count - 1;
             let start_idx = highest_confirmed_idx.saturating_sub(db_tx_to_skip);
             let end_idx = start_idx.saturating_sub(needed_from_db - 1);

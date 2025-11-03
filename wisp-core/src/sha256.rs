@@ -1,4 +1,5 @@
 use crate::{utils::MerkleRoot, U256};
+use bincode::{Decode, Encode};
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -95,7 +96,9 @@ pub fn witness_hash<T: WitnessHashable + ?Sized>(data: &T) -> Hash {
 
 /// A wrapper around a `U256` to represent a 256-bit SHA-256 hash.
 #[serde_as]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Encode, Decode, Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Hash(crate::U256);
 

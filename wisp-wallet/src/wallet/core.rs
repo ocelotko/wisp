@@ -1,4 +1,3 @@
-// wisp-wallet/src/core.rs
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -12,11 +11,10 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use k256::ecdsa::signature::Signer;
-use k256::ecdsa::Signature as ECDSASignature;
-use k256::ecdsa::SigningKey;
+use k256::ecdsa::{self, SigningKey};
 use log::{debug, info, warn};
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::TryRngCore;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use tokio::{net::TcpStream, sync::RwLock};
@@ -163,14 +161,17 @@ impl Core {
         }
 
         // Generate a new private/public key pair.
-        let private_key = PrivateKey::generate_keypair();
+        let private_key =
+            PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
         let public_key = private_key.public_key();
 
         println!("Public Key: {:?}", public_key);
 
-        let mut rng = OsRng;
+        // Use a local OsRng for salt generation
+        let mut local_rng = OsRng;
         let mut salt = vec![0u8; SALT_SIZE];
-        rng.try_fill_bytes(&mut salt)
+        local_rng
+            .try_fill_bytes(&mut salt)
             .map_err(|e| anyhow!("Failed to fill bytes for salt: {}", e))?;
 
         // Encrypt the private key using a key derived from the password and salt.
@@ -366,7 +367,7 @@ impl Core {
         salt: &[u8],
     ) -> Result<String> {
         let mut rng = OsRng;
-        let mut nonce = [0u8; ENCRYPTION_NONCE_SIZE];
+        let mut nonce = [0u8; ENCRYPTION_NONCE_SIZE]; // Use a local OsRng for nonce generation
         rng.try_fill_bytes(&mut nonce)
             .map_err(|e| anyhow!("Failed to fill bytes for nonce: {}", e))?;
         let nonce = Nonce::from(nonce);
@@ -698,10 +699,12 @@ impl Core {
         let transaction_hash_for_signing = new_transaction.txid()?;
         for input in &mut new_transaction.inputs {
             // Sign each input with the private key.
-            let signature: ECDSASignature = sender_private_key
-                .0
-                .sign(&transaction_hash_for_signing.as_bytes()[..]);
-            input.signature = Some(signature);
+            let signature = wisp_core::signatures::Signature(
+                sender_private_key
+                    .0
+                    .sign(&transaction_hash_for_signing.as_bytes()[..]),
+            );
+            input.signature = Some(signature.clone());
         }
 
         let mut stream_guard = self.get_connected_stream().await?;

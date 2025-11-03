@@ -7,15 +7,16 @@ use crate::{
 };
 
 use anyhow::{Context, Result as AnyhowResult};
+use bincode::{config::standard as bincode_config, Decode, Encode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
-    io::{Read, Result as IoResult, Write},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write},
 };
 
 /// A wrapper around a `Hash` to represent the root of a Merkle tree.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MerkleRoot(pub Hash);
 
 impl MerkleRoot {
@@ -122,15 +123,37 @@ pub trait Saveable
 where
     Self: Sized,
 {
-    fn load<I: Read>(reader: I) -> IoResult<Self>;
     fn save<O: Write>(&self, writer: O) -> IoResult<()>;
+    fn load<I: Read>(reader: I) -> IoResult<Self>;
+
     fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> IoResult<()> {
+        use std::io::BufWriter;
         let file = File::create(&path)?;
-        self.save(file)
+        self.save(BufWriter::new(file))
     }
 
     fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> IoResult<Self> {
+        // Open the file and wrap it in a BufReader for efficiency,
+        // which is common practice and also implements the required traits.
+        use std::io::BufReader;
         let file = File::open(&path)?;
-        Self::load(file)
+        let reader = BufReader::new(file);
+        Self::load(reader)
+    }
+}
+
+impl<T> Saveable for T
+where
+    T: Encode + Decode<()> + Sized,
+{
+    fn save<O: Write>(&self, mut writer: O) -> IoResult<()> {
+        bincode::encode_into_std_write(self, &mut writer, bincode_config())
+            .map(|_| ()) // Discard the `usize` count of bytes written to match return type `()`
+            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
+    }
+
+    fn load<I: Read>(mut reader: I) -> IoResult<Self> {
+        bincode::decode_from_std_read(&mut reader, bincode_config())
+            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
     }
 }

@@ -1,14 +1,16 @@
 use crate::{
     currency::Amount,
     reorg::ReorgError,
-    sha256::Hash,
+    sha256::{hash, Hash, Hashable, Sha256},
     transactions::{OutPoint, Transaction, TransactionOutput},
-    utils::{MerkleRoot, Saveable},
+    utils::MerkleRoot,
     utxo::UtxoSet,
     U256,
 };
 use anyhow::anyhow;
 use anyhow::Result;
+use bincode::config::standard as bincode_config;
+use bincode::{Decode, Encode};
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use serde::Deserialize;
@@ -18,8 +20,6 @@ use sha2::Digest;
 use sled::transaction::ConflictableTransactionError;
 use sled::Db;
 use std::collections::HashMap;
-use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write};
-
 /// Represents the possible outcomes of attempting to add a new block to the blockchain.
 #[derive(Debug)]
 pub enum AddBlockResult {
@@ -41,11 +41,12 @@ pub enum AddBlockResult {
 }
 
 /// Represents a block in the blockchain.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Block {
     /// The version of the block structure.
     pub version: u32,
     /// The timestamp when the block was created.
+    #[bincode(with_serde)]
     pub timestamp: DateTime<Utc>,
     /// A random number used in the proof-of-work algorithm.
     pub nonce: u64,
@@ -61,18 +62,16 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
-#[derive(Serialize)]
+#[derive(Encode, Decode, Serialize)]
 pub struct BlockHeader {
     pub version: u32,
+    #[bincode(with_serde)]
     pub timestamp: DateTime<Utc>,
     pub nonce: u64,
     pub previous_hash: Hash,
     pub merkle_root: MerkleRoot,
     pub target: U256,
 }
-
-use crate::sha256::{hash, Hashable};
-use sha2::Sha256;
 
 impl Hashable for BlockHeader {
     fn update_hasher(&self, hasher: &mut Sha256) {
@@ -125,18 +124,6 @@ impl Block {
     /// Calculates the hash of the block header, which serves as the block's unique identifier (txid).
     pub fn id(&self) -> Result<Hash, anyhow::Error> {
         Ok(hash(&self.header()))
-    }
-}
-
-impl Saveable for Block {
-    fn load<I: Read>(reader: I) -> IoResult<Self> {
-        bincode::deserialize_from(reader)
-            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
-    }
-
-    fn save<O: Write>(&self, writer: O) -> IoResult<()> {
-        bincode::serialize_into(writer, self)
-            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
     }
 }
 
@@ -236,27 +223,19 @@ impl Blockchain {
             new_block_hash, new_block.index
         );
 
-        // Get the current tip of our active chain.
-        let current_chain_tip = match self
+        // Get the current tip of our active chain. If it doesn't exist, we're on an empty chain.
+        let maybe_current_tip = match self
             .get_tip_hash()?
             .and_then(|h| self.get_block_by_hash(&h).transpose())
         {
             Some(Ok(block)) => block,
             None => {
+                // Chain is empty. We must be processing the genesis block.
                 if new_block.index == 0 && new_block.previous_hash == Hash::zero() {
-                    // This is the special case for the genesis block.
-                    info!("Chain is empty, processing potential genesis block.");
-
-                    let expected_genesis_hash = crate::utils::genesis_block()?.id()?;
-                    if new_block_hash == expected_genesis_hash {
-                        self.load_from_db()?;
-                        return Ok(AddBlockResult::Added);
-                    } else {
-                        return Ok(AddBlockResult::Rejected(
-                            "Received block is not the correct genesis block.".to_string(),
-                        ));
-                    }
+                    info!("Chain is empty, processing genesis block.");
+                    return self.add_direct_extension(new_block, new_block_hash);
                 }
+                // If the chain is empty and we get a non-genesis block, it's an error.
                 return Ok(AddBlockResult::Rejected(
                     "Chain is not initialized. Cannot accept non-genesis peer blocks.".to_string(),
                 ));
@@ -264,26 +243,8 @@ impl Blockchain {
             Some(Err(e)) => return Err(e).map_err(anyhow::Error::from),
         };
 
-        // Calculate the hash of the current chain tip.
-        let current_chain_tip_hash = match current_chain_tip.id() {
-            Ok(h) => h,
-            Err(e) => {
-                error!("Failed to hash current chain tip: {}", e);
-                return Ok(AddBlockResult::Rejected(format!(
-                    "Failed to hash current chain tip: {}",
-                    e
-                )));
-            }
-        };
-
-        // If we already have this block, we don't need to do anything else.
-        if self.get_block_by_hash(&new_block_hash)?.is_some() {
-            info!(
-                "Block {} already exists in the database. Ignoring.",
-                new_block_hash
-            );
-            return Ok(AddBlockResult::Added);
-        }
+        let current_chain_tip = maybe_current_tip;
+        let current_chain_tip_hash = current_chain_tip.id()?;
 
         // Case 1: The new block is a direct extension of our current chain.
         if new_block.previous_hash == current_chain_tip_hash {
@@ -291,7 +252,6 @@ impl Blockchain {
                 "New block {} is a direct extension of the current tip.",
                 new_block_hash
             );
-
             return self.add_direct_extension(new_block, new_block_hash);
         // Case 2: The new block is not a direct extension, indicating a fork or an out-of-order block.
         } else {
@@ -304,7 +264,7 @@ impl Blockchain {
 
             // Before determining the fork type, save the block. This prevents a race condition
             // where the reorg process is triggered but the block it needs is not yet on disk.
-            let block_bytes = bincode::serialize(&new_block)?;
+            let block_bytes = bincode::encode_to_vec(&new_block, bincode_config())?;
             self.db
                 .insert(format!("block_{}", new_block_hash).as_bytes(), block_bytes)?;
 
@@ -317,11 +277,11 @@ impl Blockchain {
                     common_ancestor_index, new_block_hash
                 );
 
-                // If the new block's index is not higher, it's a shorter fork and we reject it.
-                if new_block.index <= common_ancestor_index {
+                // If the new block's index is not higher than our current tip, it can't be a longer chain.
+                if new_block.index <= current_chain_tip.index {
                     return Ok(AddBlockResult::ShorterForkRejected(format!(
-                        "Received block {} is part of a shorter or equal length fork (index {} <= common ancestor index {}). Rejecting.",
-                        new_block_hash, new_block.index, common_ancestor_index
+                        "Received block {} is part of a shorter or equal length fork (new index {} <= current index {}). Rejecting.",
+                        new_block_hash, new_block.index, current_chain_tip.index
                     )));
                 }
 
@@ -348,6 +308,10 @@ impl Blockchain {
         new_block: Block,
         new_block_hash: Hash,
     ) -> Result<AddBlockResult> {
+        info!(
+            "🩵 Starting add_direct_extension for block index={} hash={}",
+            new_block.index, new_block_hash
+        );
         let expected_next_index = if self.get_tip_hash()?.is_some() {
             self.block_height()? + 1
         } else {
@@ -388,9 +352,9 @@ impl Blockchain {
         self.db
             .transaction(
                 |tx_db| -> Result<(), ConflictableTransactionError<ReorgError>> {
-                    let block_bytes =
-                        bincode::serialize(&new_block).map_err(|e| ReorgError::Anyhow(e.into()))?;
-                    let hash_bytes = bincode::serialize(&new_block_hash)
+                    let block_bytes = bincode::encode_to_vec(&new_block, bincode_config())
+                        .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                    let hash_bytes = bincode::encode_to_vec(&new_block_hash, bincode_config())
                         .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
                     // Store the block itself, indexed by its hash.
@@ -406,7 +370,7 @@ impl Blockchain {
                     let mut current_tx_index = initial_tx_count;
                     for tx in &new_block.transactions {
                         let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
-                        let tx_hash_bytes = bincode::serialize(&tx_hash)
+                        let tx_hash_bytes = bincode::encode_to_vec(&tx_hash, bincode_config())
                             .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
                         // Chronological transaction index.
@@ -520,5 +484,224 @@ impl Blockchain {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{transactions::Transaction, utils};
+    use tempfile::tempdir;
+
+    // Helper to create a temporary DB and a Blockchain instance for testing.
+    fn setup_test_blockchain() -> (Blockchain, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        let blockchain = Blockchain::new(db);
+        (blockchain, dir)
+    }
+
+    // Helper to create a new block that builds on a previous one.
+    fn create_next_block(
+        blockchain: &Blockchain,
+        prev_block: &Block,
+        transactions: Vec<Transaction>,
+    ) -> Block {
+        let index = prev_block.index + 1;
+        let previous_hash = prev_block.id().unwrap();
+        // Ensure the timestamp is always greater than the previous block's to pass MTP validation.
+        let timestamp = prev_block.timestamp + chrono::Duration::seconds(1);
+
+        // A block must always have a coinbase transaction.
+        // We create a dummy one here for testing purposes.
+        let mut block_transactions = transactions;
+        let coinbase_output = TransactionOutput {
+            // The reward must be correct for the block to be valid.
+            value: utils::calculate_block_reward(index),
+            pubkey: utils::genesis_block().unwrap().transactions[0].outputs[0] // Use a known pubkey
+                .pubkey
+                .clone(), // Use a known pubkey
+        };
+        let coinbase_input = crate::transactions::TransactionInput {
+            outpoint: crate::transactions::OutPoint {
+                txid: Hash::zero(),
+                vout: u32::MAX,
+            },
+            coinbase_data: Some(index.to_le_bytes().to_vec()),
+            signature: None,
+        };
+        let coinbase_tx = Transaction::new(vec![coinbase_input], vec![coinbase_output]);
+        block_transactions.insert(0, coinbase_tx);
+
+        let merkle_root = utils::MerkleRoot::calculate(&block_transactions).unwrap();
+
+        // Use the blockchain's calculated next target to ensure the block is valid.
+        let target = blockchain.calculate_next_target().unwrap();
+        let mut new_block = Block::new(
+            1,
+            timestamp,
+            0, // nonce starts at 0
+            previous_hash,
+            merkle_root,
+            target,
+            index,
+            block_transactions,
+        );
+        // Mine the block until it's valid.
+        new_block.mine_block(1_000_000).unwrap();
+        new_block
+    }
+
+    #[test]
+    fn test_add_genesis_block() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+
+        let result = blockchain.add_block(genesis_block.clone()).unwrap();
+        assert!(matches!(result, AddBlockResult::Added));
+        assert_eq!(blockchain.block_height().unwrap(), 0);
+        assert_eq!(
+            blockchain.get_tip_hash().unwrap().unwrap(),
+            genesis_block.id().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_add_valid_second_block() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        let second_block = create_next_block(&blockchain, &genesis_block, vec![]);
+        let result = blockchain.add_block(second_block.clone()).unwrap();
+
+        assert!(matches!(result, AddBlockResult::Added));
+        assert_eq!(blockchain.block_height().unwrap(), 1);
+        assert_eq!(
+            blockchain.get_tip_hash().unwrap().unwrap(),
+            second_block.id().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_reject_block_with_bad_index() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        let mut bad_block = create_next_block(&blockchain, &genesis_block, vec![]);
+        bad_block.index = 3; // Invalid index
+
+        let result = blockchain.add_block(bad_block).unwrap();
+        assert!(matches!(result, AddBlockResult::Rejected(_)));
+        assert_eq!(
+            blockchain.block_height().unwrap(),
+            0,
+            "Chain height should not change on rejection"
+        );
+    }
+
+    #[test]
+    fn test_reject_shorter_fork() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        // Main chain has one block after genesis
+        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        blockchain.add_block(main_chain_block_1.clone()).unwrap();
+        assert_eq!(blockchain.block_height().unwrap(), 1);
+
+        // A competing block is mined, also based on genesis. This creates a fork of equal length.
+        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+
+        // The node should reject this block because it doesn't create a longer chain.
+        let result = blockchain.add_block(fork_block_1).unwrap();
+        assert!(matches!(result, AddBlockResult::ShorterForkRejected(_)));
+        assert_eq!(
+            blockchain.block_height().unwrap(),
+            1,
+            "Chain height should not change when rejecting a shorter/equal fork"
+        );
+    }
+
+    #[test]
+    fn test_detect_longer_fork() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        // Main chain has one block after genesis
+        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        blockchain.add_block(main_chain_block_1.clone()).unwrap();
+        assert_eq!(blockchain.block_height().unwrap(), 1);
+
+        // Now, a fork appears that is longer.
+        // Fork Block 1 (builds on genesis)
+        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        // Fork Block 2 (builds on Fork Block 1)
+        let fork_block_2 = create_next_block(&blockchain, &fork_block_1, vec![]);
+
+        // When we add the first block of the fork, it should be stored but not change the main chain.
+        // It's a shorter/equal fork at this point.
+        let result1 = blockchain.add_block(fork_block_1).unwrap();
+        assert!(matches!(result1, AddBlockResult::ShorterForkRejected(_)));
+
+        // When we add the second block, our node should recognize it's part of a longer chain.
+        let result2 = blockchain.add_block(fork_block_2).unwrap();
+        assert!(matches!(
+            result2,
+            AddBlockResult::PotentialLongerForkDetected { .. }
+        ));
+    }
+
+    #[test]
+    fn test_successful_reorg() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        // 1. Create a main chain of length 1 (total height 1)
+        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        blockchain.add_block(main_chain_block_1.clone()).unwrap();
+        assert_eq!(blockchain.block_height().unwrap(), 1);
+        assert_eq!(
+            blockchain.get_tip_hash().unwrap().unwrap(),
+            main_chain_block_1.id().unwrap()
+        );
+
+        // 2. Create a longer competing fork of length 2 (total height 2)
+        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        let fork_block_2 = create_next_block(&blockchain, &fork_block_1, vec![]);
+
+        // 3. Add the fork blocks. The second one should trigger a reorg signal.
+        blockchain.add_block(fork_block_1.clone()).unwrap();
+        let result = blockchain.add_block(fork_block_2.clone()).unwrap();
+
+        // 4. Execute the reorganization
+        if let AddBlockResult::PotentialLongerForkDetected {
+            common_ancestor_index,
+            ..
+        } = result
+        {
+            blockchain
+                .reorganize_chain(
+                    vec![fork_block_1, fork_block_2.clone()],
+                    common_ancestor_index,
+                )
+                .unwrap();
+        }
+
+        // 5. Assert that the chain has successfully switched to the new tip.
+        assert_eq!(
+            blockchain.block_height().unwrap(),
+            2,
+            "Chain height should be updated after reorg"
+        );
+        assert_eq!(
+            blockchain.get_tip_hash().unwrap().unwrap(),
+            fork_block_2.id().unwrap(),
+            "Chain tip should be the new fork's tip after reorg"
+        );
     }
 }

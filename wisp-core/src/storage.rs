@@ -7,6 +7,7 @@ use crate::{
 };
 
 use anyhow::{Context, Result};
+use bincode::config::standard as bincode_config;
 use log::info;
 impl Blockchain {
     const UTXO_SNAPSHOT_INTERVAL: u64 = 720; // Save a snapshot every 720 blocks
@@ -51,7 +52,11 @@ impl Blockchain {
         let key = format!("block_{}", hash);
         self.db
             .get(key)?
-            .map(|ivec| bincode::deserialize(&ivec).context("Failed to deserialize block"))
+            .map(|ivec| {
+                bincode::decode_from_slice(&ivec, bincode_config())
+                    .map(|(b, _)| b)
+                    .context("Failed to deserialize block")
+            })
             .transpose()
     }
 
@@ -59,7 +64,7 @@ impl Blockchain {
     pub fn get_block_by_index(&self, index: u64) -> Result<Option<Block>> {
         let hash_key = format!("index_{}", index);
         if let Some(hash_ivec) = self.db.get(hash_key)? {
-            let hash: Hash = bincode::deserialize(&hash_ivec)?;
+            let (hash, _): (Hash, _) = bincode::decode_from_slice(&hash_ivec, bincode_config())?;
             self.get_block_by_hash(&hash)
         } else {
             Ok(None)
@@ -68,7 +73,7 @@ impl Blockchain {
 
     /// Saves a snapshot of the current UTXO set to the database.
     pub fn save_utxo_snapshot(&self, height: u64) -> Result<()> {
-        let utxo_bytes = bincode::serialize(&self.utxo_set)?;
+        let utxo_bytes = bincode::encode_to_vec(&self.utxo_set, bincode_config())?;
         self.db.insert("utxo_snapshot", utxo_bytes)?;
         self.db
             .insert("last_utxo_snapshot_height", &height.to_be_bytes())?;
@@ -110,14 +115,16 @@ impl Blockchain {
         self.db
             .get("tip_hash")?
             .map(|ivec| {
-                bincode::deserialize(&ivec).context("Failed to deserialize tip hash with bincode")
+                bincode::decode_from_slice(&ivec, bincode_config())
+                    .map(|(h, _)| h)
+                    .context("Failed to deserialize tip hash with bincode")
             })
             .transpose()
     }
 
     /// Sets the hash of the current chain tip in the database.
     pub fn set_tip_hash(&self, hash: &Hash) -> Result<()> {
-        let bytes = bincode::serialize(hash)?;
+        let bytes = bincode::encode_to_vec(hash, bincode_config())?;
         self.db.insert("tip_hash", bytes)?;
         Ok(())
     }
@@ -167,7 +174,9 @@ impl Blockchain {
         self.db
             .get(key)?
             .map(|ivec| {
-                bincode::deserialize(&ivec)
+                // This function seems unused, but let's fix it anyway.
+                bincode::decode_from_slice(&ivec, bincode_config())
+                    .map(|(h, _)| h)
                     .context("Failed to deserialize tx hash from outpoint index with bincode")
             })
             .transpose()
@@ -179,7 +188,9 @@ impl Blockchain {
         self.db
             .get(key)?
             .map(|ivec| {
-                bincode::deserialize(&ivec)
+                // This function seems unused, but let's fix it anyway.
+                bincode::decode_from_slice(&ivec, bincode_config())
+                    .map(|(h, _)| h)
                     .context("Failed to deserialize tx hash from chronological index with bincode")
             })
             .transpose()
@@ -194,7 +205,11 @@ impl Blockchain {
         let result = self
             .db
             .get(key)?
-            .map(|ivec| bincode::deserialize(&ivec).context("Failed to deserialize history list"))
+            .map(|ivec| {
+                bincode::decode_from_slice(&ivec, bincode_config())
+                    .map(|(v, _)| v)
+                    .context("Failed to deserialize history list")
+            })
             .transpose()?
             .unwrap_or_default();
         Ok(result)
@@ -206,7 +221,8 @@ impl Blockchain {
         // Try to load from a snapshot first.
         let (mut new_utxos, start_height) =
             if let Some(snapshot_ivec) = self.db.get("utxo_snapshot")? {
-                let snapshot: crate::utxo::UtxoSet = bincode::deserialize(&snapshot_ivec)?;
+                let (snapshot, _): (crate::utxo::UtxoSet, _) =
+                    bincode::decode_from_slice(&snapshot_ivec, bincode_config())?;
                 let snapshot_height = self.get_last_utxo_snapshot_height()?.unwrap_or(0);
                 (snapshot.utxos, snapshot_height + 1)
             } else {

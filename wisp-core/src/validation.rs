@@ -101,14 +101,9 @@ impl Block {
             ));
         }
 
-        // Correctly calculate total fees by iterating through non-coinbase transactions
-        // and using the blockchain's reliable fee calculation method.
-        let mut total_fees_in_block = Amount::zero();
-        for tx in self.transactions.iter().skip(1) {
-            let fee = blockchain.calculate_transaction_fee(tx)?;
-            total_fees_in_block = (total_fees_in_block + fee)
-                .context("Fee summation overflow during block validation")?;
-        }
+        // Use the block's own fee calculation method, which correctly handles intra-block spends
+        // by passing it the blockchain's current UTXO set.
+        let total_fees_in_block = self.calculate_total_fees(blockchain.utxos())?;
 
         self.verify_coinbase_transaction(total_fees_in_block)
             .context("Coinbase transaction verification failed")?;
@@ -203,7 +198,7 @@ impl Block {
                     Some(sig) => prev_output
                         .pubkey
                         .0
-                        .verify(&tx_hash_for_verification.as_bytes(), sig)
+                        .verify(&tx_hash_for_verification.as_bytes(), &sig.0)
                         .is_ok(),
                     None => false,
                 };

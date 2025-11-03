@@ -3,10 +3,11 @@ use crate::{
     transactions::{OutPoint, TransactionOutput},
 };
 use anyhow::Result;
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Encode, Decode, Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct UtxoSet {
     pub utxos: HashMap<OutPoint, (bool, TransactionOutput)>,
 }

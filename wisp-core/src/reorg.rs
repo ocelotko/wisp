@@ -3,6 +3,7 @@ use crate::{
     sha256::Hash,
 };
 use anyhow::{anyhow, Result};
+use bincode::config::standard as bincode_config;
 use log::{info, warn};
 use sled::transaction::ConflictableTransactionError;
 
@@ -95,21 +96,22 @@ impl Blockchain {
                                 }
                             }
 
-                            for input in &tx.inputs {
-                                let spent_output = self.find_output_for_reorg(
-                                    tx_db,
-                                    &input.outpoint,
-                                    &[],
-                                )?;
-                                let output = spent_output.ok_or_else(|| {
-                                    ReorgError::Anyhow(anyhow!(
-                                        "Reorg failed: Could not find spent output for input {} when reverting block {}",
-                                        input.outpoint,
-                                        block_to_revert.index
-                                    ))
-                                })?;
-                                let key = format!("history_{}", output.pubkey.fingerprint());
-                                self.remove_hash_from_history_list(tx_db, &key, &tx_hash)?;
+                            if !tx.is_coinbase() {
+                                for input in &tx.inputs {
+                                    let spent_output =
+                                        self.find_output_for_reorg(tx_db, &input.outpoint, &[])?;
+                                    let output = spent_output.ok_or_else(|| {
+                                        ReorgError::Anyhow(anyhow!(
+                                            "Reorg failed: Could not find spent output for input {} when reverting block {}",
+                                            input.outpoint,
+                                            block_to_revert.index
+                                        ))
+                                    })?;
+                                    let key = format!("history_{}", output.pubkey.fingerprint());
+                                    self.remove_hash_from_history_list(
+                                        tx_db, &key, &tx_hash,
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -155,10 +157,10 @@ impl Blockchain {
                             .map_err(ReorgError::Anyhow)?;
 
                         let hash = block_to_apply.id().map_err(ReorgError::Anyhow)?;
-                        let block_bytes = bincode::serialize(block_to_apply)
+                        let block_bytes = bincode::encode_to_vec(block_to_apply, bincode_config())
                             .map_err(|e| ReorgError::Anyhow(e.into()))?; // This is fine
-                        let hash_bytes =
-                            bincode::serialize(&hash).map_err(|e| ReorgError::Anyhow(e.into()))?;
+                        let hash_bytes = bincode::encode_to_vec(&hash, bincode_config())
+                            .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
                         tx_db.insert(format!("block_{}", hash).as_bytes(), block_bytes)?;
                         tx_db.insert(
@@ -172,7 +174,7 @@ impl Blockchain {
 
                         for tx in &block_to_apply.transactions {
                             let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
-                            if tx.inputs.is_empty() {
+                            if tx.is_coinbase() {
                                 // Adjust total supply by adding the new coinbase reward and fees.
                                 let block_reward =
                                     crate::utils::calculate_block_reward(block_to_apply.index);
@@ -182,31 +184,34 @@ impl Blockchain {
                                 supply = supply.saturating_add(block_reward.as_smallest_unit() + fees);
                             }
 
-                            let tx_hash_bytes = bincode::serialize(&tx_hash)
-                                .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                            let tx_hash_bytes =
+                                bincode::encode_to_vec(&tx_hash, bincode_config()).map_err(|e| ReorgError::Anyhow(e.into()))?;
                             // Add the transaction to the public key's history index.
                             for output in &tx.outputs {
                                 let key = format!("history_{}", output.pubkey.fingerprint());
                                 self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
                             }
-                            for input in &tx.inputs {
-                                let spent_output = self.find_output_for_reorg(
-                                    tx_db,
-                                    &input.outpoint,
-                                    &new_chain_segment,
-                                )?;
-                                let output = spent_output.ok_or_else(|| {
-                                    ReorgError::Anyhow(anyhow!(
-                                        "Reorg failed: Could not find spent output for input {} when applying block {}",
-                                        input.outpoint,
-                                        block_to_apply.index
-                                    ))
-                                })?;
-                                let key = format!("history_{}", output.pubkey.fingerprint());
-                                self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                            if !tx.is_coinbase() {
+                                for input in &tx.inputs {
+                                    let spent_output = self.find_output_for_reorg(
+                                        tx_db,
+                                        &input.outpoint,
+                                        &new_chain_segment,
+                                    )?;
+                                    let output = spent_output.ok_or_else(|| {
+                                        ReorgError::Anyhow(anyhow!(
+                                            "Reorg failed: Could not find spent output for input {} when applying block {}",
+                                            input.outpoint,
+                                            block_to_apply.index
+                                        ))
+                                    })?;
+                                    let key = format!("history_{}", output.pubkey.fingerprint());
+                                    self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                                }
                             }
 
-                            if !tx.inputs.is_empty() { // Add transaction metadata.
+                            if !tx.is_coinbase() {
+                                // Add transaction metadata.
                                 tx_db.insert(
                                     format!("tx_by_order_{}", tx_count).as_bytes(),
                                     tx_hash_bytes.clone(),
@@ -227,7 +232,7 @@ impl Blockchain {
                     tx_db.insert(b"chain_height", &new_height.to_be_bytes())?;
                     tx_db.insert(
                         b"tip_hash",
-                        bincode::serialize(&new_tip_hash)
+                        bincode::encode_to_vec(&new_tip_hash, bincode_config())
                             .map_err(|e| ReorgError::Anyhow(e.into()))?,
                     )?;
                     tx_db.insert(b"total_tx_count", &tx_count.to_be_bytes())?;
@@ -246,7 +251,7 @@ impl Blockchain {
         // Collect all transactions from the reverted blocks to potentially re-add to the mempool.
         for block_to_revert in rolled_back_blocks.iter().rev() {
             for tx in &block_to_revert.transactions {
-                if !tx.inputs.is_empty() {
+                if !tx.is_coinbase() {
                     txs_to_readd_to_mempool.push(tx.clone());
                 }
             }
@@ -324,14 +329,16 @@ impl Blockchain {
 
             let block_hash_key = format!("index_{}", block_index);
             if let Some(hash_ivec) = tx_db.get(block_hash_key.as_bytes())? {
-                let block_hash: Hash =
-                    bincode::deserialize(&hash_ivec).map_err(|e| ReorgError::Anyhow(e.into()))?;
+                let (block_hash, _): (Hash, _) =
+                    bincode::decode_from_slice(&hash_ivec, bincode_config())
+                        .map_err(|e| ReorgError::Anyhow(e.into()))?;
                 let block_key = format!("block_{}", block_hash);
                 // Optimization: Instead of deserializing the whole block, find the specific transaction
                 // and then the output. This avoids unnecessary work if the tx isn't in this block.
                 if let Some(block_ivec) = tx_db.get(block_key.as_bytes())? {
-                    let block: Block = bincode::deserialize(&block_ivec)
-                        .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                    let (block, _): (Block, _) =
+                        bincode::decode_from_slice(&block_ivec, bincode_config())
+                            .map_err(|e| ReorgError::Anyhow(e.into()))?;
                     return Ok(block
                         .transactions
                         .iter()
@@ -364,14 +371,19 @@ impl Blockchain {
     ) -> Result<(), ConflictableTransactionError<ReorgError>> {
         let mut hashes: Vec<Hash> = tx_db
             .get(key.as_bytes())?
-            .and_then(|v| bincode::deserialize(&v).ok())
+            .and_then(|v| {
+                bincode::decode_from_slice::<Vec<Hash>, _>(&v, bincode_config())
+                    .ok()
+                    .map(|(h, _)| h)
+            })
             .unwrap_or_default();
 
         if hashes.iter().all(|h| h != tx_hash) {
             hashes.push(*tx_hash);
             tx_db.insert(
                 key.as_bytes(),
-                bincode::serialize(&hashes).map_err(|e| ReorgError::Anyhow(e.into()))?,
+                bincode::encode_to_vec(&hashes, bincode_config())
+                    .map_err(|e| ReorgError::Anyhow(e.into()))?,
             )?;
         }
         Ok(())
@@ -384,17 +396,19 @@ impl Blockchain {
         key: &str,
         tx_hash: &Hash,
     ) -> Result<(), ConflictableTransactionError<ReorgError>> {
-        if let Some(mut hashes) = tx_db
-            .get(key.as_bytes())?
-            .and_then(|v| bincode::deserialize::<Vec<Hash>>(&v).ok())
-        {
+        if let Some(mut hashes) = tx_db.get(key.as_bytes())?.and_then(|v| {
+            bincode::decode_from_slice::<Vec<Hash>, _>(&v, bincode_config())
+                .ok()
+                .map(|(h, _)| h)
+        }) {
             hashes.retain(|h| h != tx_hash);
             if hashes.is_empty() {
                 tx_db.remove(key.as_bytes())?;
             } else {
                 tx_db.insert(
                     key.as_bytes(),
-                    bincode::serialize(&hashes).map_err(|e| ReorgError::Anyhow(e.into()))?,
+                    bincode::encode_to_vec(&hashes, bincode_config())
+                        .map_err(|e| ReorgError::Anyhow(e.into()))?,
                 )?;
             }
         }

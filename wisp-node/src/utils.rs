@@ -121,9 +121,15 @@ pub async fn find_longest_chain_node() -> Result<(String, u64)> {
         match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
             Ok(Ok(Message::LatestBlock(Some((_, remote_height))))) => {
                 let remote_block_count = remote_height + 1;
-                debug!("Received LatestBlock with height {} from {}", remote_height, node_addr);
+                debug!(
+                    "Received LatestBlock with height {} from {}",
+                    remote_height, node_addr
+                );
                 if remote_block_count > longest_count {
-                    info!("New longest blockchain: {} blocks from {}", remote_block_count, node_addr);
+                    info!(
+                        "New longest blockchain: {} blocks from {}",
+                        remote_block_count, node_addr
+                    );
                     longest_count = remote_block_count;
                     longest_name = node_addr.clone();
                 }
@@ -238,7 +244,7 @@ pub async fn download_blockchain(node: &str, target_block_count: u64) -> Result<
                         "Received block with unexpected index. Expected {}, got {}. Block Hash: {}",
                         i,
                         block.index,
-                    block.id().unwrap_or_default()
+                        block.id().unwrap_or_default()
                     );
                     return Err(anyhow!(
                         "Received block with unexpected index. Expected {}, got {}.",
@@ -253,7 +259,7 @@ pub async fn download_blockchain(node: &str, target_block_count: u64) -> Result<
                     AddBlockResult::Added => {
                         debug!(
                             "Block with index {} successfully added during download. Current chain height: {}",
-                            i, 
+                            i,
                             blockchain.block_height()?
                         );
                     }
