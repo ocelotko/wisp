@@ -299,9 +299,15 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                             );
                         }
                     }
-                    AddBlockResult::OrphanedOrDisconnected(reason) => {
+                    AddBlockResult::Orphaned => {
                         warn!(
-                            "❌ Block {} rejected (orphaned): {}",
+                            "Block {} is an orphan. Added to orphan pool.",
+                            received_block_hash
+                        );
+                    }
+                    AddBlockResult::OrphanRejected(reason) => {
+                        warn!(
+                            "❌ Orphan block {} rejected: {}",
                             received_block_hash, reason
                         );
                         let rejection_message = Message::BlockRejected(reason);
@@ -540,10 +546,15 @@ pub async fn handle_connection<A: ToSocketAddrs + std::fmt::Display + Clone + Se
                             info!("Sent BlockRejected message to miner.");
                         }
                     }
-                    AddBlockResult::OrphanedOrDisconnected(reason) => {
+                    AddBlockResult::Orphaned | AddBlockResult::OrphanRejected(reason) => {
                         warn!(
                             "❌ Mined block {} rejected (orphaned): {}",
-                            submitted_block_hash, reason
+                            submitted_block_hash,
+                            if let AddBlockResult::OrphanRejected(r) = add_result {
+                                r
+                            } else {
+                                "Added to pool".to_string()
+                            }
                         );
                         let rejection_message = Message::BlockRejected(reason);
                         if rejection_message

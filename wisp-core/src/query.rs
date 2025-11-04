@@ -1,14 +1,15 @@
 use crate::blockchain::Blockchain;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bincode::config::standard as bincode_config;
 use chrono::{DateTime, Utc};
 use log::{debug, error};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     network::{TransactionStatus, WalletTransactionInfo},
     sha256::Hash,
     signatures::PublicKey,
+    storage::DBKeys,
     transactions::{OutPoint, Transaction, TransactionOutput},
 };
 
@@ -32,9 +33,17 @@ impl Blockchain {
             return TransactionStatus::Pending;
         }
 
-        let key = format!("tx_location_{}", tx_hash);
+        let key = DBKeys::tx_location(tx_hash);
         // Check the database for a `tx_location` entry, which maps a tx hash to its block index.
         if let Ok(Some(ivec)) = self.db.get(&key) {
+            if ivec.len() != 8 {
+                error!(
+                    "Invalid tx_location length for {}: {} (expected 8). Treating as not found.",
+                    tx_hash,
+                    ivec.len()
+                );
+                return TransactionStatus::NotFound;
+            }
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ivec);
             let block_index = u64::from_be_bytes(bytes);
@@ -48,7 +57,7 @@ impl Blockchain {
                 }
             }
         } else if let Err(e) = self.db.get(&key) {
-            error!("Database error checking tx_location: {}", e);
+            error!("Database error checking tx_location for {}: {}", tx_hash, e);
         }
 
         debug!(
@@ -70,8 +79,16 @@ impl Blockchain {
         }
 
         // If not in mempool, check the database for a confirmed transaction.
-        let key = format!("tx_location_{}", tx_hash);
+        let key = DBKeys::tx_location(tx_hash);
         if let Some(ivec) = self.db.get(&key)? {
+            if ivec.len() != 8 {
+                error!(
+                    "Invalid tx_location length for {}: {} (expected 8). Treating as not found.",
+                    tx_hash,
+                    ivec.len()
+                );
+                return Ok(None);
+            }
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ivec);
             let block_index = u64::from_be_bytes(bytes);
@@ -116,6 +133,35 @@ impl Blockchain {
         Ok(None)
     }
 
+    /// Finds multiple transaction outputs by their `OutPoint`s.
+    /// It checks the live UTXO set first, then falls back to searching the database for historical transactions.
+    /// This is more efficient than calling `find_output_by_outpoint_in_chain_or_utxos` in a loop.
+    pub fn find_outputs_by_outpoints(
+        &self,
+        outpoints: &[OutPoint],
+    ) -> Result<HashMap<OutPoint, TransactionOutput>> {
+        let mut results = HashMap::new();
+        let mut needed_from_db = Vec::new();
+
+        // First, check the in-memory UTXO set.
+        for outpoint in outpoints {
+            if let Some((_, output)) = self.utxo_set.utxos.get(outpoint) {
+                results.insert(*outpoint, output.clone());
+            } else {
+                needed_from_db.push(*outpoint);
+            }
+        }
+
+        // For any not found in memory, check the database.
+        for outpoint in needed_from_db {
+            if let Some(output) = self.find_output_by_outpoint_in_db(&outpoint)? {
+                results.insert(outpoint, output);
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Finds a specific transaction output by its `OutPoint` by searching the database only.
     /// This is useful for operations that need to look at historical state, like reorgs.
     pub fn find_output_by_outpoint_in_db(
@@ -135,23 +181,32 @@ impl Blockchain {
 
         // This logic is a simplified, DB-only version of `get_transaction_with_details`.
         // It avoids using `&self` and the mempool.
-        let key = format!("tx_location_{}", tx_hash);
-        if let Some(ivec) = db.get(&key)? {
+        if let Some(ivec) = db.get(DBKeys::tx_location(&tx_hash))? {
+            if ivec.len() != 8 {
+                error!(
+                    "Invalid tx_location length for {}: {} (expected 8). Treating as not found.",
+                    tx_hash,
+                    ivec.len()
+                );
+                return Ok(None);
+            }
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ivec);
             let block_index = u64::from_be_bytes(bytes);
 
             // Nested logic to get block from index
-            let hash_key = format!("index_{}", block_index);
-            if let Some(hash_ivec) = db.get(hash_key)? {
+            if let Some(hash_ivec) = db.get(DBKeys::index_to_hash(block_index))? {
                 let (hash, _): (Hash, _) =
                     bincode::decode_from_slice(&hash_ivec, bincode_config())?;
 
                 // Nested logic to get block from hash
-                let block_key = format!("block_{}", hash);
-                if let Some(block_ivec) = db.get(block_key)? {
-                    let (block, _): (crate::blockchain::Block, _) =
-                        bincode::decode_from_slice(&block_ivec, bincode_config())?;
+                if let Some(block_ivec) = db.get(DBKeys::block(&hash))? {
+                    let (checked_block, _): (crate::blockchain::CheckedBlock, _) =
+                        bincode::decode_from_slice(&block_ivec, bincode_config())
+                            .context("Failed to decode CheckedBlock in find_output_by_outpoint")?;
+                    let block = checked_block.into_block().context(
+                        "Failed to verify and unwrap CheckedBlock in find_output_by_outpoint",
+                    )?;
                     if let Some(tx) = block
                         .transactions
                         .iter()

@@ -216,29 +216,41 @@ impl Blockchain {
             return Ok(crate::MAX_TARGET);
         }
 
-        let last_block = self.get_block_by_index(last_block_index)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "DAA: Missing last block in window at index {}",
-                last_block_index
-            )
-        })?;
+        // Attempt to get block data from the DAA cache first.
+        let (last_block_timestamp, current_target) =
+            if let Some((ts, tgt)) = self.daa_cache.get(&last_block_index) {
+                (*ts, *tgt)
+            } else {
+                // Fallback to DB if not in cache.
+                let block = self.get_block_by_index(last_block_index)?.ok_or_else(|| {
+                    anyhow!(
+                        "DAA: Missing last block in window at index {}",
+                        last_block_index
+                    )
+                })?;
+                (block.timestamp, block.target)
+            };
 
-        let first_block = self.get_block_by_index(first_block_index)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "DAA: Missing first block in window at index {}",
-                first_block_index
-            )
-        })?;
+        let first_block_timestamp = if let Some((ts, _)) = self.daa_cache.get(&first_block_index) {
+            *ts
+        } else {
+            // Fallback to DB if not in cache.
+            let block = self.get_block_by_index(first_block_index)?.ok_or_else(|| {
+                anyhow!(
+                    "DAA: Missing first block in window at index {}",
+                    first_block_index
+                )
+            })?;
+            block.timestamp
+        };
 
         // Time span of the window
         let mut actual_timespan =
-            last_block.timestamp.timestamp() - first_block.timestamp.timestamp();
+            last_block_timestamp.timestamp() - first_block_timestamp.timestamp();
         actual_timespan = std::cmp::max(1, actual_timespan);
 
         let ideal_timespan = ((DAA_WINDOW - 1) as u64 * IDEAL_BLOCK_TIME) as i64;
         let clamped_timespan = actual_timespan.clamp(ideal_timespan / 4, ideal_timespan * 4);
-
-        let current_target = last_block.target;
 
         let avg_time_u256 = U256::from(clamped_timespan as u64);
         let ideal_time_u256 = U256::from(ideal_timespan as u64);

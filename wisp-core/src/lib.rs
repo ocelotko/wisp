@@ -53,6 +53,12 @@ pub const MIN_TARGET: U256 = U256([1, 0, 0, 0]);
 /// The maximum number of transactions allowed in a single block.
 pub const MAX_BLOCK_TRANSACTIONS: usize = 1000;
 
+/// The maximum size of a block in bytes.
+pub const MAX_BLOCK_SIZE_BYTES: usize = 1_000_000; // 1 MB
+
+/// The maximum size of a single transaction in bytes.
+pub const MAX_TRANSACTION_SIZE_BYTES: usize = 100_000; // 100 KB
+
 /// The maximum size of a network message in bytes.
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 

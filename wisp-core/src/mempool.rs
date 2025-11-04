@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use ecdsa::signature::Verifier;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::HashSet;
 
 /// The maximum age in seconds for a transaction to remain in the mempool before being evicted.
@@ -128,6 +128,11 @@ impl Blockchain {
             "Transaction added to mempool. Mempool size: {}",
             self.mempool.len()
         );
+
+        // Persist the updated mempool to disk.
+        if let Err(e) = self.save_mempool_snapshot() {
+            warn!("[MEMPOOL] Failed to save mempool snapshot: {}", e);
+        }
         Ok(())
     }
 
@@ -155,26 +160,31 @@ impl Blockchain {
     }
 
     /// Removes transactions from the mempool that have been included in a new block.
-    pub fn clear_mempool_of_block_transactions(&mut self, block: &Block) {
-        // Create a set of transaction hashes from the block for efficient lookup.
-        let mut block_transaction_hashes: HashSet<Hash> = HashSet::new();
-        for tx in &block.transactions {
-            if let Ok(hash) = tx.txid() {
-                block_transaction_hashes.insert(hash);
-            } else {
-                warn!("Failed to hash transaction for mempool clearing.");
+    pub fn clear_mempool_of_block_transactions(&mut self, block: &Block, block_hash: Hash) {
+        let txids_in_block: HashSet<Hash> = block
+            .transactions
+            .iter()
+            .filter_map(|tx| tx.txid().ok())
+            .collect();
+
+        let initial_mempool_size = self.mempool.len();
+
+        // Retain only the transactions that are NOT in the new block.
+        self.mempool
+            .retain(|txid, _| !txids_in_block.contains(txid));
+
+        let removed_count = initial_mempool_size - self.mempool.len();
+
+        // Persist the change if any transactions were removed.
+        if removed_count > 0 {
+            if let Err(e) = self.save_mempool_snapshot() {
+                warn!("[MEMPOOL] Failed to save mempool snapshot after clearing block transactions: {}", e);
             }
         }
 
-        let initial_mempool_size = self.mempool.len();
-        // Retain only the transactions that are NOT in the new block.
-        self.mempool
-            .retain(|hash, _| !block_transaction_hashes.contains(hash));
-
-        debug!(
-            "Removed {} transactions from mempool for block {}.",
-            initial_mempool_size - self.mempool.len(),
-            block.id().unwrap_or_default()
+        info!(
+            "[MEMPOOL] Removed {} transactions from mempool for block {}.",
+            removed_count, block_hash
         );
     }
 }
@@ -182,6 +192,7 @@ impl Blockchain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils;
     use crate::{signatures::PrivateKey, transactions::TransactionOutput};
     use tempfile::tempdir;
 
@@ -190,6 +201,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = sled::open(dir.path()).unwrap();
         let blockchain = Blockchain::new(db);
+        // For mempool tests, we don't need a full chain, just a UTXO set.
+        // So we don't call `load_from_db` which would add a genesis block.
+        // This keeps the tests focused on mempool logic.
         (blockchain, dir)
     }
 
@@ -199,22 +213,27 @@ mod tests {
         private_key: &PrivateKey,
         amount: Amount,
     ) -> OutPoint {
+        // In a real scenario, this UTXO would come from a confirmed block.
+        // For isolated mempool testing, we can manually insert it.
         let pubkey = private_key.public_key();
-        let tx = Transaction::new(
-            vec![], // Dummy tx, not a real coinbase
+        // Create a fake transaction to be the source of the UTXO.
+        let funding_tx = Transaction::new(
+            vec![],
             vec![TransactionOutput {
                 value: amount,
                 pubkey,
             }],
         );
-        let txid = tx.txid().unwrap();
+        let txid = funding_tx.txid().unwrap();
         let outpoint = OutPoint { txid, vout: 0 };
 
-        // Manually insert into the UTXO set for testing purposes.
+        // Manually insert the UTXO into the blockchain's UTXO set.
+        // The `(false, ...)` tuple indicates it is not yet spent in the mempool.
         blockchain
             .utxo_set
             .utxos
-            .insert(outpoint, (false, tx.outputs[0].clone()));
+            .insert(outpoint, (false, funding_tx.outputs[0].clone()));
+
         outpoint
     }
 
@@ -310,7 +329,7 @@ mod tests {
     #[test]
     fn test_reject_coinbase_in_mempool() {
         let (mut blockchain, _dir) = setup_test_blockchain();
-        let coinbase_tx = crate::utils::genesis_block().unwrap().transactions[0].clone();
+        let coinbase_tx = utils::genesis_block().unwrap().transactions[0].clone();
         let result = blockchain.add_to_mempool(coinbase_tx);
         assert!(result.is_err());
         assert!(result

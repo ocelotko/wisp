@@ -1,5 +1,5 @@
 use crate::{
-    blockchain::Block,
+    blockchain::{Block, BlockHeader},
     sha256::Hash,
     signatures::PublicKey,
     transactions::{OutPoint, Transaction, TransactionOutput},
@@ -51,25 +51,31 @@ pub enum Message {
     },
 
     // --- Mining Messages ---
-    FetchTemplate(PublicKey),
-    Template(Block),
-    NewTemplate(Block), // Pushed from node to miner when tip changes
-    ValidateTemplate(Block),
-    TemplateValidity(bool),
-    SubmitTemplate(Block),
-    BlockSubmittedConfirmation,
-    BlockRejected(String),
+    FetchTemplate(PublicKey), // Miner requests a block template to work on.
+    Template(Block),          // Node responds with a block template.
+    NewTemplate(Block),       // Node pushes a new template to miners when the chain tip changes.
+    ValidateTemplate(Block),  // Miner asks node to validate a found template before submitting.
+    TemplateValidity(bool),   // Node responds with validity of the template.
+    SubmitTemplate(Block),    // Miner submits a mined block.
+    BlockSubmittedConfirmation, // Node confirms receipt and successful addition of the block.
+    BlockRejected(String),    // Node rejects a submitted block.
 
     // --- Chain & Block Sync Messages ---
     NewBlock(Block),
     FetchBlock(u64),
     FetchBlockByHash(Hash),
-    FetchBlockInfo(u64),
-    BlockInfo(Option<Block>),
     FetchLatestBlock,
     LatestBlock(Option<(Block, u64)>),
-    FetchChainSegment(u64),   // Request blocks from a certain index onwards
-    ChainSegment(Vec<Block>), // Response with the requested blocks
+
+    // Headers-first synchronization messages
+    GetBlockHeaders {
+        from_index: u64,
+        count: u32,
+    }, // Request a sequence of block headers.
+    BlockHeaders(Vec<BlockHeader>), // Response with the requested headers.
+
+    FetchChainSegment(u64), // DEPRECATED: Prefer GetBlockHeaders and FetchBlock. Request blocks from a certain index onwards.
+    ChainSegment(Vec<Block>), // DEPRECATED: Response with the requested blocks.
 
     // --- General & Peer Discovery Messages ---
     Ping,

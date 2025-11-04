@@ -8,26 +8,53 @@ use crate::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use bincode::config::standard as bincode_config;
 use chrono::{Duration as ChronoDuration, Utc};
 use ecdsa::signature::Verifier;
 use log::{debug, info};
+use sled::transaction::TransactionalTree;
 use std::collections::{HashMap, HashSet};
+
+pub enum ValidationState<'a> {
+    Live(&'a Blockchain),
+    Reorg {
+        temp_utxos: &'a HashMap<OutPoint, (bool, TransactionOutput)>,
+        tx_db: &'a TransactionalTree,
+        db: &'a sled::Db,
+    },
+}
 
 impl Block {
     /// Performs a comprehensive validation of a block's contents and rules.
     /// This is a critical function for ensuring the integrity of the blockchain. It's called when adding a new block.
     pub fn validate_block(&self, blockchain: &Blockchain, expected_target: &U256) -> Result<()> {
+        self.validate_block_with_state(ValidationState::Live(blockchain), expected_target)
+    }
+
+    /// A unified block validation function that works for both live chain and reorg contexts.
+    fn validate_block_with_state(
+        &self,
+        state: ValidationState,
+        expected_target: &U256,
+    ) -> Result<()> {
         info!(
             "DEBUG: Starting validate_block for index {} hash {}",
             self.index,
             self.id().unwrap_or_default()
         );
-        info!("DEBUG: expected_target: {}", expected_target);
-        let block_hash = self.id()?;
-        info!(
-            "Validating block with hash: {} at index {}",
-            block_hash, self.index
-        );
+
+        // 0. Check block size. This is a cheap check to perform first to prevent DoS.
+        let encoded_block = bincode::encode_to_vec(self, bincode_config())?;
+        if encoded_block.len() > crate::MAX_BLOCK_SIZE_BYTES {
+            return Err(anyhow!(
+                "Block size ({} bytes) exceeds maximum limit of {} bytes",
+                encoded_block.len(),
+                crate::MAX_BLOCK_SIZE_BYTES
+            ));
+        }
+        let block_hash = self
+            .id()
+            .context("Failed to get block hash for validation")?;
 
         // 1. Check if the block's hash meets its own declared PoW target.
         if !block_hash.matches_target(self.target) {
@@ -73,11 +100,21 @@ impl Block {
 
         // 5. Check if the timestamp is greater than the median time of the past 11 blocks.
         if self.index > 0 {
-            if self.timestamp.timestamp()
-                <= Block::calculate_median_time_past(self.index, blockchain)?
-            {
+            let mtp = match state {
+                ValidationState::Live(blockchain) => {
+                    Block::calculate_median_time_past(self.index, blockchain, None)?
+                }
+                ValidationState::Reorg { db, tx_db, .. } => Block::calculate_median_time_past(
+                    self.index,
+                    &Blockchain::new(db.clone()),
+                    Some(tx_db),
+                )?,
+            };
+
+            if self.timestamp.timestamp() <= mtp {
                 return Err(anyhow!(
-                    "Block timestamp is not greater than the median time of past 11 blocks."
+                    "Block timestamp ({}) is not greater than the median time of past 11 blocks ({}).",
+                    self.timestamp.timestamp(), mtp
                 ));
             }
         }
@@ -103,19 +140,46 @@ impl Block {
 
         // Use the block's own fee calculation method, which correctly handles intra-block spends
         // by passing it the blockchain's current UTXO set.
-        let total_fees_in_block = self.calculate_total_fees(blockchain.utxos())?;
+        let total_fees_in_block = match state {
+            ValidationState::Live(blockchain) => self.calculate_total_fees(blockchain.utxos())?,
+            ValidationState::Reorg { tx_db, .. } => self
+                .calculate_total_fees_for_reorg(tx_db)
+                .map_err(|e| anyhow!("Failed to calculate fees for reorg: {:?}", e))?,
+        };
 
         self.verify_coinbase_transaction(total_fees_in_block)
             .context("Coinbase transaction verification failed")?;
         info!("DEBUG: Coinbase transaction validation passed.");
 
         // 8. Verify all other (regular) transactions in the block.
+        let utxos_for_validation = match state {
+            ValidationState::Live(blockchain) => blockchain.utxos(),
+            ValidationState::Reorg { temp_utxos, .. } => temp_utxos,
+        };
         info!("DEBUG: About to verify regular transactions.");
-        self.verify_transactions(self.index, blockchain.utxos())
+        self.verify_transactions(utxos_for_validation)
             .context("Regular transactions verification failed")?;
         info!("DEBUG: Regular transactions validation passed.");
-
         Ok(())
+    }
+
+    /// A specialized version of `validate_block` for use within a database transaction during a reorg.
+    /// It uses the transactional database view (`tx_db`) instead of a `Blockchain` instance to avoid deadlocks.
+    pub fn validate_block_for_reorg(
+        &self,
+        temp_utxos: &HashMap<OutPoint, (bool, TransactionOutput)>,
+        expected_target: &U256,
+        tx_db: &TransactionalTree,
+        db: &sled::Db,
+    ) -> Result<()> {
+        self.validate_block_with_state(
+            ValidationState::Reorg {
+                temp_utxos,
+                tx_db,
+                db,
+            },
+            expected_target,
+        )
     }
 
     /// Verifies all non-coinbase transactions within the block.
@@ -123,22 +187,29 @@ impl Block {
     /// and ensuring that input values are sufficient to cover output values.
     pub fn verify_transactions(
         &self,
-        _predicted_block_height: u64,
         chain_utxos: &HashMap<OutPoint, (bool, TransactionOutput)>,
     ) -> Result<()> {
-        info!(
-            "DEBUG: verify_transactions called for block index {}",
-            chain_utxos.len()
-        );
+        // Check transaction count against the consensus limit.
+        if self.transactions.len() > crate::MAX_BLOCK_TRANSACTIONS {
+            return Err(anyhow!(
+                "Block contains too many transactions: {}, max is {}",
+                self.transactions.len(),
+                crate::MAX_BLOCK_TRANSACTIONS
+            ));
+        }
+
         // Keep track of inputs spent within this block to prevent intra-block double spends.
         let mut inputs_in_block: HashSet<OutPoint> = HashSet::new();
         let mut new_outputs_in_block: HashMap<OutPoint, TransactionOutput> = HashMap::new();
+        let mut tx_hashes_in_block: HashSet<crate::sha256::Hash> = HashSet::new();
+
         if self.transactions.is_empty() {
             return Err(anyhow!("Empty transactions"));
         }
 
         for transaction in self.transactions.iter().skip(1) {
             let tx_hash_for_verification = transaction.txid()?;
+
             info!(
                 "DEBUG: Verifying regular transaction {} in block {}",
                 tx_hash_for_verification, self.index
@@ -147,6 +218,25 @@ impl Block {
             let mut input_value = Amount::zero();
             let mut output_value = Amount::zero();
             let mut inputs_checked_in_tx: HashSet<OutPoint> = HashSet::new();
+
+            // Check for duplicate transactions within the block.
+            if !tx_hashes_in_block.insert(tx_hash_for_verification) {
+                return Err(anyhow!(
+                    "Duplicate transaction {} found in block",
+                    tx_hash_for_verification
+                ));
+            }
+
+            // Check transaction size.
+            let encoded_tx = bincode::encode_to_vec(transaction, bincode_config())?;
+            if encoded_tx.len() > crate::MAX_TRANSACTION_SIZE_BYTES {
+                return Err(anyhow!(
+                    "Transaction {} size ({} bytes) exceeds limit of {} bytes",
+                    tx_hash_for_verification,
+                    encoded_tx.len(),
+                    crate::MAX_TRANSACTION_SIZE_BYTES
+                ));
+            }
 
             if transaction.inputs.is_empty() {
                 return Err(anyhow!(
@@ -258,6 +348,7 @@ impl Block {
     /// block reward plus the sum of all transaction fees in the block.
     pub fn verify_coinbase_transaction(&self, total_fees_in_block: Amount) -> Result<()> {
         if self.transactions.is_empty() {
+            // This check is technically redundant if verify_transactions is called, but good for defense-in-depth.
             return Err(anyhow!("Block has no transactions (missing coinbase)"));
         }
 
@@ -270,12 +361,24 @@ impl Block {
             .coinbase_data
             .as_ref()
             .ok_or_else(|| anyhow!("Coinbase input is missing coinbase_data (scriptSig)"))?;
-        if coinbase_data.len() < 8 {
+
+        const MIN_COINBASE_DATA_SIZE: usize = 2;
+        const MAX_COINBASE_DATA_SIZE: usize = 100;
+        if coinbase_data.len() < MIN_COINBASE_DATA_SIZE
+            || coinbase_data.len() > MAX_COINBASE_DATA_SIZE
+        {
             return Err(anyhow!(
-                "Coinbase data is too short to contain block height"
+                "Coinbase data size ({}) is outside the allowed range of {}-{} bytes",
+                coinbase_data.len(),
+                MIN_COINBASE_DATA_SIZE,
+                MAX_COINBASE_DATA_SIZE
             ));
         }
-        let height_from_coinbase = u64::from_le_bytes(coinbase_data[0..8].try_into()?);
+        // Safely get the first 8 bytes for the height to avoid panicking on a short slice.
+        let height_bytes = coinbase_data
+            .get(0..std::mem::size_of::<u64>())
+            .ok_or_else(|| anyhow!("Coinbase data is too short to contain block height"))?;
+        let height_from_coinbase = u64::from_le_bytes(height_bytes.try_into()?);
 
         let coinbase_transaction = self
             .transactions
@@ -317,14 +420,24 @@ impl Block {
     }
 
     /// Calculates the median timestamp of the last 11 blocks.
-    fn calculate_median_time_past(block_index: u64, blockchain: &Blockchain) -> Result<i64> {
+    fn calculate_median_time_past(
+        block_index: u64,
+        blockchain: &Blockchain,
+        tx_db: Option<&TransactionalTree>,
+    ) -> Result<i64> {
         let mut timestamps = Vec::with_capacity(11);
 
         let start_index = block_index.saturating_sub(1);
         let end_index = start_index.saturating_sub(10);
 
         for i in end_index..=start_index {
-            if let Some(block) = blockchain.get_block_by_index(i)? {
+            // Use the transactional DB view if provided, otherwise use the main blockchain instance.
+            let block_opt = if let Some(db) = tx_db {
+                blockchain.get_block_by_index_from_db_txn(i, db)?
+            } else {
+                blockchain.get_block_by_index(i)?
+            };
+            if let Some(block) = block_opt {
                 timestamps.push(block.timestamp.timestamp());
                 if block.index == 0 {
                     break;

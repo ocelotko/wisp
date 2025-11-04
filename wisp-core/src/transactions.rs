@@ -44,7 +44,7 @@ pub struct TransactionInput {
 
 /// A transaction output, which creates new spendable value. It specifies the amount, the public key
 /// that can spend it (the "lock script"), and an optional message.
-#[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash)]
+#[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash, Default)]
 pub struct TransactionOutput {
     pub value: Amount,
     pub pubkey: PublicKey,

@@ -47,6 +47,21 @@ impl Signature {
 )]
 pub struct PublicKey(#[bincode(with_serde)] pub VerifyingKey<Secp256k1>);
 
+impl Default for PublicKey {
+    /// Creates a default `PublicKey`.
+    /// This uses the hardcoded "burn" public key from the genesis block utility,
+    /// as `VerifyingKey` itself does not have a natural default. This must be a constant
+    /// to avoid re-calculating it, which can cause deadlocks in test environments.
+    fn default() -> Self {
+        let genesis_pubkey_hex =
+            "020000000000000000000000000000000000000000000000000000000000000001";
+        let genesis_pubkey_bytes =
+            hex::decode(genesis_pubkey_hex).expect("Failed to decode constant genesis pubkey hex");
+        let genesis_verifying_key = VerifyingKey::from_sec1_bytes(&genesis_pubkey_bytes).unwrap();
+        PublicKey(genesis_verifying_key)
+    }
+}
+
 use sha2::Digest;
 impl Hashable for PublicKey {
     fn update_hasher(&self, hasher: &mut sha2::Sha256) {

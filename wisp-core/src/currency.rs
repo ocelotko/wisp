@@ -9,7 +9,19 @@ use std::ops::{Add, Sub};
 /// This struct is used to prevent floating-point errors in financial calculations
 /// by always working with integers.
 #[derive(
-    Encode, Decode, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+    Encode,
+    Decode,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Default,
 )]
 pub struct Amount(pub u64);
 

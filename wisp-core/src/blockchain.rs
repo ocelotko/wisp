@@ -2,20 +2,20 @@ use crate::{
     currency::Amount,
     reorg::ReorgError,
     sha256::{hash, Hash, Hashable, Sha256},
+    storage::DBKeys,
     transactions::{OutPoint, Transaction, TransactionOutput},
     utils::MerkleRoot,
     utxo::UtxoSet,
     U256,
 };
-use anyhow::anyhow;
 use anyhow::Result;
+use anyhow::{anyhow, Context};
 use bincode::config::standard as bincode_config;
 use bincode::{Decode, Encode};
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use serde::Deserialize;
 use serde::Serialize;
-use serde_with::serde_as;
 use sha2::Digest;
 use sled::transaction::ConflictableTransactionError;
 use sled::Db;
@@ -34,8 +34,10 @@ pub enum AddBlockResult {
         new_block_index: u64,
         new_block_hash: Hash,
     },
-    /// The block's previous hash does not correspond to any known block in the chain, making it an orphan.
-    OrphanedOrDisconnected(String),
+    /// The block's parent is unknown. The block has been added to the orphan pool.
+    Orphaned,
+    /// The block's parent is unknown and it was rejected from the orphan pool (e.g., pool is full).
+    OrphanRejected(String),
     /// The block is part of a fork that is shorter than the current main chain and was rejected.
     ShorterForkRejected(String),
 }
@@ -62,7 +64,38 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
 }
 
-#[derive(Encode, Decode, Serialize)]
+/// A wrapper for a block that includes a checksum to verify data integrity upon deserialization.
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedBlock {
+    block: Block,
+    checksum: Hash,
+}
+
+impl CheckedBlock {
+    /// Creates a new `CheckedBlock` from a `Block`, calculating its checksum.
+    pub(crate) fn from_block(block: Block) -> Result<Self> {
+        let block_bytes = bincode::encode_to_vec(&block, bincode_config())?;
+        let checksum = hash(&block_bytes[..]);
+        Ok(Self { block, checksum })
+    }
+
+    /// Verifies the block's integrity and returns the inner block if valid.
+    pub(crate) fn into_block(self) -> Result<Block> {
+        let block_bytes = bincode::encode_to_vec(&self.block, bincode_config())?;
+        let expected_checksum = hash(&block_bytes[..]);
+        if self.checksum == expected_checksum {
+            Ok(self.block)
+        } else {
+            Err(anyhow!(
+                "Block checksum mismatch! Expected {}, got {}. Block data may be corrupt.",
+                expected_checksum,
+                self.checksum
+            ))
+        }
+    }
+}
+
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
     pub version: u32,
     #[bincode(with_serde)]
@@ -128,7 +161,6 @@ impl Block {
 }
 
 #[derive(Serialize, Clone, Debug)]
-#[serde_as]
 pub struct Blockchain {
     /// The in-memory set of Unspent Transaction Outputs (UTXOs).
     pub utxo_set: UtxoSet,
@@ -140,16 +172,46 @@ pub struct Blockchain {
     /// The memory pool of unconfirmed transactions.
     #[serde(default)]
     pub mempool: HashMap<Hash, (DateTime<Utc>, Transaction, Amount)>,
+    /// An in-memory cache for recent block headers to speed up DAA calculations.
+    #[serde(skip)]
+    pub daa_cache: HashMap<u64, (DateTime<Utc>, U256)>,
+    /// An in-memory cache for the current tip block to reduce DB reads.
+    #[serde(skip)]
+    pub tip_cache: Option<(Hash, Block)>,
+    /// In-memory cache for the total circulating supply.
+    #[serde(skip)]
+    pub total_supply: Amount,
+    /// In-memory cache for the total number of confirmed transactions.
+    #[serde(skip)]
+    pub total_tx_count: u64,
+    /// A pool to store blocks whose parents have not yet been received.
+    /// Key: The `previous_hash` the orphan block is waiting for. Value: The orphan block itself.
+    #[serde(skip)]
+    pub orphan_pool: HashMap<Hash, Vec<Block>>,
+    /// A quick lookup to check if an orphan block (by its own hash) is already in the pool.
+    #[serde(skip)]
+    pub orphan_cache_by_hash: HashMap<Hash, ()>,
 }
 
 impl Blockchain {
+    /// The interval (in number of blocks) at which to save a UTXO snapshot.
+    /// 720 blocks * 2 minutes/block = 1440 minutes = 24 hours.
+    pub const UTXO_SNAPSHOT_INTERVAL: u64 = 720;
+
     /// Creates a new `Blockchain` instance with a database connection.
+    /// Note: This creates an empty, in-memory instance. `load_from_db` must be called to initialize state.
     pub fn new(db: Db) -> Self {
         Blockchain {
             utxo_set: UtxoSet::new(),
             target: crate::MAX_TARGET,
             db,
             mempool: HashMap::new(),
+            daa_cache: HashMap::new(),
+            tip_cache: None,
+            total_supply: Amount::zero(),
+            total_tx_count: 0,
+            orphan_pool: HashMap::new(),
+            orphan_cache_by_hash: HashMap::new(),
         }
     }
 
@@ -181,18 +243,22 @@ impl Blockchain {
             return Ok(Amount::zero());
         }
 
+        let outpoints_to_find: Vec<OutPoint> =
+            transaction.inputs.iter().map(|i| i.outpoint).collect();
+        let found_outputs = self.find_outputs_by_outpoints(&outpoints_to_find)?;
+
         let mut input_total = Amount::zero();
         for input in &transaction.inputs {
-            let prev_output = self
-                .find_output_by_outpoint_in_chain_or_utxos(&input.outpoint)?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Input UTXO {}:{} not found for fee calculation",
-                        input.outpoint.txid,
-                        input.outpoint.vout
-                    )
-                })?;
-            input_total = (input_total + prev_output.value)?;
+            if let Some(prev_output) = found_outputs.get(&input.outpoint) {
+                input_total = (input_total + prev_output.value)
+                    .context("Overflow calculating total input value")?;
+            } else {
+                return Err(anyhow!(
+                    "Input UTXO {} not found for fee calculation in transaction {}",
+                    input.outpoint,
+                    transaction.txid().unwrap_or_default()
+                ));
+            }
         }
 
         let output_total = transaction
@@ -219,44 +285,39 @@ impl Blockchain {
             }
         };
         info!(
-            "Attempting to add block with hash: {} at index {}",
+            "[CHAIN] Attempting to add block with hash: {} at index {}",
             new_block_hash, new_block.index
         );
 
-        // Get the current tip of our active chain. If it doesn't exist, we're on an empty chain.
-        let maybe_current_tip = match self
-            .get_tip_hash()?
-            .and_then(|h| self.get_block_by_hash(&h).transpose())
-        {
-            Some(Ok(block)) => block,
-            None => {
-                // Chain is empty. We must be processing the genesis block.
-                if new_block.index == 0 && new_block.previous_hash == Hash::zero() {
-                    info!("Chain is empty, processing genesis block.");
-                    return self.add_direct_extension(new_block, new_block_hash);
-                }
-                // If the chain is empty and we get a non-genesis block, it's an error.
-                return Ok(AddBlockResult::Rejected(
+        // Explicitly get the current tip block to make logic clearer.
+        let maybe_current_tip = self.get_tip_block()?;
+
+        let current_chain_tip = if let Some(block) = maybe_current_tip {
+            block
+        } else {
+            // Chain is empty. We must be processing the genesis block.
+            if new_block.index == 0 && new_block.previous_hash == Hash::zero() {
+                info!("[CHAIN] Chain is empty, processing genesis block.");
+                return self.add_direct_extension(new_block, new_block_hash);
+            } else {
+                return Ok(AddBlockResult::OrphanRejected(
                     "Chain is not initialized. Cannot accept non-genesis peer blocks.".to_string(),
                 ));
             }
-            Some(Err(e)) => return Err(e).map_err(anyhow::Error::from),
         };
-
-        let current_chain_tip = maybe_current_tip;
         let current_chain_tip_hash = current_chain_tip.id()?;
 
         // Case 1: The new block is a direct extension of our current chain.
         if new_block.previous_hash == current_chain_tip_hash {
             info!(
-                "New block {} is a direct extension of the current tip.",
+                "[CHAIN] New block {} is a direct extension of the current tip.",
                 new_block_hash
             );
             return self.add_direct_extension(new_block, new_block_hash);
         // Case 2: The new block is not a direct extension, indicating a fork or an out-of-order block.
         } else {
             warn!(
-                "Fork detected or out-of-order block ({}). Local tip: {} (index {}), New block previous: {} (index {})",
+                "[FORK] Fork detected or out-of-order block ({}). Local tip: {} (index {}), New block previous: {} (index {})",
                 new_block_hash,
                 current_chain_tip_hash, current_chain_tip.index,
                 new_block.previous_hash, new_block.index.saturating_sub(1)
@@ -264,26 +325,51 @@ impl Blockchain {
 
             // Before determining the fork type, save the block. This prevents a race condition
             // where the reorg process is triggered but the block it needs is not yet on disk.
-            let block_bytes = bincode::encode_to_vec(&new_block, bincode_config())?;
+            let checked_block = CheckedBlock::from_block(new_block.clone())?;
+            let checked_block_bytes = bincode::encode_to_vec(&checked_block, bincode_config())?;
+            // Use the canonical DB key so get_block_by_hash can find this block later.
             self.db
-                .insert(format!("block_{}", new_block_hash).as_bytes(), block_bytes)?;
+                .insert(DBKeys::block(&new_block_hash), checked_block_bytes)?;
+            info!(
+                "[FORK] Stored potential fork block {} for future reorg.",
+                new_block_hash
+            );
 
             // Try to find a common ancestor between our chain and the new block's chain.
-            if let Some(common_ancestor_index) =
-                self.find_common_ancestor_by_hash(&new_block.previous_hash)
+            if let Some((common_ancestor_index, common_ancestor_hash)) =
+                self.find_common_ancestor(&new_block.previous_hash)
             {
                 info!(
-                    "Found common ancestor at index {} for received block {}",
-                    common_ancestor_index, new_block_hash
+                    "[FORK] Found common ancestor {} at index {} for received block {}",
+                    common_ancestor_hash, common_ancestor_index, new_block_hash
                 );
 
                 // If the new block's index is not higher than our current tip, it can't be a longer chain.
                 if new_block.index <= current_chain_tip.index {
                     return Ok(AddBlockResult::ShorterForkRejected(format!(
                         "Received block {} is part of a shorter or equal length fork (new index {} <= current index {}). Rejecting.",
-                        new_block_hash, new_block.index, current_chain_tip.index
+                        new_block_hash, new_block.index, current_chain_tip.index,
                     )));
                 }
+
+                // Before signaling a reorg, atomically save the state required to recover if we crash.
+                self.db
+                    .transaction(|tx_db| {
+                        let tip_bytes = bincode::encode_to_vec(&new_block_hash, bincode_config())
+                            .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                        let ancestor_bytes =
+                            bincode::encode_to_vec(&common_ancestor_index, bincode_config())
+                                .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                        let ancestor_hash_bytes =
+                            bincode::encode_to_vec(&common_ancestor_hash, bincode_config())
+                                .map_err(|e| ReorgError::Anyhow(e.into()))?;
+
+                        tx_db.insert(DBKeys::PENDING_REORG_TIP, tip_bytes)?;
+                        tx_db.insert(DBKeys::PENDING_REORG_ANCESTOR, ancestor_bytes)?;
+                        tx_db.insert(DBKeys::PENDING_REORG_ANCESTOR_HASH, ancestor_hash_bytes)?;
+                        Ok(())
+                    })
+                    .map_err(|e| anyhow!("Failed to save pending reorg state: {:?}", e))?;
 
                 // The new block is on a potentially longer fork. Signal this for a reorg.
                 Ok(AddBlockResult::PotentialLongerForkDetected {
@@ -293,10 +379,8 @@ impl Blockchain {
                 })
             } else {
                 // No common ancestor found, the block is an orphan.
-                Ok(AddBlockResult::OrphanedOrDisconnected(format!(
-                    "Received block {} does not connect to the current chain or any known ancestor. Previous hash: {}",
-                    new_block_hash, new_block.previous_hash
-                )))
+                // The block was already saved to disk, so we just need to add it to the orphan pool.
+                self.add_to_orphan_pool(new_block.clone(), new_block_hash)
             }
         }
     }
@@ -308,10 +392,6 @@ impl Blockchain {
         new_block: Block,
         new_block_hash: Hash,
     ) -> Result<AddBlockResult> {
-        info!(
-            "🩵 Starting add_direct_extension for block index={} hash={}",
-            new_block.index, new_block_hash
-        );
         let expected_next_index = if self.get_tip_hash()?.is_some() {
             self.block_height()? + 1
         } else {
@@ -336,114 +416,32 @@ impl Blockchain {
             )));
         }
 
-        // Pre-validate UTXO application on a temporary copy to ensure it won't fail mid-transaction.
-        // This is a pre-check. The actual update happens after the DB transaction succeeds.
-        self.utxo_set.clone().apply_block(&new_block)?;
+        // Pre-validate UTXO application to ensure it won't fail mid-transaction.
+        self.utxo_set.validate_block_utxos(&new_block)?;
+        // Create a snapshot of what the UTXO set will look like after applying the new block.
+        let simulated_utxos = self.utxo_set.simulate_apply(&new_block)?;
 
-        let tx_count_in_block = new_block.transactions.len() as u64;
-        let initial_tx_count = self.get_total_transaction_count_from_db()?;
-        let mut total_fees = Amount::zero();
-        for tx in &new_block.transactions {
-            if !tx.is_coinbase() {
-                total_fees = (total_fees + self.calculate_transaction_fee(tx)?)?;
-            }
-        }
         // Atomically update the database with the new block and associated metadata.
         self.db
             .transaction(
                 |tx_db| -> Result<(), ConflictableTransactionError<ReorgError>> {
-                    let block_bytes = bincode::encode_to_vec(&new_block, bincode_config())
-                        .map_err(|e| ReorgError::Anyhow(e.into()))?;
-                    let hash_bytes = bincode::encode_to_vec(&new_block_hash, bincode_config())
-                        .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                    let mut new_tx_count = self.total_tx_count;
+                    let mut new_supply = self.total_supply.as_smallest_unit();
 
-                    // Store the block itself, indexed by its hash.
-                    tx_db.insert(format!("block_{}", new_block_hash).as_bytes(), block_bytes)?;
-                    // Store a mapping from block index to block hash.
-                    tx_db.insert(
-                        format!("index_{}", new_block.index).as_bytes(),
-                        hash_bytes.clone(),
+                    // Use the shared helper to apply the block's DB changes.
+                    self.apply_block_to_db(
+                        tx_db,
+                        &new_block,
+                        &[],
+                        &mut new_supply,
+                        &mut new_tx_count,
                     )?;
 
-                    // Store transaction locations and chronological order.
-                    // Process each transaction in the new block to update various indices.
-                    let mut current_tx_index = initial_tx_count;
-                    for tx in &new_block.transactions {
-                        let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
-                        let tx_hash_bytes = bincode::encode_to_vec(&tx_hash, bincode_config())
+                    // Store a pending UTXO snapshot to ensure atomicity with the block commit.
+                    let simulated_utxos_bytes =
+                        bincode::encode_to_vec(&simulated_utxos, bincode_config())
                             .map_err(|e| ReorgError::Anyhow(e.into()))?;
-
-                        // Chronological transaction index.
-                        // Update history index for all outputs (including coinbase outputs).
-                        for output in &tx.outputs {
-                            let key = format!("history_{}", output.pubkey.fingerprint());
-                            self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
-                        }
-
-                        // For non-coinbase transactions:
-                        // - Update history index for inputs (the public key whose UTXO is being spent).
-                        // - Store chronological transaction index.
-                        // - Increment total transaction count.
-                        if !tx.is_coinbase() {
-                            for input in &tx.inputs {
-                                // Find the original output being spent to get its public key for history indexing.
-                                let spent_output = Self::find_output_for_reorg_static(
-                                    tx_db,
-                                    &input.outpoint,
-                                    &[], // No new chain segment when adding a direct extension
-                                )
-                                .map_err(|e| match e {
-                                    sled::transaction::ConflictableTransactionError::Abort(
-                                        reorg_err,
-                                    ) => reorg_err,
-                                    sled::transaction::ConflictableTransactionError::Storage(
-                                        err,
-                                    ) => ReorgError::Anyhow(err.into()),
-                                    _ => ReorgError::Anyhow(anyhow!(
-                                        "Unexpected error type during history indexing"
-                                    )),
-                                })?
-                                .ok_or_else(|| {
-                                    ReorgError::Anyhow(anyhow!(
-                                        "UTXO {} not found for history indexing during block add",
-                                        input.outpoint
-                                    ))
-                                })?;
-
-                                let key = format!("history_{}", spent_output.pubkey.fingerprint());
-                                self.add_hash_to_history_list(tx_db, &key, &tx_hash)?;
-                            }
-                            tx_db.insert(
-                                format!("tx_by_order_{}", current_tx_index).as_bytes(),
-                                tx_hash_bytes.clone(),
-                            )?;
-                            current_tx_index += 1;
-                        }
-
-                        // Store transaction location (for all transactions, including coinbase).
-                        tx_db.insert(
-                            format!("tx_location_{}", tx_hash).as_bytes(),
-                            &new_block.index.to_be_bytes(),
-                        )?;
-                    }
-
-                    // Update chain-wide metadata.
-                    tx_db.insert(b"tip_hash", hash_bytes)?;
-                    tx_db.insert(b"chain_height", &new_block.index.to_be_bytes())?;
-                    let new_total_tx_count = initial_tx_count + tx_count_in_block;
-                    tx_db.insert(b"total_tx_count", &new_total_tx_count.to_be_bytes())?;
-
-                    // Update total supply.
-                    let current_supply_bytes = tx_db.get(b"total_supply")?.unwrap_or_default();
-                    let current_supply = u64::from_le_bytes(
-                        current_supply_bytes.as_ref().try_into().unwrap_or([0; 8]),
-                    );
-                    let block_reward = crate::utils::calculate_block_reward(new_block.index);
-                    let new_supply = current_supply
-                        + block_reward.as_smallest_unit()
-                        + total_fees.as_smallest_unit();
-
-                    tx_db.insert(b"total_supply", &new_supply.to_le_bytes())?;
+                    tx_db.insert(DBKeys::PENDING_UTXO_SNAPSHOT, simulated_utxos_bytes)?;
 
                     Ok(())
                 },
@@ -453,37 +451,202 @@ impl Blockchain {
                 sled::transaction::TransactionError::Storage(err) => anyhow::Error::from(err),
             })?;
 
-        info!("Database updated atomically for block {}.", new_block_hash);
+        info!(
+            "[DB] Database updated atomically for block {}.",
+            new_block_hash
+        );
 
         // If the DB transaction was successful, commit the in-memory changes:
-        // 1. Apply the block to the live UTXO set.
-        self.utxo_set.apply_block(&new_block)?;
-        // 2. Remove transactions from the mempool that were included in the block.
-        self.clear_mempool_of_block_transactions(&new_block);
+        // 1. Atomically update the in-memory UTXO set from the snapshot we just committed.
+        // This is now the canonical in-memory state.
+        self.utxo_set = simulated_utxos;
+
+        // 2. Promote the pending snapshot to the main snapshot for future rebuilds.
+        // This is done atomically with removing the pending key.
+        let pending_bytes = self.db.get(DBKeys::PENDING_UTXO_SNAPSHOT)?.ok_or_else(|| {
+            anyhow!("CRITICAL: Pending UTXO snapshot disappeared after direct extension commit")
+        })?;
+        self.db.insert(DBKeys::UTXO_SNAPSHOT, pending_bytes)?;
+        self.db.remove(DBKeys::PENDING_UTXO_SNAPSHOT)?; // Now it's safe to remove
+        self.db.insert(
+            DBKeys::LAST_UTXO_SNAPSHOT_HEIGHT,
+            new_block.index.to_be_bytes().to_vec(),
+        )?;
+
+        // 2. Remove transactions from the mempool that were included in the block
+        self.clear_mempool_of_block_transactions(&new_block, new_block_hash);
+
+        // 3. Update in-memory state from the database to ensure consistency after the commit.
         self.target = expected_next_target;
+        self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
+        self.total_tx_count = self.get_total_transaction_count_from_db()?;
+
+        // 4. Update the in-memory tip cache.
+        self.tip_cache = Some((new_block_hash, new_block.clone()));
 
         // This log provides clear, consistent confirmation when a block is added.
         info!(
             "✅ Block {} (index {}) accepted and added to chain. New height: {}",
             new_block_hash, new_block.index, new_block.index
         );
+
+        // Update the DAA cache with the new block's data and prune old entries.
+        self.daa_cache
+            .insert(new_block.index, (new_block.timestamp, new_block.target));
+        self.prune_daa_cache(new_block.index);
+
+        // After adding a block, check if it resolves any orphans.
+        self.process_orphans_for_parent(new_block_hash)?;
         Ok(AddBlockResult::Added)
     }
 
-    /// Finds the common ancestor of a potential fork by walking back from the current tip.
-    /// It checks if any block in the current chain matches the `previous_hash` of the new block.
-    fn find_common_ancestor_by_hash(&self, previous_hash: &Hash) -> Option<u64> {
-        let height = self.block_height().ok()?;
-        for i in (0..=height).rev() {
-            if let Ok(Some(block)) = self.get_block_by_index(i) {
-                if let Ok(block_hash) = block.id() {
-                    if block_hash == *previous_hash {
-                        return Some(i);
+    /// Adds a block to the orphan pool.
+    fn add_to_orphan_pool(&mut self, block: Block, block_hash: Hash) -> Result<AddBlockResult> {
+        const MAX_ORPHAN_POOL_SIZE: usize = 1000;
+
+        if self.orphan_cache_by_hash.contains_key(&block_hash) {
+            info!("[ORPHAN] Ignoring already orphaned block {}", block_hash);
+            return Ok(AddBlockResult::Orphaned);
+        }
+
+        if self.orphan_cache_by_hash.len() >= MAX_ORPHAN_POOL_SIZE {
+            warn!("[ORPHAN] Pool is full. Evicting an orphan to make space.");
+            // Simple eviction: remove the first entry. A more advanced strategy could be used.
+            if let Some(key_to_remove) = self.orphan_pool.keys().next() {
+                let key_clone = *key_to_remove;
+                if let Some(removed_orphans) = self.orphan_pool.remove(&key_clone) {
+                    for orphan_to_evict in removed_orphans {
+                        match orphan_to_evict.id() {
+                            Ok(orphan_hash) => {
+                                self.orphan_cache_by_hash.remove(&orphan_hash);
+                            }
+                            Err(e) => {
+                                error!("[ORPHAN] Failed to get ID of orphan being evicted. Cache may be inconsistent. Error: {}", e);
+                            }
+                        }
                     }
                 }
+            } else {
+                return Ok(AddBlockResult::OrphanRejected(
+                    "Orphan pool is full and could not evict an entry.".to_string(),
+                ));
             }
         }
-        None
+
+        info!(
+            "[ORPHAN] Adding block {} to orphan pool, waiting for parent {}",
+            block_hash, block.previous_hash
+        );
+        self.orphan_pool
+            .entry(block.previous_hash)
+            .or_default()
+            .push(block);
+        self.orphan_cache_by_hash.insert(block_hash, ());
+
+        Ok(AddBlockResult::Orphaned)
+    }
+
+    /// After a block is added, this function checks if it's the parent of any orphans and tries to process them.
+    fn process_orphans_for_parent(&mut self, parent_hash: Hash) -> Result<()> {
+        let mut current_parent_hash = parent_hash;
+        // Use a loop instead of recursion to prevent stack overflow when processing a long chain of orphans.
+        loop {
+            if let Some(orphans_to_process) = self.orphan_pool.remove(&current_parent_hash) {
+                info!(
+                    "[ORPHAN] Parent {} found. Processing {} orphan block(s).",
+                    current_parent_hash,
+                    orphans_to_process.len()
+                );
+                // In most cases, there will only be one orphan per parent.
+                // If there are multiple, we process the first one and the rest will be re-processed
+                // if the first one is successfully added.
+                for orphan in orphans_to_process {
+                    let orphan_hash_result = orphan.id();
+                    if let Ok(orphan_hash) = orphan_hash_result {
+                        self.orphan_cache_by_hash.remove(&orphan_hash);
+                        // Re-submit the orphan block to the main `add_block` flow.
+                        // We match on the result to avoid `?` propagating an error and stopping
+                        // the processing of other potential orphans for this parent.
+                        match self.add_block(orphan) {
+                            Ok(AddBlockResult::Added) => {
+                                // The newly added block becomes the parent for the next iteration.
+                                current_parent_hash = orphan_hash;
+                            }
+                            Ok(res) => warn!(
+                                "[ORPHAN] Re-submitted orphan {} was not added: {:?}",
+                                orphan_hash, res
+                            ),
+                            Err(e) => warn!(
+                                "[ORPHAN] Error processing re-submitted orphan {}: {}",
+                                orphan_hash, e
+                            ),
+                        }
+                    }
+                }
+            } else {
+                // No more orphans found for the current parent, so we can stop.
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Periodically saves a UTXO snapshot to disk to speed up future startups.
+    pub fn maybe_save_snapshot(&self, height: u64) -> Result<()> {
+        if height > 0 && height % 720 == 0 {
+            self.save_utxo_snapshot(height)?;
+        }
+        Ok(())
+    }
+
+    /// Prunes the DAA cache to keep it from growing indefinitely.
+    /// It retains entries only within the DAA window and a small buffer.
+    pub fn prune_daa_cache(&mut self, current_height: u64) {
+        const CACHE_BUFFER: u64 = 100; // Keep a bit more than the DAA window
+        let retain_after = current_height.saturating_sub(crate::DAA_WINDOW as u64 + CACHE_BUFFER);
+        self.daa_cache.retain(|&index, _| index > retain_after);
+    }
+
+    /// Finds the common ancestor of a potential fork by walking back from the current tip.
+    /// This optimized version uses the `hash_to_index` DB lookup to efficiently walk backwards.
+    fn find_common_ancestor(&self, previous_hash: &Hash) -> Option<(u64, Hash)> {
+        const MAX_ANCESTOR_SEARCH_DEPTH: u32 = 2016; // Approx. 2 weeks, a reasonable limit.
+
+        let mut current_hash = *previous_hash;
+
+        for _ in 0..MAX_ANCESTOR_SEARCH_DEPTH {
+            // Check if the current hash exists in our main chain.
+            // If it does, we've found the common ancestor.
+            if let Ok(Some(ivec)) = self.db.get(DBKeys::hash_to_index(&current_hash)) {
+                if ivec.len() != 8 {
+                    warn!(
+                        "Invalid hash_to_index length for {}: {} (expected 8). Skipping.",
+                        current_hash,
+                        ivec.len()
+                    );
+                    return None;
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&ivec);
+                let index = u64::from_be_bytes(bytes);
+                return Some((index, current_hash));
+            }
+
+            // If not, get the block from the DB (it might be a fork block we've stored)
+            // and walk back to its predecessor.
+            if let Ok(Some(block)) = self.get_block_by_hash(&current_hash) {
+                current_hash = block.previous_hash;
+                if current_hash == Hash::zero() {
+                    // We've walked back to before genesis, which means no common ancestor was found in our chain.
+                    return None;
+                }
+            } else {
+                // The block isn't in our DB at all, so we can't trace it back further.
+                return None;
+            }
+        }
+        warn!("Ancestor search reached max depth without finding a common ancestor.");
+        None // Reached max depth
     }
 }
 
@@ -503,24 +666,24 @@ mod tests {
 
     // Helper to create a new block that builds on a previous one.
     fn create_next_block(
-        blockchain: &Blockchain,
+        blockchain: &mut Blockchain,
         prev_block: &Block,
         transactions: Vec<Transaction>,
     ) -> Block {
         let index = prev_block.index + 1;
-        let previous_hash = prev_block.id().unwrap();
+        let prev_block_hash = prev_block.id().unwrap();
+
         // Ensure the timestamp is always greater than the previous block's to pass MTP validation.
+        // This also helps ensure mining progress in tests.
         let timestamp = prev_block.timestamp + chrono::Duration::seconds(1);
 
         // A block must always have a coinbase transaction.
-        // We create a dummy one here for testing purposes.
         let mut block_transactions = transactions;
         let coinbase_output = TransactionOutput {
-            // The reward must be correct for the block to be valid.
             value: utils::calculate_block_reward(index),
-            pubkey: utils::genesis_block().unwrap().transactions[0].outputs[0] // Use a known pubkey
+            pubkey: utils::genesis_block().unwrap().transactions[0].outputs[0]
                 .pubkey
-                .clone(), // Use a known pubkey
+                .clone(),
         };
         let coinbase_input = crate::transactions::TransactionInput {
             outpoint: crate::transactions::OutPoint {
@@ -535,13 +698,16 @@ mod tests {
 
         let merkle_root = utils::MerkleRoot::calculate(&block_transactions).unwrap();
 
-        // Use the blockchain's calculated next target to ensure the block is valid.
-        let target = blockchain.calculate_next_target().unwrap();
+        // CRITICAL: Calculate the target based on the PREVIOUS block's height, not the current
+        // tip of the main blockchain instance. This is essential for creating valid fork blocks in tests.
+        let target = blockchain
+            .calculate_next_target_from_height(prev_block.index)
+            .unwrap();
         let mut new_block = Block::new(
             1,
             timestamp,
             0, // nonce starts at 0
-            previous_hash,
+            prev_block_hash,
             merkle_root,
             target,
             index,
@@ -572,7 +738,8 @@ mod tests {
         let genesis_block = utils::genesis_block().unwrap();
         blockchain.add_block(genesis_block.clone()).unwrap();
 
-        let second_block = create_next_block(&blockchain, &genesis_block, vec![]);
+        let stored_genesis = blockchain.get_tip_block().unwrap().unwrap();
+        let second_block = create_next_block(&mut blockchain, &stored_genesis, vec![]);
         let result = blockchain.add_block(second_block.clone()).unwrap();
 
         assert!(matches!(result, AddBlockResult::Added));
@@ -589,7 +756,7 @@ mod tests {
         let genesis_block = utils::genesis_block().unwrap();
         blockchain.add_block(genesis_block.clone()).unwrap();
 
-        let mut bad_block = create_next_block(&blockchain, &genesis_block, vec![]);
+        let mut bad_block = create_next_block(&mut blockchain, &genesis_block, vec![]);
         bad_block.index = 3; // Invalid index
 
         let result = blockchain.add_block(bad_block).unwrap();
@@ -608,12 +775,13 @@ mod tests {
         blockchain.add_block(genesis_block.clone()).unwrap();
 
         // Main chain has one block after genesis
-        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        let stored_genesis = blockchain.get_tip_block().unwrap().unwrap();
+        let main_chain_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
         blockchain.add_block(main_chain_block_1.clone()).unwrap();
         assert_eq!(blockchain.block_height().unwrap(), 1);
 
         // A competing block is mined, also based on genesis. This creates a fork of equal length.
-        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        let fork_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
 
         // The node should reject this block because it doesn't create a longer chain.
         let result = blockchain.add_block(fork_block_1).unwrap();
@@ -632,15 +800,16 @@ mod tests {
         blockchain.add_block(genesis_block.clone()).unwrap();
 
         // Main chain has one block after genesis
-        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        let stored_genesis = blockchain.get_tip_block().unwrap().unwrap();
+        let main_chain_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
         blockchain.add_block(main_chain_block_1.clone()).unwrap();
         assert_eq!(blockchain.block_height().unwrap(), 1);
 
         // Now, a fork appears that is longer.
         // Fork Block 1 (builds on genesis)
-        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
-        // Fork Block 2 (builds on Fork Block 1)
-        let fork_block_2 = create_next_block(&blockchain, &fork_block_1, vec![]);
+        let fork_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
+        // Fork Block 2 (builds on Fork Block 1) - Pass a clone of blockchain to avoid move
+        let fork_block_2 = create_next_block(&mut blockchain, &fork_block_1, vec![]);
 
         // When we add the first block of the fork, it should be stored but not change the main chain.
         // It's a shorter/equal fork at this point.
@@ -662,7 +831,8 @@ mod tests {
         blockchain.add_block(genesis_block.clone()).unwrap();
 
         // 1. Create a main chain of length 1 (total height 1)
-        let main_chain_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
+        let stored_genesis = blockchain.get_tip_block().unwrap().unwrap();
+        let main_chain_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
         blockchain.add_block(main_chain_block_1.clone()).unwrap();
         assert_eq!(blockchain.block_height().unwrap(), 1);
         assert_eq!(
@@ -671,8 +841,8 @@ mod tests {
         );
 
         // 2. Create a longer competing fork of length 2 (total height 2)
-        let fork_block_1 = create_next_block(&blockchain, &genesis_block, vec![]);
-        let fork_block_2 = create_next_block(&blockchain, &fork_block_1, vec![]);
+        let fork_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
+        let fork_block_2 = create_next_block(&mut blockchain, &fork_block_1, vec![]);
 
         // 3. Add the fork blocks. The second one should trigger a reorg signal.
         blockchain.add_block(fork_block_1.clone()).unwrap();
@@ -695,13 +865,42 @@ mod tests {
         // 5. Assert that the chain has successfully switched to the new tip.
         assert_eq!(
             blockchain.block_height().unwrap(),
-            2,
+            fork_block_2.index,
             "Chain height should be updated after reorg"
         );
         assert_eq!(
             blockchain.get_tip_hash().unwrap().unwrap(),
             fork_block_2.id().unwrap(),
             "Chain tip should be the new fork's tip after reorg"
+        );
+    }
+
+    #[test]
+    fn test_fork_block_is_persisted() {
+        let (mut blockchain, _dir) = setup_test_blockchain();
+        let genesis_block = utils::genesis_block().unwrap();
+        blockchain.add_block(genesis_block.clone()).unwrap();
+
+        // Create a main chain block
+        let stored_genesis = blockchain.get_tip_block().unwrap().unwrap();
+        let main_chain_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
+        blockchain.add_block(main_chain_block_1.clone()).unwrap();
+
+        // Create a competing fork block that also builds on genesis
+        let fork_block_1 = create_next_block(&mut blockchain, &stored_genesis, vec![]);
+        let fork_hash = fork_block_1.id().unwrap();
+
+        // Add the fork block. It should be rejected as a shorter fork, but it must be persisted first.
+        let result = blockchain.add_block(fork_block_1).unwrap();
+        assert!(matches!(result, AddBlockResult::ShorterForkRejected(_)));
+
+        // CRITICAL: Verify that the fork block was actually saved to the DB,
+        // even though it wasn't adopted as the main chain tip.
+        // This is essential for the `find_common_ancestor_by_hash` logic to work.
+        let persisted_fork_block = blockchain.get_block_by_hash(&fork_hash).unwrap();
+        assert!(
+            persisted_fork_block.is_some(),
+            "Fork block should be persisted in the database even if not adopted"
         );
     }
 }

@@ -111,7 +111,11 @@ struct ApiNetworkVitals {
 
 impl From<Block> for ApiBlock {
     fn from(block: Block) -> Self {
-        let block_size = bincode::serialize(&block).map(|v| v.len()).unwrap_or(0);
+        // Use the bincode 2.x API for serialization.
+        let block_size = bincode::encode_to_vec(&block, bincode::config::standard())
+            .map(|v| v.len())
+            .unwrap_or(0);
+
         let tx_hashes = block
             .transactions
             .iter()
@@ -382,7 +386,11 @@ async fn get_transaction_by_hash(
                 tx.inputs
                     .first()
                     .and_then(|i| i.coinbase_data.as_ref())
-                    .and_then(|data| String::from_utf8(data.clone()).ok())
+                    .and_then(|data| {
+                        // Skip the first 8 bytes (height) and try to parse the rest as a string.
+                        let message_bytes = data.get(8..).unwrap_or_default();
+                        String::from_utf8(message_bytes.to_vec()).ok()
+                    })
             } else {
                 None
             };
@@ -406,13 +414,7 @@ async fn get_transaction_by_hash(
             let inputs = if is_coinbase {
                 // For coinbase, the input is special and contains the message.
                 vec![ApiTransactionInput {
-                    outpoint: format!(
-                        "Coinbase (New Coins){}",
-                        coinbase_message
-                            .as_ref()
-                            .map(|m| format!(": {}", m))
-                            .unwrap_or_default()
-                    ),
+                    outpoint: "Coinbase (New Coins)".to_string(),
                     signature: None,
                 }]
             } else {
@@ -421,7 +423,7 @@ async fn get_transaction_by_hash(
                     .iter()
                     .map(|i| ApiTransactionInput {
                         outpoint: i.outpoint.to_string(),
-                        signature: i.signature.as_ref().map(|s| hex::encode(s.to_bytes())),
+                        signature: i.signature.as_ref().map(|s| hex::encode(s.0.to_bytes())),
                     })
                     .collect()
             };
