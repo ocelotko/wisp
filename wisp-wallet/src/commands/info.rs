@@ -85,7 +85,7 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
 
             let available_balance = utxos_guard
                 .values()
-                .try_fold(Amount::zero(), |acc, output| acc + output.value)?
+                .fold(Amount::zero(), |acc, output| acc + output.value)
                 .to_string_wisp();
 
             let mut pending_change = 0i64;

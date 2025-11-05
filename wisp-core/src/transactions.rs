@@ -105,40 +105,43 @@ impl Transaction {
         self.inputs.len() == 1 && self.inputs[0].outpoint.txid == Hash::zero()
     }
 
+    /// Creates and signs a transaction from a set of UTXOs.
+    /// This version is designed for a wallet where a single private key controls all inputs.
     pub fn new_signed_from_utxos(
         outpoints_to_spend: &[OutPoint],
         outputs: Vec<TransactionOutput>,
         private_key: &PrivateKey,
     ) -> Result<Self, anyhow::Error> {
-        let inputs_for_signing = outpoints_to_spend
-            .iter()
-            .map(|outpoint| TransactionInput {
-                outpoint: *outpoint,
-                signature: None,
-                coinbase_data: None,
-            })
-            .collect();
-
+        // 1. Create the transaction with placeholder (empty) inputs to generate the hash to be signed.
         let tx_to_sign = Transaction {
-            inputs: inputs_for_signing,
+            inputs: outpoints_to_spend
+                .iter()
+                .map(|outpoint| TransactionInput {
+                    outpoint: *outpoint,
+                    signature: None, // Signature is None for hashing
+                    coinbase_data: None,
+                })
+                .collect(),
             outputs: outputs.clone(),
         };
 
+        // 2. Calculate the transaction ID (txid), which is what gets signed.
         let tx_hash_to_sign = hash(&tx_to_sign);
 
+        // 3. Create a single signature for the entire transaction.
         let signature = Signature::sign_transaction_hash(&tx_hash_to_sign, private_key);
 
-        let inputs_with_signature = outpoints_to_spend
-            .iter()
-            .map(|outpoint| TransactionInput {
-                outpoint: *outpoint,
-                signature: Some(signature.clone()),
-                coinbase_data: None,
-            })
-            .collect();
-
+        // 4. Create the final transaction by applying the same signature to all inputs.
+        // This is a simplification suitable for single-key wallets.
         Ok(Transaction {
-            inputs: inputs_with_signature,
+            inputs: outpoints_to_spend
+                .iter()
+                .map(|outpoint| TransactionInput {
+                    outpoint: *outpoint,
+                    signature: Some(signature.clone()), // Clone the signature for each input
+                    coinbase_data: None,
+                })
+                .collect(),
             outputs,
         })
     }

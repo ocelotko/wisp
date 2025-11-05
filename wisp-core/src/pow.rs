@@ -1,135 +1,14 @@
+use crate::sha256::Hashable;
 use crate::{
     blockchain::{Block, Blockchain},
-    currency::Amount,
-    transactions::{OutPoint, TransactionOutput},
     DAA_WINDOW, IDEAL_BLOCK_TIME, U256,
 };
-
-use crate::reorg::ReorgError;
-use crate::sha256::Hashable;
 use anyhow::{anyhow, Result};
+use log::warn;
 use sha2::Digest;
-use sled::transaction::ConflictableTransactionError;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 impl Block {
-    /// Calculates the total fees for all non-coinbase transactions in the block.
-    /// It does this by summing all inputs and subtracting all outputs.
-    /// This requires looking up the value of the inputs from the provided UTXO set.
-    pub fn calculate_total_fees(
-        &self,
-        existing_utxos: &HashMap<OutPoint, (bool, TransactionOutput)>,
-    ) -> Result<Amount> {
-        let mut inputs_total = Amount::zero();
-        let mut outputs_total = Amount::zero();
-
-        // Build a map of new outputs created within this block to handle intra-block spends.
-        let mut new_outputs_in_block = HashMap::new();
-        for transaction in self.transactions.iter().skip(1) {
-            let txid = transaction.txid()?;
-            for (vout, output) in transaction.outputs.iter().enumerate() {
-                new_outputs_in_block.insert(
-                    OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    },
-                    output.clone(),
-                );
-            }
-        }
-
-        // Iterate through regular transactions to sum inputs and outputs.
-        for transaction in self.transactions.iter().skip(1) {
-            // For each input, find its corresponding output (either from a previous block or this one).
-            for input in &transaction.inputs {
-                // First, check for outputs created in this same block.
-                // Then, fall back to the existing UTXO set from the wider chain state.
-                let prev_output = new_outputs_in_block.get(&input.outpoint).or_else(|| {
-                    existing_utxos
-                        .get(&input.outpoint)
-                        .map(|(_, output)| output)
-                });
-
-                let prev_output = prev_output.ok_or_else(|| {
-                    anyhow!(
-                        "Transaction input UTXO {} not found for fee calculation",
-                        input.outpoint
-                    )
-                })?;
-                let sum_result = inputs_total + prev_output.value;
-                inputs_total = sum_result?;
-            }
-
-            for output in &transaction.outputs {
-                let sum_result = outputs_total + output.value;
-                outputs_total = sum_result?;
-            }
-        }
-
-        if inputs_total < outputs_total {
-            Err(anyhow!(
-                "Input value less than output value in fee calculation: inputs ({}) < outputs ({})",
-                inputs_total,
-                outputs_total
-            ))
-        } else {
-            inputs_total - outputs_total
-        }
-    }
-
-    /// A specialized version of `calculate_total_fees` for use within a database transaction during a reorg.
-    /// It fetches UTXO values directly from the transactional database view (`tx_db`) instead of an in-memory map.
-    /// This is crucial for maintaining atomicity during the reorg process.
-    pub fn calculate_total_fees_for_reorg(
-        &self,
-        tx_db: &sled::transaction::TransactionalTree,
-    ) -> Result<Amount, ConflictableTransactionError<ReorgError>> {
-        let mut inputs_total = Amount::zero();
-        let mut outputs_total = Amount::zero();
-
-        let mut new_outputs_in_block = HashMap::new();
-        for transaction in self.transactions.iter().skip(1) {
-            let txid = transaction.txid().map_err(ReorgError::Anyhow)?;
-            for (vout, output) in transaction.outputs.iter().enumerate() {
-                new_outputs_in_block.insert(
-                    OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    },
-                    output.clone(),
-                );
-            }
-        }
-
-        for transaction in self.transactions.iter().skip(1) {
-            for input in &transaction.inputs {
-                let prev_output = if let Some(output) = new_outputs_in_block.get(&input.outpoint) {
-                    Some(output.clone())
-                } else {
-                    Blockchain::find_output_for_reorg_static(tx_db, &input.outpoint, &[])?
-                };
-
-                let prev_output = prev_output.ok_or_else(|| {
-                    ReorgError::Anyhow(anyhow!(
-                        "Transaction input UTXO not found during reorg fee calculation..."
-                    ))
-                })?;
-                inputs_total =
-                    (inputs_total + prev_output.value).map_err(|e| ReorgError::Anyhow(e))?;
-            }
-
-            for output in &transaction.outputs {
-                outputs_total =
-                    (outputs_total + output.value).map_err(|e| ReorgError::Anyhow(e))?;
-            }
-        }
-
-        (inputs_total - outputs_total)
-            .map_err(|e| ReorgError::Anyhow(e))
-            .map_err(ConflictableTransactionError::Abort)
-    }
-
     /// A simple, single-threaded mining function for testing purposes.
     /// It iterates through nonces until a valid proof-of-work is found.
     pub fn mine_block(&mut self, steps: usize) -> Result<bool> {
@@ -166,33 +45,41 @@ pub fn mine_block_parallel(
     nonce_step: u64,
     max_attempts_per_call: usize,
     mining_active: &AtomicBool,
-) -> Result<(bool, usize)> {
+) -> Result<(bool, u64)> {
     block.nonce = block.nonce.wrapping_add(start_nonce);
+
+    // Pre-hash all fields that come before the nonce to optimize the hot loop.
+    // This matches the order in `BlockHeader::update_hasher`.
+    let mut base_hasher = sha2::Sha256::new();
+    block.version.update_hasher(&mut base_hasher);
+    base_hasher.update(&block.timestamp.timestamp().to_be_bytes());
+    base_hasher.update(&block.timestamp.timestamp_subsec_nanos().to_be_bytes());
+    block.previous_hash.update_hasher(&mut base_hasher);
+    block.merkle_root.update_hasher(&mut base_hasher);
+    block.target.update_hasher(&mut base_hasher);
 
     for i in 0..max_attempts_per_call {
         if !mining_active.load(Ordering::Relaxed) {
-            return Ok((false, i));
+            return Ok((false, i as u64));
         }
 
-        // In the hot loop, we must reconstruct the header and hash it correctly every time
-        // to ensure the nonce is in the right position as defined by the Hashable trait.
-        let header = block.header();
-        let mut hasher = sha2::Sha256::new();
-        header.update_hasher(&mut hasher);
-
+        // In the hot loop, clone the pre-hashed state and only hash the nonce.
+        let mut hasher = base_hasher.clone();
+        block.nonce.update_hasher(&mut hasher);
         let first_pass = hasher.finalize();
+
         let mut hasher2 = sha2::Sha256::new();
         hasher2.update(&first_pass);
         let hash_bytes: [u8; 32] = hasher2.finalize().into();
         let hash_u256 = U256::from_big_endian(&hash_bytes);
 
         if hash_u256 <= block.target {
-            return Ok((true, i + 1));
+            return Ok((true, (i + 1) as u64));
         }
 
         block.nonce = block.nonce.wrapping_add(nonce_step);
     }
-    Ok((false, max_attempts_per_call))
+    Ok((false, max_attempts_per_call as u64))
 }
 
 impl Blockchain {
@@ -208,9 +95,9 @@ impl Blockchain {
     /// The calculation is based on the window of blocks ending at the specified `height`.
     pub fn calculate_next_target_from_height(&self, height: u64) -> Result<U256> {
         // Special case: genesis block (height 0) or early blocks before full DAA window
-        // Safe indices for the DAA window
         let last_block_index = height;
-        let first_block_index = height.saturating_sub(DAA_WINDOW as u64 - 1);
+        let window_size = (DAA_WINDOW - 1) as u64;
+        let first_block_index = height.saturating_sub(window_size);
 
         if first_block_index == 0 {
             return Ok(crate::MAX_TARGET);
@@ -247,7 +134,13 @@ impl Blockchain {
         // Time span of the window
         let mut actual_timespan =
             last_block_timestamp.timestamp() - first_block_timestamp.timestamp();
+
+        // Clamp timespan to prevent extreme fluctuations.
+        // Also, warn if timestamps seem manipulated.
         actual_timespan = std::cmp::max(1, actual_timespan);
+        if actual_timespan < 10 && last_block_index > first_block_index {
+            warn!("[DAA] Unusually short timespan ({}) for DAA window between blocks {} and {}. Possible timestamp manipulation.", actual_timespan, first_block_index, last_block_index);
+        }
 
         let ideal_timespan = ((DAA_WINDOW - 1) as u64 * IDEAL_BLOCK_TIME) as i64;
         let clamped_timespan = actual_timespan.clamp(ideal_timespan / 4, ideal_timespan * 4);

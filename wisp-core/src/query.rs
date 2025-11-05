@@ -1,5 +1,5 @@
 use crate::blockchain::Blockchain;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use bincode::config::standard as bincode_config;
 use chrono::{DateTime, Utc};
 use log::{debug, error};
@@ -19,7 +19,7 @@ impl Blockchain {
         self.utxo_set
             .utxos
             .iter()
-            .filter_map(|(outpoint, (_marked, output))| {
+            .filter_map(|(outpoint, output)| {
                 (output.pubkey == *pubkey).then_some((*outpoint, output.clone()))
             })
             .collect()
@@ -34,37 +34,53 @@ impl Blockchain {
         }
 
         let key = DBKeys::tx_location(tx_hash);
-        // Check the database for a `tx_location` entry, which maps a tx hash to its block index.
-        if let Ok(Some(ivec)) = self.db.get(&key) {
-            if ivec.len() != 8 {
-                error!(
-                    "Invalid tx_location length for {}: {} (expected 8). Treating as not found.",
-                    tx_hash,
-                    ivec.len()
-                );
-                return TransactionStatus::NotFound;
-            }
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&ivec);
-            let block_index = u64::from_be_bytes(bytes);
+        match self.db.get(&key) {
+            Ok(Some(ivec)) => {
+                if ivec.len() != 8 {
+                    error!(
+                        "Invalid tx_location length for {}: {} (expected 8). Treating as not found.",
+                        tx_hash,
+                        ivec.len()
+                    );
+                    return TransactionStatus::NotFound;
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&ivec);
+                let block_index = u64::from_be_bytes(bytes);
 
-            if let Ok(Some(block)) = self.get_block_by_index(block_index) {
-                if let Ok(block_hash) = block.id() {
-                    return TransactionStatus::Confirmed {
-                        block_hash,
-                        block_index,
-                    };
+                match self.get_block_by_index(block_index) {
+                    Ok(Some(block)) => match block.id() {
+                        Ok(block_hash) => TransactionStatus::Confirmed {
+                            block_hash,
+                            block_index,
+                        },
+                        Err(e) => {
+                            error!("Failed to hash block {} during status check, which may indicate data corruption: {}", block.index, e);
+                            TransactionStatus::NotFound
+                        }
+                    },
+                    Ok(None) => TransactionStatus::NotFound,
+                    Err(e) => {
+                        error!(
+                            "DB error fetching block {} for status check: {}",
+                            block_index, e
+                        );
+                        TransactionStatus::NotFound
+                    }
                 }
             }
-        } else if let Err(e) = self.db.get(&key) {
-            error!("Database error checking tx_location for {}: {}", tx_hash, e);
+            Ok(None) => {
+                debug!(
+                    "Transaction {} not found in mempool or confirmed blocks.",
+                    tx_hash
+                );
+                TransactionStatus::NotFound
+            }
+            Err(e) => {
+                error!("Database error checking tx_location for {}: {}", tx_hash, e);
+                TransactionStatus::NotFound
+            }
         }
-
-        debug!(
-            "Transaction {} not found in mempool or confirmed blocks.",
-            tx_hash
-        );
-        TransactionStatus::NotFound
     }
 
     /// Retrieves a transaction and its associated metadata (block height, timestamp).
@@ -74,8 +90,8 @@ impl Blockchain {
         tx_hash: &Hash,
     ) -> Result<Option<(Transaction, Option<u64>, DateTime<Utc>)>> {
         // Check the mempool first for unconfirmed transactions.
-        if let Some((timestamp, tx, _)) = self.mempool.get(tx_hash) {
-            return Ok(Some((tx.clone(), None, *timestamp)));
+        if let Some(entry) = self.mempool.get(tx_hash) {
+            return Ok(Some((entry.transaction.clone(), None, entry.timestamp)));
         }
 
         // If not in mempool, check the database for a confirmed transaction.
@@ -100,6 +116,10 @@ impl Blockchain {
                     .find(|t| t.txid().ok() == Some(*tx_hash))
                 {
                     return Ok(Some((tx.clone(), Some(block.index), block.timestamp)));
+                } else {
+                    // This indicates a DB inconsistency.
+                    log::warn!("Transaction {} not found in block {} despite tx_location entry pointing to it.", tx_hash, block_index);
+                    return Ok(None);
                 }
             }
         }
@@ -118,7 +138,7 @@ impl Blockchain {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<TransactionOutput>> {
-        if let Some((_, output)) = self.utxo_set.utxos.get(outpoint) {
+        if let Some(output) = self.utxo_set.utxos.get(outpoint) {
             return Ok(Some(output.clone()));
         }
 
@@ -140,12 +160,12 @@ impl Blockchain {
         &self,
         outpoints: &[OutPoint],
     ) -> Result<HashMap<OutPoint, TransactionOutput>> {
-        let mut results = HashMap::new();
+        let mut results = HashMap::with_capacity(outpoints.len());
         let mut needed_from_db = Vec::new();
 
         // First, check the in-memory UTXO set.
         for outpoint in outpoints {
-            if let Some((_, output)) = self.utxo_set.utxos.get(outpoint) {
+            if let Some(output) = self.utxo_set.utxos.get(outpoint) {
                 results.insert(*outpoint, output.clone());
             } else {
                 needed_from_db.push(*outpoint);
@@ -244,15 +264,28 @@ impl Blockchain {
                 if let Some((tx, block_index, timestamp)) =
                     self.get_transaction_with_details(&tx_hash)?
                 {
-                    let status = match block_index {
-                        Some(index) => TransactionStatus::Confirmed {
-                            block_hash: tx.txid()?,
+                    let status = if let Some(index) = block_index {
+                        // Correctly fetch the block hash for the confirmed transaction.
+                        let block_hash = self
+                            .get_block_by_index(index)?
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "Block {} not found for wallet history, but tx_location exists",
+                                    index
+                                )
+                            })?
+                            .id()?;
+                        TransactionStatus::Confirmed {
+                            block_hash,
                             block_index: index,
-                        },
-                        None => TransactionStatus::Pending,
+                        }
+                    } else {
+                        TransactionStatus::Pending
                     };
+
                     transaction_history_info.push(WalletTransactionInfo {
                         transaction: tx,
+                        // The status now correctly contains the block hash.
                         status,
                         block_timestamp: Some(timestamp),
                         block_index,
@@ -262,13 +295,17 @@ impl Blockchain {
         }
 
         // Also check the mempool for any relevant pending transactions.
-        for (tx_hash, (timestamp, tx, _fee)) in self.mempool.iter() {
-            let is_relevant = tx.outputs.iter().any(|o| o.pubkey == *pubkey)
-                || tx.inputs.iter().any(|i| {
+        for (tx_hash, entry) in self.mempool.iter() {
+            let is_relevant = entry
+                .transaction
+                .outputs
+                .iter()
+                .any(|o| o.pubkey == *pubkey)
+                || entry.transaction.inputs.iter().any(|i| {
                     self.utxo_set
                         .utxos
                         .get(&i.outpoint)
-                        .map_or(false, |(_, o)| o.pubkey == *pubkey)
+                        .map_or(false, |o| o.pubkey == *pubkey)
                 });
 
             if is_relevant
@@ -276,9 +313,9 @@ impl Blockchain {
                 && transaction_history_info.len() < MAX_HISTORY_ITEMS
             {
                 transaction_history_info.push(WalletTransactionInfo {
-                    transaction: tx.clone(),
+                    transaction: entry.transaction.clone(),
                     status: TransactionStatus::Pending,
-                    block_timestamp: Some(*timestamp),
+                    block_timestamp: Some(entry.timestamp),
                     block_index: None,
                 });
             }
@@ -287,6 +324,8 @@ impl Blockchain {
         transaction_history_info.truncate(MAX_HISTORY_ITEMS);
 
         // Sort the final list by timestamp, newest first.
+        // Using unwrap_or_default() for None timestamps will push pending transactions (which might have a recent timestamp)
+        // or corrupted entries to the end of the list if their timestamp is older than confirmed ones. This is acceptable.
         transaction_history_info.sort_by(|a, b| {
             b.block_timestamp
                 .unwrap_or_default()

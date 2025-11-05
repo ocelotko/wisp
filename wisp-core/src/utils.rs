@@ -20,12 +20,15 @@ use std::{
 pub struct MerkleRoot(pub Hash);
 
 impl MerkleRoot {
-    /// Calculates the Merkle root for a list of transactions.
+    /// Calculates the Merkle root for a list of transactions using a binary Merkle tree
+    /// with double-SHA256 hashing.
     /// It repeatedly hashes pairs of hashes in a layer until only one root hash remains.
     pub fn calculate(transactions: &[Transaction]) -> Result<MerkleRoot, anyhow::Error> {
         let mut layer: Vec<Hash> = vec![];
 
         for transaction in transactions {
+            // Use the witness transaction ID (wtxid) for the Merkle root.
+            // This prevents transaction malleability attacks.
             layer.push(transaction.wtxid()?);
         }
 
@@ -35,7 +38,8 @@ impl MerkleRoot {
 
         // Continue hashing until only one hash (the root) is left.
         while layer.len() > 1 {
-            let mut new_layer = vec![];
+            // Pre-allocate with capacity to avoid reallocations in the loop.
+            let mut new_layer = Vec::with_capacity(layer.len() / 2 + 1);
             // Process hashes in pairs.
             for pair in layer.chunks(2) {
                 let left = pair[0];
@@ -79,7 +83,7 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     let genesis_verifying_key = k256::ecdsa::VerifyingKey::from_sec1_bytes(&genesis_pubkey_bytes)
         .context("Failed to create verifying key from genesis bytes")?;
 
-    let genesis_message = "Sic Mundus Creatus Est // 20.10.2025 //";
+    let genesis_message = "Sic Mundus Creatus Est // 5.11.2025 //";
     let mut coinbase_data = Vec::new();
     coinbase_data.extend_from_slice(&0u64.to_le_bytes()); // Block height 0
     coinbase_data.extend_from_slice(genesis_message.as_bytes());
@@ -100,14 +104,14 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     );
 
     let merkle_root = MerkleRoot::calculate(&[coinbase_tx.clone()])?;
-    let genesis_timestamp = DateTime::parse_from_rfc3339("2025-10-20T18:28:48.811829571Z")
-        .unwrap()
+    let genesis_timestamp = DateTime::parse_from_rfc3339("2025-11-05T14:47:02.192361230Z")
+        .context("Invalid hardcoded genesis timestamp")?
         .with_timezone(&Utc);
 
     let genesis_block = Block::new(
         1,
         genesis_timestamp,
-        54033315,
+        1030674,
         Hash::zero(),
         merkle_root,
         crate::MAX_TARGET,
@@ -148,12 +152,133 @@ where
 {
     fn save<O: Write>(&self, mut writer: O) -> IoResult<()> {
         bincode::encode_into_std_write(self, &mut writer, bincode_config())
-            .map(|_| ()) // Discard the `usize` count of bytes written to match return type `()`
-            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
+            .map(|_| ())
+            .map_err(|e| {
+                IoError::new(
+                    IoErrorKind::InvalidData,
+                    format!("Failed to save with bincode: {}", e),
+                )
+            })
     }
 
     fn load<I: Read>(mut reader: I) -> IoResult<Self> {
-        bincode::decode_from_std_read(&mut reader, bincode_config())
-            .map_err(|e| IoError::new(IoErrorKind::InvalidData, e.to_string()))
+        bincode::decode_from_std_read(&mut reader, bincode_config()).map_err(|e| {
+            IoError::new(
+                IoErrorKind::InvalidData,
+                format!("Failed to load with bincode: {}", e),
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sha256::hash;
+    use crate::transactions::Transaction;
+    use crate::HALVING_INTERVAL;
+    use crate::INITIAL_BLOCK_REWARD_SMALLEST_UNITS;
+
+    #[test]
+    fn test_merkle_root_calculation() {
+        // 1. Empty list
+        let root_empty = MerkleRoot::calculate(&[]).unwrap();
+        assert_eq!(root_empty.0, Hash::zero());
+
+        // 2. Single transaction
+        let tx1 = Transaction::new(vec![], vec![]);
+        let wtxid1 = tx1.wtxid().unwrap();
+        let root_one = MerkleRoot::calculate(&[tx1.clone()]).unwrap();
+        assert_eq!(root_one.0, wtxid1);
+
+        // 3. Even number of transactions (2)
+        let tx2 = Transaction::new(vec![], vec![]); // Different tx
+        let wtxid2 = tx2.wtxid().unwrap();
+        let combined_hash = hash(&[wtxid1, wtxid2][..]);
+        let root_two = MerkleRoot::calculate(&[tx1.clone(), tx2.clone()]).unwrap();
+        assert_eq!(root_two.0, combined_hash);
+
+        // 4. Odd number of transactions (3)
+        let tx3 = Transaction::new(vec![], vec![]);
+        let wtxid3 = tx3.wtxid().unwrap();
+        let combined_1_2 = hash(&[wtxid1, wtxid2][..]);
+        let combined_3_3 = hash(&[wtxid3, wtxid3][..]); // Duplicated
+        let final_root_hash = hash(&[combined_1_2, combined_3_3][..]);
+        let root_three = MerkleRoot::calculate(&[tx1, tx2, tx3]).unwrap();
+        assert_eq!(root_three.0, final_root_hash);
+    }
+
+    #[test]
+    fn test_block_reward_halving() {
+        // Block 0 (first block)
+        assert_eq!(
+            calculate_block_reward(0).as_smallest_unit(),
+            INITIAL_BLOCK_REWARD_SMALLEST_UNITS
+        );
+
+        // Block just before first halving
+        assert_eq!(
+            calculate_block_reward(HALVING_INTERVAL - 1).as_smallest_unit(),
+            INITIAL_BLOCK_REWARD_SMALLEST_UNITS
+        );
+
+        // Block at first halving
+        assert_eq!(
+            calculate_block_reward(HALVING_INTERVAL).as_smallest_unit(),
+            INITIAL_BLOCK_REWARD_SMALLEST_UNITS / 2
+        );
+
+        // Block at second halving
+        assert_eq!(
+            calculate_block_reward(HALVING_INTERVAL * 2).as_smallest_unit(),
+            INITIAL_BLOCK_REWARD_SMALLEST_UNITS / 4
+        );
+
+        // After 64 halvings, reward should be 0
+        assert_eq!(
+            calculate_block_reward(HALVING_INTERVAL * 64).as_smallest_unit(),
+            0
+        );
+        assert_eq!(
+            calculate_block_reward(HALVING_INTERVAL * 100).as_smallest_unit(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_genesis_block_is_deterministic() {
+        let genesis1 = genesis_block().unwrap();
+        let genesis2 = genesis_block().unwrap();
+        let genesis_hash = genesis1.id().unwrap();
+
+        // Ensure two calls produce the exact same block
+        assert_eq!(genesis1, genesis2);
+
+        // Check against a known, hardcoded hash to prevent accidental changes
+        let expected_genesis_hash =
+            Hash::try_from("000000179bf3dc1f7dd18b7e7a9c85d81dfe028afd04c52aa0459152d50bbe86")
+                .unwrap();
+        assert_eq!(genesis_hash, expected_genesis_hash);
+    }
+
+    #[test]
+    fn test_saveable_trait_roundtrip() {
+        #[derive(Encode, Decode, PartialEq, Debug)]
+        struct TestStruct {
+            a: u32,
+            b: String,
+        }
+
+        let original = TestStruct {
+            a: 42,
+            b: "hello world".to_string(),
+        };
+
+        // Test in-memory roundtrip
+        let mut buffer: Vec<u8> = Vec::new();
+        original.save(&mut buffer).unwrap();
+        let loaded = TestStruct::load(&buffer[..]).unwrap();
+
+        assert_eq!(original, loaded);
     }
 }

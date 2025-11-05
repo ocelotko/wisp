@@ -15,7 +15,7 @@ use k256::ecdsa::{self, SigningKey};
 use log::{debug, info, warn};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use tokio::time::timeout;
 use tokio::{net::TcpStream, sync::RwLock};
 
@@ -100,34 +100,29 @@ impl Core {
 
     /// Gets a handle to the connected node stream.
     /// If not connected, it establishes a new connection to the default node.
-    /// This function ensures that there is only one active connection at a time.
-    pub async fn get_connected_stream(
-        &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<TcpStream>>> {
+    pub async fn get_connected_stream(&self) -> Result<MutexGuard<'_, Option<TcpStream>>> {
         let mut stream_lock = self.connected_node_stream.lock().await;
 
-        if let Some(ref stream) = *stream_lock {
-            if stream.peer_addr().is_ok() {
-                debug!("Re-using existing connection to node.");
-                return Ok(stream_lock);
-            } else {
-                warn!("Existing connection is dead, re-connecting.");
-                *stream_lock = None;
-            }
+        if stream_lock.is_none() {
+            let node_address = self.get_default_node_address().await;
+            let connect_timeout =
+                Duration::from_secs(self.config.lock().await.node_connect_timeout_secs);
+
+            info!("Attempting to connect to node at: {}", node_address);
+            let stream = match timeout(connect_timeout, TcpStream::connect(&node_address)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    return Err(anyhow!("Failed to connect to node {}: {}", node_address, e))
+                }
+                Err(e) => return Err(anyhow!("Connection timed out to {}: {}", node_address, e)),
+            };
+
+            info!("Successfully connected to node at {}", node_address);
+            *stream_lock = Some(stream);
+        } else {
+            debug!("Re-using existing connection to node.");
         }
 
-        let node_address = self.get_default_node_address().await;
-        let connect_timeout =
-            Duration::from_secs(self.config.lock().await.node_connect_timeout_secs);
-
-        info!("Attempting to connect to node at: {}", node_address);
-        let stream = timeout(connect_timeout, TcpStream::connect(&node_address))
-            .await
-            .map_err(|e| anyhow!("Connection timed out to {}: {}", node_address, e))?
-            .map_err(|e| anyhow!("Failed to connect to node {}: {}", node_address, e))?;
-
-        info!("Successfully connected to node at {}", node_address);
-        *stream_lock = Some(stream);
         Ok(stream_lock)
     }
 
@@ -164,8 +159,6 @@ impl Core {
         let private_key =
             PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
         let public_key = private_key.public_key();
-
-        println!("Public Key: {:?}", public_key);
 
         // Use a local OsRng for salt generation
         let mut local_rng = OsRng;
@@ -567,10 +560,11 @@ impl Core {
     /// Calculates and returns the total spendable balance from the available UTXOs.
     pub async fn get_total_balance(&self) -> Result<Amount> {
         let available_utxos_guard = self.utxos.read().await;
-        available_utxos_guard
+        let total: Amount = available_utxos_guard
             .values()
-            .try_fold(Amount::zero(), |acc, output| acc + output.value) // This returns a Result
-            .context("An arithmetic error occurred during balance calculation")
+            .map(|output| output.value)
+            .sum();
+        Ok(total)
     }
 
     /// Creates, signs, and submits a transaction to send funds.
@@ -604,7 +598,9 @@ impl Core {
                     amount_to_send.as_smallest_unit() * fee_value_raw / 10_000,
                 ),
             };
-            (amount_to_send + fee).context("Total required amount overflow")?
+            amount_to_send
+                .checked_add(fee)
+                .context("Total required amount overflow")?
         } else {
             // For send_max, we need all UTXOs, so the initial requirement is effectively infinite until we sum them up.
             Amount::MAX
@@ -634,7 +630,9 @@ impl Core {
                     signature: None,
                     coinbase_data: None,
                 });
-                current_input_sum = (current_input_sum + utxo_output.value)?;
+                current_input_sum = current_input_sum
+                    .checked_add(utxo_output.value)
+                    .context("Input sum overflow")?;
             } else {
                 break; // Stop once we have enough value
             }
@@ -651,14 +649,23 @@ impl Core {
         let (final_amount_to_send, transaction_fee) = if is_send_max {
             // For "send max", the fee is calculated from the total available input value.
             let fee = match fee_type {
-                FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw),
-                FeeType::Percent => {
-                    // For "send max", the percentage fee should be calculated from the total available input value.
-                    let fee_amount = current_input_sum.as_smallest_unit() * fee_value_raw / 10_000;
-                    Amount::from_smallest_unit(fee_amount)
-                }
+                FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw), // fee is fixed
+                FeeType::Percent => Amount::from_smallest_unit(
+                    // Calculate fee based on total input value, then subtract it.
+                    // amount_to_send = total_input - fee
+                    // fee = (amount_to_send) * percent / 100
+                    // fee = (total_input - fee) * percent / 100
+                    // fee * (1 + percent/100) = total_input * percent / 100
+                    // fee = (total_input * percent / 100) / (1 + percent/100)
+                    // fee = (total_input * fee_value_raw / 10_000) / (1 + fee_value_raw / 10_000)
+                    // fee = (total_input * fee_value_raw) / (10_000 + fee_value_raw)
+                    (current_input_sum.as_smallest_unit() as u128 * fee_value_raw as u128
+                        / (10_000 + fee_value_raw as u128)) as u64,
+                ),
             };
-            let amount = (current_input_sum - fee)?;
+            let amount = current_input_sum
+                .checked_sub(fee)
+                .context("Fee calculation underflow for send max")?;
             (amount, fee)
         } else {
             // For regular sends, the fee is calculated based on the amount the user wants to send.
@@ -679,8 +686,12 @@ impl Core {
         });
 
         // Calculate if change is needed and create a change output if necessary.
-        let total_spent = (final_amount_to_send + transaction_fee)?;
-        let change_amount = (current_input_sum - total_spent)?;
+        let total_spent = final_amount_to_send
+            .checked_add(transaction_fee)
+            .context("Total spent calculation overflow")?;
+        let change_amount = current_input_sum
+            .checked_sub(total_spent)
+            .context("Change calculation underflow")?;
         if change_amount > Amount::zero() {
             outputs.push(TransactionOutput {
                 // Send the change back to our own wallet.
@@ -741,16 +752,35 @@ impl Core {
                 );
 
                 // Add the transaction to our local transaction list with a pending status.
+                let mut transactions_guard = self.transactions.write().await;
                 let tx_info = WalletTransactionInfo {
-                    transaction: new_transaction,
+                    transaction: new_transaction.clone(),
                     status: TransactionStatus::Pending,
                     block_timestamp: Some(Utc::now()),
                     block_index: None,
                 };
-                self.transactions.write().await.insert(tx_hash, tx_info);
+                transactions_guard.insert(tx_hash, tx_info);
+                drop(transactions_guard);
 
-                // Re-fetch the wallet state to get the updated UTXO set from the node.
-                self.fetch_wallet_state().await?;
+                // --- CRITICAL FIX ---
+                // Proactively update the local UTXO set instead of re-fetching.
+                // This prevents the wallet from trying to double-spend its own pending UTXOs.
+                let mut utxos_guard = self.utxos.write().await;
+                for input in &new_transaction.inputs {
+                    utxos_guard.remove(&input.outpoint);
+                }
+                for (vout, output) in new_transaction.outputs.iter().enumerate() {
+                    if output.pubkey == current_wallet.public_key {
+                        // This is our change output, add it to our spendable UTXOs.
+                        utxos_guard.insert(
+                            OutPoint {
+                                txid: tx_hash,
+                                vout: vout as u32,
+                            },
+                            output.clone(),
+                        );
+                    }
+                }
             }
             Message::TransactionRejected(hash, reason) => {
                 warn!("Transaction rejected by node: {} - {}", hash, reason);
@@ -820,5 +850,38 @@ impl Core {
                 other
             )),
         }
+    }
+
+    /// Spawns a background task to periodically sync the wallet state with the node.
+    pub async fn start_background_sync(self: Arc<Self>) {
+        tokio::spawn(async move {
+            // Create an interval that ticks every 30 seconds.
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+
+            loop {
+                // Wait for the next tick.
+                interval.tick().await;
+
+                // Check if a wallet is loaded before attempting to sync.
+                let wallet_loaded = match self.get_current_wallet().await {
+                    Ok(wallet) => wallet.name.is_empty() == false,
+                    Err(_) => false,
+                };
+
+                if wallet_loaded {
+                    debug!("Background sync: Fetching wallet state...");
+                    if let Err(e) = self.fetch_wallet_state().await {
+                        // Log errors but don't panic. The loop will continue and try again later.
+                        // This handles cases where the node might be temporarily unavailable.
+                        warn!("Background sync failed: {}", e);
+                    } else {
+                        info!("Background sync completed successfully.");
+                    }
+                } else {
+                    // If no wallet is loaded, there's nothing to sync.
+                    debug!("Background sync: No wallet loaded, skipping fetch.");
+                }
+            }
+        });
     }
 }

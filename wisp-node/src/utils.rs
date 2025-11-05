@@ -256,30 +256,24 @@ pub async fn download_blockchain(node: &str, target_block_count: u64) -> Result<
                 // Add the received block to our local blockchain.
                 let add_result = blockchain.add_block(block);
                 match add_result? {
-                    AddBlockResult::Added => {
-                        debug!(
-                            "Block with index {} successfully added during download. Current chain height: {}",
-                            i,
-                            blockchain.block_height()?
-                        );
-                    }
-                    // These other results indicate a problem with the download or the peer's chain.
-                    AddBlockResult::PotentialLongerForkDetected { .. } => {
-                        error!("Unexpected longer fork detected while downloading block {} during reorg itself. Aborting download.", i);
-                        return Err(anyhow!("Unexpected longer fork detected during download."));
-                    }
-                    AddBlockResult::Rejected(reason)
-                    | AddBlockResult::ShorterForkRejected(reason)
-                    | AddBlockResult::OrphanedOrDisconnected(reason) => {
+                    AddBlockResult::Added => debug!(
+                        "Block with index {} successfully added during download. Current chain height: {}",
+                        i,
+                        blockchain.block_height()?
+                    ),
+                    other_result => {
+                        // During initial sync, we expect a clean series of `Added` results.
+                        // Any other result (Rejected, Orphaned, ForkDetected) indicates a desync or a malicious peer.
+                        // It's safest to abort the download.
                         error!(
-                            "Failed to add block {} received from {}: {}. Aborting blockchain download.",
-                            i, node, reason
+                            "Failed to add block {} from {}: {:?}. Aborting blockchain download.",
+                            i, node, other_result
                         );
                         return Err(anyhow!(
-                            "Failed to add block {} from {}: {}",
+                            "Unexpected result while adding block {} from {}: {:?}",
                             i,
                             node,
-                            reason
+                            other_result
                         ));
                     }
                 }

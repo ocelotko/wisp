@@ -94,13 +94,17 @@ impl Miner {
             tokio::select! {
                 // Branch 1: A mining thread has found a block.
                 Ok(mined_block) = receiver_clone.recv_async() => {
-                    info!("Received mined block from mining thread.");
-                    if self.submit_block(mined_block).await.is_ok() { // The block was accepted
-                        info!("Block accepted by node. Requesting new template...");
-                        self.fetch_and_validate_template().await?;
+                    debug!("Received mined block from mining thread. Submitting...");
+                    // The submit_block function now handles receiving the next template.
+                    // If it fails, we fetch a new template to recover.
+                    if self.submit_block(mined_block).await.is_err() {
+                        warn!("Block submission failed or was rejected. Fetching a new template to resume mining.");
+                        // A small delay to prevent spamming the node on repeated failures.
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let _ = self.fetch_and_validate_template().await;
                     } else {
-                        warn!("Block was rejected. Fetching a new template to resume mining.");
-                        self.fetch_and_validate_template().await?;
+                        // On success, the template is already updated. No action needed here.
+                        debug!("Block submission was successful, new template received in confirmation.");
                     }
                 },
                 // Branch 2: Listen for messages from the node, like a new template.
@@ -190,9 +194,9 @@ impl Miner {
                             if found {
                                 // The block is now mined, so its hash is final.
                                 if let Ok(block_hash) = block_to_mine.id() {
-                                    info!(
-                                        "\n⛏️  Block Found! (Thread {})\n   - Index: {}\n   - Nonce: {}\n   - Hash: {}",
-                                        i, block_to_mine.index, block_to_mine.nonce, block_hash
+                                    println!(
+                                        "\nBlock Found!\n  - Index: {}\n  - Nonce: {}\n  - Hash:  {}\n  - Thread: {}",
+                                        block_to_mine.index, block_to_mine.nonce, block_hash, i
                                     );
                                 }
                                 // Stop all other threads from mining and send the block for submission.
@@ -259,7 +263,7 @@ impl Miner {
             "Submitting mined block: {}",
             block.id().expect("Failed to hash mined block for logging")
         );
-        let message = Message::SubmitTemplate(block);
+        let message = Message::SubmitTemplate(self.public_key, block);
 
         let mut stream_lock = self.stream.lock().await;
         message
@@ -276,8 +280,24 @@ impl Miner {
         )
         .await
         {
-            Ok(Ok(Message::BlockSubmittedConfirmation)) => {
+            // The node now responds with a new template directly as confirmation.
+            Ok(Ok(Message::Template(new_template))) => {
+                // This is the primary success path
                 info!("✅ Submission successful! Block accepted by node.");
+                info!(
+                    "Received new template for block #{}. Resuming mining.",
+                    new_template.index
+                );
+                let mut current_template_guard = self.current_template.lock().unwrap();
+                *current_template_guard = Some(new_template);
+                self.new_template_counter.fetch_add(1, Ordering::Relaxed);
+                self.mining.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            // Legacy confirmation for compatibility, though our new node won't send this.
+            Ok(Ok(Message::BlockSubmittedConfirmation)) => {
+                // Fallback path
+                info!("✅ Submission successful! Block accepted by node (legacy confirmation).");
                 Ok(())
             }
             Ok(Ok(Message::BlockRejected(reason))) => {

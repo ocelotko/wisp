@@ -9,7 +9,10 @@ use crate::{
 use bincode::{config::standard as bincode_config, Decode, Encode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::io::{Error as IoError, Read, Write};
+use std::{
+    convert::TryFrom,
+    io::{Error as IoError, Read, Write},
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -56,14 +59,16 @@ pub enum Message {
     NewTemplate(Block),       // Node pushes a new template to miners when the chain tip changes.
     ValidateTemplate(Block),  // Miner asks node to validate a found template before submitting.
     TemplateValidity(bool),   // Node responds with validity of the template.
-    SubmitTemplate(Block),    // Miner submits a mined block.
-    BlockSubmittedConfirmation, // Node confirms receipt and successful addition of the block.
-    BlockRejected(String),    // Node rejects a submitted block.
+    SubmitTemplate(PublicKey, Block), // Miner submits a mined block, including their pubkey for the next template.
+    BlockSubmittedConfirmation,       // Node confirms receipt and successful addition of the block.
+    BlockRejected(String),            // Node rejects a submitted block.
 
     // --- Chain & Block Sync Messages ---
     NewBlock(Block),
     FetchBlock(u64),
     FetchBlockByHash(Hash),
+    FetchBlockInfo(u64),
+    BlockInfo(Option<Block>),
     FetchLatestBlock,
     LatestBlock(Option<(Block, u64)>),
 
@@ -111,10 +116,25 @@ impl Message {
 
     /// Sends the message over a synchronous stream, prepending its length.
     pub fn send(&self, stream: &mut impl Write) -> Result<(), IoError> {
-        let bytes = self
-            .encode()
-            .map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))?;
+        let bytes = self.encode()?;
         let len = bytes.len() as u64;
+
+        if len == 0 {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Cannot send a zero-length message",
+            ));
+        }
+        if len as usize > MAX_MESSAGE_SIZE {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Message too large to send: {} bytes > max {} bytes",
+                    len, MAX_MESSAGE_SIZE
+                ),
+            ));
+        }
+
         stream.write_all(&len.to_be_bytes())?;
         stream.write_all(&bytes)?;
         Ok(())
@@ -124,7 +144,21 @@ impl Message {
     pub fn receive(stream: &mut impl Read) -> Result<Self, IoError> {
         let mut len_bytes = [0u8; 8];
         stream.read_exact(&mut len_bytes)?;
-        let len = u64::from_be_bytes(len_bytes) as usize;
+        let len_u64 = u64::from_be_bytes(len_bytes);
+
+        if len_u64 == 0 {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Received zero-length message header",
+            ));
+        }
+
+        let len = usize::try_from(len_u64).map_err(|_| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Message length exceeds platform's usize capacity",
+            )
+        })?;
 
         if len > MAX_MESSAGE_SIZE {
             return Err(IoError::new(
@@ -139,15 +173,30 @@ impl Message {
         let mut data = vec![0u8; len];
         stream.read_exact(&mut data)?;
 
-        Self::decode(&data).map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))
+        Self::decode(&data)
     }
 
     /// Sends the message over an asynchronous stream, prepending its length.
     pub async fn send_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> Result<(), IoError> {
-        let bytes = self
-            .encode()
-            .map_err(|_| IoError::from(std::io::ErrorKind::InvalidData))?;
+        let bytes = self.encode()?;
         let len = bytes.len() as u64;
+
+        if len == 0 {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Cannot send a zero-length message",
+            ));
+        }
+        if len as usize > MAX_MESSAGE_SIZE {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Message too large to send: {} bytes > max {} bytes",
+                    len, MAX_MESSAGE_SIZE
+                ),
+            ));
+        }
+
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(&bytes).await?;
         Ok(())
@@ -157,28 +206,37 @@ impl Message {
     pub async fn receive_async(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, IoError> {
         let mut len_bytes = [0u8; 8];
         stream.read_exact(&mut len_bytes).await?;
-        let len = u64::from_be_bytes(len_bytes) as usize;
+        let len_u64 = u64::from_be_bytes(len_bytes);
+
+        if len_u64 == 0 {
+            return Err(IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Received zero-length message header",
+            ));
+        }
+
+        let len = usize::try_from(len_u64).map_err(|_| {
+            IoError::new(
+                std::io::ErrorKind::InvalidData,
+                "Message length exceeds platform's usize capacity",
+            )
+        })?;
 
         if len > MAX_MESSAGE_SIZE {
             return Err(IoError::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "Received message too large: {} bytes, max is {} bytes",
+                    "Received message header for too large a message: {} bytes, max is {} bytes",
                     len, MAX_MESSAGE_SIZE
                 ),
             ));
         }
 
-        let mut data = Vec::with_capacity(len);
-        let mut stream_reader = stream.take(len as u64);
-        stream_reader.read_to_end(&mut data).await?;
-
-        if data.len() != len {
-            return Err(IoError::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Failed to read the full message body",
-            ));
-        }
+        // Allocate the exact buffer size and read the exact number of bytes.
+        // `read_exact` will return an `UnexpectedEof` error if the stream ends
+        // before the buffer is filled, which is the desired behavior.
+        let mut data = vec![0u8; len];
+        stream.read_exact(&mut data).await?;
 
         Self::decode(&data)
     }

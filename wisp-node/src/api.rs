@@ -381,7 +381,7 @@ async fn get_transaction_by_hash(
     let tx_data = blockchain.get_transaction_with_details(&hash);
     match tx_data {
         Ok(Some((tx, block_height, timestamp))) => {
-            let is_coinbase = tx.inputs.is_empty();
+            let is_coinbase = tx.is_coinbase();
             let coinbase_message = if is_coinbase {
                 tx.inputs
                     .first()
@@ -395,21 +395,14 @@ async fn get_transaction_by_hash(
                 None
             };
             let fee_or_reward = if is_coinbase {
-                tx.outputs
-                    .iter()
-                    .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                    .unwrap_or_else(|_| Amount::zero())
+                tx.outputs.iter().map(|o| o.value).sum()
             } else {
                 blockchain
                     .calculate_transaction_fee(&tx)
                     .unwrap_or_else(|_| Amount::zero())
             };
 
-            let total_output: Amount = tx
-                .outputs
-                .iter()
-                .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                .unwrap_or_else(|_| Amount::zero());
+            let total_output: Amount = tx.outputs.iter().map(|o| o.value).sum();
 
             let inputs = if is_coinbase {
                 // For coinbase, the input is special and contains the message.
@@ -532,24 +525,25 @@ async fn get_recent_transactions(
     let mempool = blockchain.mempool();
     let mut api_transactions: Vec<ApiTransactionSummary> = mempool
         .iter()
-        .map(|(_tx_hash, (timestamp, tx, _fee))| {
-            let total_output: wisp_core::currency::Amount = tx
+        .map(|(_tx_hash, entry)| {
+            let total_output: wisp_core::currency::Amount = entry
+                .transaction
                 .outputs
                 .iter()
-                .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                .unwrap_or_else(|_| {
-                    log::warn!("Overflow calculating total output for a recent transaction. This should not happen for a validated tx.");
-                    Amount::zero()
-                });
+                .map(|o| o.value)
+                .sum();
+            if total_output == Amount::MAX {
+                log::warn!("Overflow calculating total output for a recent transaction. This should not happen for a validated tx.");
+            }
 
             ApiTransactionSummary {
-                hash: tx.txid().unwrap_or_default(),
+                hash: entry.transaction.txid().unwrap_or_default(),
                 block_height: None,
-                input_count: tx.inputs.len(),
+                input_count: entry.transaction.inputs.len(),
                 is_coinbase: false,
-                output_count: tx.outputs.len(),
+                output_count: entry.transaction.outputs.len(),
                 total_output_wisp: total_output.to_string_wisp(),
-                timestamp: timestamp.timestamp(),
+                timestamp: entry.timestamp.timestamp(),
             }
         })
         .collect();
@@ -568,20 +562,17 @@ async fn get_recent_transactions(
 
         if let Ok(Some(block)) = blockchain.get_block_by_index(i) {
             for tx in block.transactions.iter() {
-                let total_output: wisp_core::currency::Amount = tx
-                    .outputs
-                    .iter()
-                    .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                    .unwrap_or_else(|_| {
-                        log::warn!("Overflow calculating total output for a block transaction. This should not happen for a validated tx.");
-                        Amount::zero()
-                    });
+                let total_output: wisp_core::currency::Amount =
+                    tx.outputs.iter().map(|o| o.value).sum();
+                if total_output == Amount::MAX {
+                    log::warn!("Overflow calculating total output for a block transaction. This should not happen for a validated tx.");
+                }
 
                 api_transactions.push(ApiTransactionSummary {
                     hash: tx.txid().unwrap_or_default(),
                     block_height: Some(block.index),
                     input_count: tx.inputs.len(),
-                    is_coinbase: tx.inputs.is_empty(),
+                    is_coinbase: tx.is_coinbase(),
                     output_count: tx.outputs.len(),
                     total_output_wisp: total_output.to_string_wisp(),
                     timestamp: block.timestamp.timestamp(),
@@ -629,20 +620,17 @@ async fn get_transactions_paginated(
     let mut transactions_for_page: Vec<ApiTransactionSummary> = Vec::with_capacity(limit as usize);
     let mut mempool_txs: Vec<ApiTransactionSummary> = mempool
         .iter()
-        .map(|(_tx_hash, (timestamp, tx, _fee))| {
-            let total_output: wisp_core::currency::Amount = tx
-                .outputs
-                .iter()
-                .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                .unwrap_or_else(|_| Amount::zero());
+        .map(|(_tx_hash, entry)| {
+            let total_output: wisp_core::currency::Amount =
+                entry.transaction.outputs.iter().map(|o| o.value).sum();
             ApiTransactionSummary {
-                hash: tx.txid().unwrap_or_default(),
+                hash: entry.transaction.txid().unwrap_or_default(),
                 block_height: None,
-                input_count: tx.inputs.len(),
+                input_count: entry.transaction.inputs.len(),
                 is_coinbase: false,
-                output_count: tx.outputs.len(),
+                output_count: entry.transaction.outputs.len(),
                 total_output_wisp: total_output.to_string_wisp(),
-                timestamp: timestamp.timestamp(),
+                timestamp: entry.timestamp.timestamp(),
             }
         })
         .collect();
@@ -670,17 +658,14 @@ async fn get_transactions_paginated(
                     if let Ok(Some((tx, block_height, timestamp))) =
                         blockchain.get_transaction_with_details(&tx_hash)
                     {
-                        let total_output: wisp_core::currency::Amount = tx
-                            .outputs
-                            .iter()
-                            .try_fold(Amount::zero(), |acc, o| acc + o.value)
-                            .unwrap_or_else(|_| Amount::zero());
+                        let total_output: wisp_core::currency::Amount =
+                            tx.outputs.iter().map(|o| o.value).sum();
 
                         transactions_for_page.push(ApiTransactionSummary {
                             hash: tx_hash,
                             block_height,
                             input_count: tx.inputs.len(),
-                            is_coinbase: tx.inputs.is_empty(),
+                            is_coinbase: tx.is_coinbase(),
                             output_count: tx.outputs.len(),
                             total_output_wisp: total_output.to_string_wisp(),
                             timestamp: timestamp.timestamp(),

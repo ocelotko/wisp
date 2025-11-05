@@ -5,11 +5,25 @@ use crate::{
     transactions::{OutPoint, Transaction},
 };
 
-use anyhow::{anyhow, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use anyhow::{anyhow, Context, Result};
+use bincode::{Decode, Encode};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ecdsa::signature::Verifier;
 use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+/// Represents an entry in the mempool.
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MempoolEntry {
+    /// The time the transaction was added to the mempool.
+    #[bincode(with_serde)]
+    pub timestamp: DateTime<Utc>,
+    /// The transaction itself.
+    pub transaction: Transaction,
+    /// The pre-calculated fee for the transaction.
+    pub fee: Amount,
+}
 
 /// The maximum age in seconds for a transaction to remain in the mempool before being evicted.
 pub const MAX_MEMPOOL_TRANSACTION_AGE: u64 = 172800; // Two days in seconds
@@ -39,7 +53,9 @@ impl Blockchain {
 
         let mut output_sum = Amount::zero();
         for output in &transaction.outputs {
-            output_sum = (output_sum + output.value)?;
+            output_sum = output_sum
+                .checked_add(output.value)
+                .context("Output sum overflow")?;
         }
 
         let transaction_hash_for_verification = transaction.txid()?;
@@ -52,9 +68,15 @@ impl Blockchain {
             }
 
             // Check if the input UTXO exists and is not already spent by another mempool transaction.
-            // The boolean in the UTXO entry indicates if it's "spent" in the mempool.
-            let (is_in_mempool, prev_output) = match self.utxo_set.utxos.get(outpoint) {
-                Some((is_in_mempool, output)) => (*is_in_mempool, output),
+            if self.mempool_spent_utxos.contains(outpoint) {
+                return Err(anyhow!(
+                    "Double spend: input {} already spent by a transaction in mempool",
+                    outpoint
+                ));
+            }
+
+            let prev_output = match self.utxo_set.utxos.get(outpoint) {
+                Some(output) => output,
                 None => {
                     return Err(anyhow!(
                         "Transaction input UTXO {} not found or already spent on chain",
@@ -62,13 +84,6 @@ impl Blockchain {
                     ));
                 }
             };
-
-            if is_in_mempool {
-                return Err(anyhow!(
-                    "Double spend: input {} already spent by a transaction in mempool",
-                    outpoint
-                ));
-            }
 
             // Verify the signature for the input.
             let is_signature_valid = match input.signature.as_ref() {
@@ -94,7 +109,9 @@ impl Blockchain {
                 ));
             }
 
-            input_sum = (input_sum + prev_output.value)?;
+            input_sum = input_sum
+                .checked_add(prev_output.value)
+                .context("Input sum overflow")?;
         }
 
         // Ensure that the total input value is not less than the total output value.
@@ -112,20 +129,27 @@ impl Blockchain {
             transaction.inputs.iter().map(|i| i.outpoint).collect();
 
         for outpoint in outpoints_to_mark {
-            if let Some(utxo_entry) = self.utxo_set.utxos.get_mut(&outpoint) {
-                utxo_entry.0 = true;
-            } else {
-                return Err(anyhow!("CRITICAL: UTXO {} disappeared between validation and marking. Aborting mempool add.", outpoint));
-            }
+            self.mempool_spent_utxos.insert(outpoint);
         }
 
         // Add the validated transaction to the mempool.
-        let fee = (input_sum - output_sum)?;
-        self.mempool
-            .insert(tx_hash, (Utc::now(), transaction.clone(), fee));
+        let fee = input_sum
+            .checked_sub(output_sum)
+            .context("Fee calculation underflow")?;
+        let now = Utc::now();
+        self.mempool.insert(
+            tx_hash,
+            MempoolEntry {
+                timestamp: now,
+                transaction: transaction.clone(),
+                fee,
+            },
+        );
 
         println!(
-            "Transaction added to mempool. Mempool size: {}",
+            "Transaction {} added to mempool with fee {}. Mempool size: {}",
+            tx_hash,
+            fee,
             self.mempool.len()
         );
 
@@ -142,19 +166,29 @@ impl Blockchain {
         let mut outpoints_to_unmark: Vec<OutPoint> = vec![];
 
         // Retain only transactions that are not too old.
-        self.mempool.retain(|_, (timestamp, transaction, _)| {
-            let is_too_old = now.signed_duration_since(*timestamp)
-                > ChronoDuration::seconds(MAX_MEMPOOL_TRANSACTION_AGE as i64);
+        self.mempool.retain(|_, entry| {
+            let is_too_old = now.signed_duration_since(entry.timestamp)
+                > ChronoDuration::seconds(
+                    i64::try_from(MAX_MEMPOOL_TRANSACTION_AGE).unwrap_or(i64::MAX),
+                );
             if is_too_old {
-                outpoints_to_unmark.extend(transaction.inputs.iter().map(|input| input.outpoint));
+                outpoints_to_unmark
+                    .extend(entry.transaction.inputs.iter().map(|input| input.outpoint));
             }
             !is_too_old
         });
 
         // Unmark the UTXOs that were spent by the expired transactions.
-        for outpoint in outpoints_to_unmark {
-            if let Some((marked, _)) = self.utxo_set.utxos.get_mut(&outpoint) {
-                *marked = false;
+        for outpoint in &outpoints_to_unmark {
+            self.mempool_spent_utxos.remove(outpoint);
+        }
+
+        if !outpoints_to_unmark.is_empty() {
+            if let Err(e) = self.save_mempool_snapshot() {
+                warn!(
+                    "[MEMPOOL] Failed to save mempool snapshot after clearing old transactions: {}",
+                    e
+                );
             }
         }
     }
@@ -169,10 +203,20 @@ impl Blockchain {
 
         let initial_mempool_size = self.mempool.len();
 
+        let mut outpoints_to_unmark = Vec::new();
+        for (txid, entry) in self.mempool.iter() {
+            if txids_in_block.contains(txid) {
+                outpoints_to_unmark.extend(entry.transaction.inputs.iter().map(|i| i.outpoint));
+            }
+        }
+
         // Retain only the transactions that are NOT in the new block.
         self.mempool
             .retain(|txid, _| !txids_in_block.contains(txid));
 
+        for outpoint in outpoints_to_unmark {
+            self.mempool_spent_utxos.remove(&outpoint);
+        }
         let removed_count = initial_mempool_size - self.mempool.len();
 
         // Persist the change if any transactions were removed.
@@ -232,7 +276,7 @@ mod tests {
         blockchain
             .utxo_set
             .utxos
-            .insert(outpoint, (false, funding_tx.outputs[0].clone()));
+            .insert(outpoint, funding_tx.outputs[0].clone());
 
         outpoint
     }
@@ -256,11 +300,8 @@ mod tests {
         assert!(blockchain.add_to_mempool(tx.clone()).is_ok());
         assert_eq!(blockchain.mempool.len(), 1);
         assert!(blockchain.mempool.contains_key(&tx.txid().unwrap()));
-        // Check that the UTXO is now marked as spent in the mempool
-        assert_eq!(
-            blockchain.utxo_set.utxos.get(&utxo_to_spend).unwrap().0,
-            true
-        );
+        // Check that the UTXO is now marked as spent in the separate mempool set
+        assert!(blockchain.mempool_spent_utxos.contains(&utxo_to_spend));
     }
 
     #[test]

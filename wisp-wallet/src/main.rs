@@ -26,9 +26,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config;
 
-    let core = Core::load(config_path.clone()).await?;
+    let core = Arc::new(Core::load(config_path.clone()).await?);
 
-    run_wallet_ui(Arc::new(core), config_path).await?;
+    // Start the background sync task.
+    Arc::clone(&core).start_background_sync().await;
+
+    run_wallet_ui(core, config_path).await?;
 
     info!("Wisp Wallet exited cleanly.");
     Ok(())

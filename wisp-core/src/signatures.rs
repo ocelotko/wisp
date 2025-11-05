@@ -25,7 +25,23 @@ use crate::sha256::{Hash, Hashable};
 pub struct Signature(#[bincode(with_serde)] pub EcdsaSignature<Secp256k1>);
 
 impl Signature {
+    /// Creates a new signature from a DER-encoded hex string.
+    pub fn from_hex(s: &str) -> anyhow::Result<Self> {
+        let bytes = hex::decode(s)?;
+        EcdsaSignature::from_der(&bytes)
+            .map(Signature)
+            .map_err(|e| anyhow!("Failed to create Signature from DER bytes: {}", e))
+    }
+
+    /// Returns the signature as a DER-encoded hex string.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0.to_der().as_bytes())
+    }
+
     /// Creates a new signature for a given transaction hash using a private key.
+    ///
+    /// All signatures are generated using deterministic ECDSA per RFC 6979;
+    /// no external randomness is required for the signing operation itself.
     pub fn sign_transaction_hash(transaction_hash: &Hash, private_key: &PrivateKey) -> Self {
         let signing_key = &private_key.0;
         let signature = signing_key.sign(&transaction_hash.as_bytes()[..]);
@@ -85,6 +101,15 @@ impl PublicKey {
     pub fn fingerprint(&self) -> String {
         let encoded_point = self.0.to_encoded_point(true);
         hex::encode(encoded_point.as_bytes())
+    }
+
+    /// Returns the compressed SEC1-encoded public key as a 33-byte array.
+    pub fn to_bytes(&self) -> [u8; 33] {
+        self.0
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("EncodedPoint should be 33 bytes for compressed secp256k1 keys")
     }
 }
 
@@ -150,6 +175,11 @@ impl PrivateKey {
     /// Derives the corresponding public key from this private key.
     pub fn public_key(&self) -> PublicKey {
         PublicKey(self.0.verifying_key().clone())
+    }
+
+    /// Returns the private key as a 32-byte hex string.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0.to_bytes())
     }
 }
 

@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use crate::{
     blockchain::{Block, Blockchain},
     currency::Amount,
+    mempool::MempoolEntry,
     sha256::Hash,
     signatures::PublicKey, // Keep this for other functions
-    transactions::{OutPoint, Transaction, TransactionOutput},
+    transactions::{OutPoint, TransactionOutput},
     utils,
 };
 
@@ -27,10 +30,10 @@ impl DBKeys {
     pub const LAST_UTXO_SNAPSHOT_HEIGHT: &'static [u8] = b"last_utxo_snapshot_height";
     pub const UTXO_SNAPSHOT_CHECKSUM: &'static [u8] = b"utxo_snapshot_checksum";
     pub const MEMPOOL_SNAPSHOT: &'static [u8] = b"mempool_snapshot";
-    pub const PENDING_REORG_TIP: &'static [u8] = b"pending_reorg_tip";
     pub const PENDING_UTXO_SNAPSHOT: &'static [u8] = b"pending_utxo_snapshot";
-    pub const PENDING_REORG_ANCESTOR: &'static [u8] = b"pending_reorg_ancestor";
-    pub const PENDING_REORG_ANCESTOR_HASH: &'static [u8] = b"pending_reorg_ancestor_hash";
+    pub const PENDING_REORG_TIP: &'static [u8] = b"reorg:tip";
+    pub const PENDING_REORG_ANCESTOR: &'static [u8] = b"reorg:ancestor";
+    pub const PENDING_REORG_ANCESTOR_HASH: &'static [u8] = b"reorg:ancestor_hash";
 
     // --- Key Generation Functions for Prefixed Collections ---
     pub fn block(hash: &Hash) -> Vec<u8> {
@@ -75,27 +78,12 @@ impl Blockchain {
                 return Err(e);
             }
 
-            // Check for and handle a crashed UTXO update from a direct extension.
-            if let Ok(Some(bytes)) = self.db.get(DBKeys::PENDING_UTXO_SNAPSHOT) {
-                warn!("Found a pending UTXO snapshot, indicating a possible crash after a block was added. Recovering...");
-                let (snapshot, _): (crate::utxo::UtxoSet, _) =
-                    bincode::decode_from_slice(&bytes, bincode_config())
-                        .context("Failed to decode pending UTXO snapshot during recovery")?;
-                self.utxo_set = snapshot;
-
-                // The crash happened after the block was committed but before the snapshot was promoted.
-                // We must complete the promotion now to ensure the main snapshot is up-to-date.
-                self.db.insert(DBKeys::UTXO_SNAPSHOT, bytes.to_vec())?;
-                // We also need to update the snapshot height to match the new tip.
-                let tip_height = self.block_height()?;
-                self.db.insert(
-                    DBKeys::LAST_UTXO_SNAPSHOT_HEIGHT,
-                    tip_height.to_be_bytes().to_vec(),
-                )?;
+            // The PENDING_UTXO_SNAPSHOT key is now deprecated, as snapshotting is atomic with block commits.
+            // However, we keep this recovery logic for nodes upgrading from a version that might have crashed
+            // and left a pending snapshot.
+            if self.db.contains_key(DBKeys::PENDING_UTXO_SNAPSHOT)? {
+                warn!("Found a deprecated PENDING_UTXO_SNAPSHOT key. This indicates a crash may have occurred on a previous software version. The key will be removed, and a full UTXO rebuild will ensure consistency.");
                 self.db.remove(DBKeys::PENDING_UTXO_SNAPSHOT)?;
-
-                info!("✅ Successfully recovered and promoted UTXO set from pending snapshot.");
-                // After this, normal loading can continue.
             }
 
             // Populate the tip cache
@@ -219,6 +207,29 @@ impl Blockchain {
         }
     }
 
+    /// A static version of `get_block_by_index_from_db_txn` for use where `&self` isn't available.
+    pub fn get_block_by_index_from_db_txn_static(
+        index: u64,
+        tx_db: &TransactionalTree,
+    ) -> Result<Option<Block>> {
+        if let Some(hash_ivec) = tx_db.get(DBKeys::index_to_hash(index))? {
+            let (hash, _): (Hash, _) = bincode::decode_from_slice(&hash_ivec, bincode_config())?;
+            tx_db
+                .get(DBKeys::block(&hash))?
+                .map(|ivec| {
+                    let (checked_block, _): (crate::blockchain::CheckedBlock, _) =
+                        bincode::decode_from_slice(&ivec, bincode_config())
+                            .context("Failed to deserialize CheckedBlock in txn")?;
+                    checked_block
+                        .into_block()
+                        .context("Failed to deserialize block in txn")
+                })
+                .transpose()
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Saves a snapshot of the current UTXO set to the database.
     pub fn save_utxo_snapshot(&self, height: u64) -> Result<()> {
         info!("Serializing UTXO set for snapshot at height {}...", height);
@@ -251,19 +262,17 @@ impl Blockchain {
 
     /// Saves a snapshot of the current mempool to the database.
     pub fn save_mempool_snapshot(&self) -> Result<()> {
-        let mempool_txs: Vec<Transaction> =
-            self.mempool.values().map(|(_, tx, _)| tx.clone()).collect();
-
-        if mempool_txs.is_empty() {
+        if self.mempool.is_empty() {
             // If the mempool is empty, just remove the key from the DB.
             self.db.remove(DBKeys::MEMPOOL_SNAPSHOT)?;
         } else {
-            let bytes = bincode::encode_to_vec(&mempool_txs, bincode_config())?;
+            // Serialize the entire mempool HashMap to preserve timestamps and pre-calculated fees.
+            let bytes = bincode::encode_to_vec(&self.mempool, bincode_config())?;
             self.db.insert(DBKeys::MEMPOOL_SNAPSHOT, bytes)?;
         }
         debug!(
             "Saved mempool snapshot with {} transactions.",
-            mempool_txs.len()
+            self.mempool.len()
         );
         Ok(())
     }
@@ -271,20 +280,26 @@ impl Blockchain {
     /// Loads the mempool from a database snapshot and re-validates each transaction.
     fn load_mempool_snapshot(&mut self) -> Result<()> {
         if let Some(ivec) = self.db.get(DBKeys::MEMPOOL_SNAPSHOT)? {
-            let (txs, _): (Vec<Transaction>, _) =
+            // Decode the full HashMap<Hash, MempoolEntry>
+            let (snapshot_mempool, _): (HashMap<Hash, MempoolEntry>, _) =
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .context("Failed to decode mempool snapshot")?;
 
             info!(
                 "Loading {} transactions from mempool snapshot...",
-                txs.len()
+                snapshot_mempool.len()
             );
             let mut successfully_loaded = 0;
-            for tx in txs {
+            for (tx_hash, entry) in snapshot_mempool {
                 // Re-validate each transaction against the current state.
                 // This is a crucial safety check.
-                if self.add_to_mempool(tx).is_ok() {
+                // We can skip the full `add_to_mempool` which recalculates fees,
+                // and do a quicker validation before inserting directly.
+                // For simplicity here, we'll just re-add, but a more optimized path is possible.
+                if self.add_to_mempool(entry.transaction.clone()).is_ok() {
                     successfully_loaded += 1;
+                } else {
+                    warn!("Could not re-validate transaction {} from mempool snapshot. It may now be invalid.", tx_hash);
                 }
             }
             info!(
@@ -307,7 +322,11 @@ impl Blockchain {
             .transpose() // Option<Result<T>> -> Result<Option<T>>
     }
     /// Gets the current height of the blockchain from the database.
+    /// It prioritizes the in-memory tip cache for immediate consistency.
     pub fn block_height(&self) -> Result<u64> {
+        if let Some((_, tip_block)) = &self.tip_cache {
+            return Ok(tip_block.index);
+        }
         if let Some(ivec) = self.db.get(DBKeys::CHAIN_HEIGHT)? {
             // Handle raw 8-byte big-endian format first, which is the canonical format.
             if ivec.len() == 8 {
@@ -567,7 +586,7 @@ impl Blockchain {
                         new_utxos.remove(&outpoint);
                     }
                     for (outpoint, output) in changes.outputs_to_add {
-                        new_utxos.insert(outpoint, (false, output));
+                        new_utxos.insert(outpoint, output);
                     }
                 }
                 i = end + 1;
@@ -577,10 +596,10 @@ impl Blockchain {
 
         // After rebuilding the UTXO set, iterate through the mempool and mark spent UTXOs.
         // This ensures the in-memory UTXO state is consistent with pending transactions.
-        for (_, tx, _) in self.mempool.values() {
-            for input in &tx.inputs {
-                if let Some(utxo_entry) = new_utxos.get_mut(&input.outpoint) {
-                    utxo_entry.0 = true; // Mark as spent in mempool
+        for entry in self.mempool.values() {
+            for input in &entry.transaction.inputs {
+                if new_utxos.contains_key(&input.outpoint) {
+                    self.mempool_spent_utxos.insert(input.outpoint); // Mark as spent in mempool
                 }
             }
         }

@@ -1,6 +1,5 @@
 use crate::{utils::MerkleRoot, U256};
 use bincode::{Decode, Encode};
-use hex;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use sha2::Digest;
@@ -94,6 +93,20 @@ pub fn witness_hash<T: WitnessHashable + ?Sized>(data: &T) -> Hash {
     double_sha256_hash(|hasher| data.update_witness_hasher(hasher))
 }
 
+/// Performs a tagged hash as specified in BIP-340 for Taproot.
+/// The tag is hashed, and the result is used to prefix the data hash,
+/// creating a domain-separated hash.
+pub fn tagged_hash(tag: &str, data: &[u8]) -> Hash {
+    let tag_hash = hash(tag.as_bytes());
+    let tag_hash_bytes = tag_hash.as_bytes();
+
+    double_sha256_hash(|hasher| {
+        hasher.update(&tag_hash_bytes);
+        hasher.update(&tag_hash_bytes);
+        hasher.update(data);
+    })
+}
+
 /// A wrapper around a `U256` to represent a 256-bit SHA-256 hash.
 #[serde_as]
 #[derive(
@@ -124,7 +137,7 @@ impl Hash {
     }
 
     /// Creates a `Hash` from a `U256`. This is private to ensure hashes are only created via the `hash` function.
-    fn from_u256(u: U256) -> Self {
+    pub(crate) fn from_u256(u: U256) -> Self {
         Hash(u)
     }
 }

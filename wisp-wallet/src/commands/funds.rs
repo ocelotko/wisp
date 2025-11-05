@@ -231,19 +231,27 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .unwrap_or_else(|| "Unknown Date/Time".to_string())
         };
 
-        let mut value_from_us = Amount::zero(); // Value of inputs we owned
-        let mut value_to_us = Amount::zero(); // Value of new outputs being sent to us (e.g., change)
+        let mut value_from_us = Amount::zero();
+        let mut value_to_us = Amount::zero();
 
         // Calculate value from us (inputs we owned)
+        // To do this, we need to find the source transaction for each input.
         for input in &tx.inputs {
-            if let Some(source_tx_info) = all_txs.get(&input.outpoint.txid) {
-                if let Some(spent_output) = source_tx_info
+            // We need to look up the output this input is spending.
+            // The most reliable way is to check all transactions, but this can be slow.
+            // A better approach is to rely on the UTXO set at the time of the transaction,
+            // but for history, we must reconstruct.
+            // Let's find the source transaction in our `all_txs` map.
+            if let Some(source_tx) = all_txs.get(&input.outpoint.txid) {
+                if let Some(spent_output) = source_tx
                     .transaction
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
                     if spent_output.pubkey == wallet_public_key {
-                        value_from_us = (value_from_us + spent_output.value)?;
+                        value_from_us = value_from_us
+                            .checked_add(spent_output.value)
+                            .context("Overflow calculating value from us in transaction history")?;
                     }
                 }
             }
@@ -252,7 +260,9 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         // Calculate value to us (outputs we received)
         for output in &tx.outputs {
             if output.pubkey == wallet_public_key {
-                value_to_us = (value_to_us + output.value)?;
+                value_to_us = value_to_us
+                    .checked_add(output.value)
+                    .context("value_to_us overflow")?;
             }
         }
 
@@ -262,17 +272,21 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         }
 
         let net_effect =
-            (value_to_us.as_smallest_unit() as i64) - (value_from_us.as_smallest_unit() as i64);
+            (value_to_us.as_smallest_unit() as i128) - (value_from_us.as_smallest_unit() as i128);
 
         let (tx_type, amount_str, counterparty_info) = if is_coinbase {
             (
                 "Coinbase".to_string(),
-                format!("+{} WISP", value_to_us),
+                format!("+{} WISP", value_to_us.to_string_wisp()),
                 "Coinbase Reward".to_string(),
             )
         } else if net_effect < 0 {
+            // Outgoing transaction
             // We sent more than we received (net outgoing)
-            let amount_sent = Amount::from_smallest_unit(net_effect.abs() as u64);
+            let total_sent_to_others = value_from_us
+                .checked_sub(value_to_us)
+                .unwrap_or_else(|| Amount::from_smallest_unit(net_effect.abs() as u64));
+
             let recipients: HashSet<_> = tx
                 .outputs
                 .iter()
@@ -281,43 +295,46 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .collect();
 
             let recipient_info = if recipients.is_empty() {
-                "to Self".to_string() // Sent to ourself
+                "Self".to_string() // Sent to ourself
             } else if recipients.len() == 1 {
-                format!("to {}", recipients.iter().next().unwrap())
+                recipients.iter().next().unwrap().to_string()
             } else {
-                format!("to ({} recipients)", recipients.len())
+                format!("{} recipients", recipients.len())
             };
             (
                 "Sent".to_string(),
-                format!("-{} WISP", amount_sent),
+                format!("-{} WISP", total_sent_to_others.to_string_wisp()),
                 recipient_info,
             )
         } else {
+            // Incoming or self-transfer
             // We received more than we sent (net incoming)
-            let amount_received = Amount::from_smallest_unit(net_effect as u64);
+            let amount_received = Amount::from_smallest_unit(net_effect.abs() as u64);
             let senders: HashSet<_> = tx
                 .inputs
                 .iter()
-                .filter_map(|i| all_txs.get(&i.outpoint.txid))
-                .flat_map(|source_tx_info| {
+                .filter_map(|i| all_txs.get(&i.outpoint.txid).map(|info| (i, info)))
+                .flat_map(|(i, source_tx_info)| {
                     source_tx_info
                         .transaction
                         .outputs
-                        .iter()
+                        .get(i.outpoint.vout as usize) // `i` is now in scope here
+                        .into_iter()
+                        .filter(|o| o.pubkey != wallet_public_key) // Don't list ourselves as sender
                         .map(|o| o.pubkey.fingerprint())
                 })
                 .collect();
 
             let sender_info = if senders.is_empty() {
-                "from Unknown".to_string()
+                "Unknown".to_string()
             } else if senders.len() == 1 {
-                format!("from {}", senders.iter().next().unwrap())
+                senders.iter().next().unwrap().to_string()
             } else {
-                format!("from ({} senders)", senders.len())
+                format!("{} senders", senders.len())
             };
             (
                 "Received".to_string(),
-                format!("+{} WISP", amount_received),
+                format!("+{} WISP", amount_received.to_string_wisp()),
                 sender_info,
             )
         };
@@ -365,12 +382,12 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             total_pages
         );
         println!(
-            "{:^19} {:^15} {:^18} {:<30}",
-            "Date/Time", "Type", "Amount", "Address/Memo"
+            "{:<20} {:<10} {:>18}  {:<30}",
+            "Date/Time", "Type", "Amount", "Counterparty/Memo"
         ); // Adjusted header width
-        println!("{}", "-".repeat(90)); // Adjust length based on column widths
+        println!("{}", "-".repeat(85)); // Adjust length based on column widths
 
-        let start_index = current_page * TRANSACTIONS_PER_PAGE;
+        let start_index = current_page * TRANSACTIONS_PER_PAGE; // Use a constant for items per page
         let end_index = (start_index + TRANSACTIONS_PER_PAGE).min(display_items.len());
 
         if display_items.is_empty() {
@@ -393,7 +410,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
 
             // Print the main transaction line with colors
             println!(
-                "{}{:<19} {:<15} {:>18} {:<30}{}", // Adjusted widths
+                "{}{:<20} {:<10} {:>18}  {:<30}{}", // Adjusted widths
                 color_code,
                 tx_item.display_date_time,
                 tx_item.tx_type,
@@ -407,7 +424,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             );
             println!();
         }
-        println!("{}", "-".repeat(90));
+        println!("{}", "-".repeat(85));
 
         let mut page_options = Vec::new();
         if current_page > 0 {

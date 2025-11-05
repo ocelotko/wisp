@@ -7,7 +7,7 @@ use tokio::{net::TcpListener, net::TcpStream, sync::OnceCell, sync::RwLock};
 use wisp_core::blockchain::Blockchain;
 
 pub mod api;
-pub mod connection_handler;
+pub mod connection;
 pub mod utils;
 
 #[macro_use]
@@ -141,7 +141,7 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
             Ok((socket, addr)) => {
                 info!("Accepted new connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(e) = connection_handler::handle_connection(socket, addr).await {
+                    if let Err(e) = connection::handle_connection(socket, addr).await {
                         error!("Error in connection handler from {}: {:?}", addr, e);
                     }
                 });
