@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use inquire::{Confirm, Select};
 use log::{error, info};
 use std::path::PathBuf;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 use wisp_core::{currency::Amount, network::TransactionStatus};
 
 pub async fn settings_and_info(
@@ -75,46 +75,54 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
             println!("Connected Node:      {}", config_guard.default_node);
             drop(config_guard);
 
-            let discovered_nodes_guard = core.discovered_nodes.lock().await;
-            let total_discovered_nodes = discovered_nodes_guard.len();
-            println!("Known Peers:         {}", total_discovered_nodes);
-
             println!("\n--- Balance & State ---");
             let transactions_guard = core.transactions.read().await;
             let utxos_guard = core.utxos.read().await;
 
-            let available_balance = utxos_guard
-                .values()
-                .fold(Amount::zero(), |acc, output| acc + output.value)
-                .to_string_wisp();
+            // Confirmed balance is the sum of all UTXOs currently in the wallet's confirmed set.
+            let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
 
-            let mut pending_change = 0i64;
+            // Pending balance calculates the net change from all pending transactions.
+            let mut pending_net_change: i128 = 0;
             let mut pending_tx_count = 0;
-            let wallet_utxos_set: HashSet<_> = utxos_guard.keys().collect();
 
             for tx_info in transactions_guard.values() {
                 if tx_info.status == TransactionStatus::Pending {
                     pending_tx_count += 1;
-                    // Sum inputs that were part of our available UTXOs
+                    let tx = &tx_info.transaction;
+
+                    // Subtract the value of inputs we owned that are being spent.
                     for input in &tx_info.transaction.inputs {
-                        if wallet_utxos_set.contains(&input.outpoint) {
-                            if let Some(utxo_output) = utxos_guard.get(&input.outpoint) {
-                                pending_change -= utxo_output.value.as_smallest_unit() as i64;
-                            }
+                        // An input is ours if it existed in our UTXO set before this tx.
+                        if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
+                            pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
                         }
                     }
-                    for output in &tx_info.transaction.outputs {
+
+                    // Add the value of new outputs being sent to us (including our own change).
+                    for output in &tx.outputs {
                         if output.pubkey == wallet.public_key {
-                            pending_change += output.value.as_smallest_unit() as i64;
+                            pending_net_change += output.value.as_smallest_unit() as i128;
                         }
                     }
                 }
             }
 
-            println!("Available Balance:   {} WISP", available_balance);
+            let total_balance = Amount::from_smallest_unit(
+                (confirmed_balance.as_smallest_unit() as i128 + pending_net_change).max(0) as u64,
+            );
+
             println!(
-                "Pending Balance:     {} WISP",
-                Amount((pending_change).max(0) as u64)
+                "Total Balance:       {} WISP (Confirmed + Pending)",
+                total_balance
+            );
+            println!(
+                "Available Balance:   {} WISP (Confirmed)",
+                confirmed_balance
+            );
+            println!(
+                "Pending Change:      {} WISP (Unconfirmed)",
+                Amount::from_smallest_unit(pending_net_change.abs() as u64)
             );
             println!("Tracked UTXOs:       {}", utxos_guard.len());
             println!("Pending Txs:         {}", pending_tx_count);

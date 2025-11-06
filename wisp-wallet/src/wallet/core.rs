@@ -559,12 +559,42 @@ impl Core {
 
     /// Calculates and returns the total spendable balance from the available UTXOs.
     pub async fn get_total_balance(&self) -> Result<Amount> {
-        let available_utxos_guard = self.utxos.read().await;
-        let total: Amount = available_utxos_guard
-            .values()
-            .map(|output| output.value)
-            .sum();
-        Ok(total)
+        let utxos_guard = self.utxos.read().await;
+        let transactions_guard = self.transactions.read().await;
+        let wallet_public_key = self.get_current_wallet().await?.public_key;
+
+        // 1. Calculate the confirmed balance from the UTXO set.
+        let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
+
+        // 2. Calculate the net change from all pending transactions.
+        let mut pending_net_change: i128 = 0;
+        for tx_info in transactions_guard.values() {
+            if tx_info.status == TransactionStatus::Pending {
+                let tx = &tx_info.transaction;
+
+                // Subtract the value of inputs we owned that are being spent.
+                for input in &tx.inputs {
+                    if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
+                        if spent_utxo.pubkey == wallet_public_key {
+                            pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
+                        }
+                    }
+                }
+
+                // Add the value of new outputs being sent to us (including our own change).
+                for output in &tx.outputs {
+                    if output.pubkey == wallet_public_key {
+                        pending_net_change += output.value.as_smallest_unit() as i128;
+                    }
+                }
+            }
+        }
+
+        // 3. The total balance is the confirmed balance plus the net pending change.
+        let total_balance_units =
+            (confirmed_balance.as_smallest_unit() as i128 + pending_net_change).max(0) as u64;
+
+        Ok(Amount::from_smallest_unit(total_balance_units))
     }
 
     /// Creates, signs, and submits a transaction to send funds.
@@ -673,12 +703,12 @@ impl Core {
             pubkey: recipient_public_key,
         });
 
-        let total_spent = final_amount_to_send
+        let total_to_distribute = final_amount_to_send
             .checked_add(transaction_fee)
-            .context("Total spent calculation overflow")?;
+            .context("Total amount + fee calculation overflow")?;
         let change_amount = current_input_sum
-            .checked_sub(total_spent)
-            .context("Change calculation underflow")?;
+            .checked_sub(total_to_distribute)
+            .context("Change calculation underflow (input sum < amount + fee)")?;
 
         if change_amount > Amount::zero() {
             outputs.push(TransactionOutput {
@@ -708,6 +738,9 @@ impl Core {
             input.signature = Some(signature.clone());
         }
 
+        // --- FIX ---
+        // Recalculate the txid with the signatures included to get the final, canonical hash.
+        let final_txid = new_transaction.txid()?;
         let mut stream_guard = self.get_connected_stream().await?;
         let stream_ref = stream_guard
             .as_mut()
@@ -737,7 +770,7 @@ impl Core {
 
                 println!(
                     "🚀 Transaction submitted, waiting for confirmation. Hash: {}",
-                    tx_hash_for_signing
+                    final_txid
                 );
 
                 // Add the transaction to our local transaction list with a pending status.
@@ -748,7 +781,7 @@ impl Core {
                     block_timestamp: Some(Utc::now()),
                     block_index: None,
                 };
-                transactions_guard.insert(tx_hash_for_signing, tx_info);
+                transactions_guard.insert(final_txid, tx_info);
                 drop(transactions_guard);
 
                 // --- CRITICAL FIX ---
@@ -763,7 +796,7 @@ impl Core {
                         // This is our change output, add it to our spendable UTXOs.
                         utxos_guard.insert(
                             OutPoint {
-                                txid: tx_hash_for_signing,
+                                txid: final_txid,
                                 vout: vout as u32,
                             },
                             output.clone(),

@@ -298,10 +298,11 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .map(|o| o.value)
                 .sum();
 
-            // The fee is the difference between what we put in and what came out (to us and to others)
-            let fee = value_from_us
-                .checked_sub(value_to_us)
-                .and_then(|v| v.checked_sub(amount_sent_to_others));
+            // The fee is the total value of the inputs we owned minus the total value of all outputs.
+            let total_output_value = amount_sent_to_others
+                .checked_add(value_to_us)
+                .context("Total output value overflowed")?;
+            let fee = value_from_us.checked_sub(total_output_value);
 
             let recipient_info = if recipients.is_empty() {
                 "Self (fee only)".to_string() // Sent to ourself
