@@ -283,10 +283,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         } else if net_effect < 0 {
             // Outgoing transaction
             // We sent more than we received (net outgoing)
-            let total_sent_to_others = value_from_us
-                .checked_sub(value_to_us)
-                .unwrap_or_else(|| Amount::from_smallest_unit(net_effect.abs() as u64));
-
             let recipients: HashSet<_> = tx
                 .outputs
                 .iter()
@@ -294,8 +290,21 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .map(|o| o.pubkey.fingerprint())
                 .collect();
 
+            // This is the amount sent to others, NOT including the fee.
+            let amount_sent_to_others: Amount = tx
+                .outputs
+                .iter()
+                .filter(|o| o.pubkey != wallet_public_key)
+                .map(|o| o.value)
+                .sum();
+
+            // The fee is the difference between what we put in and what came out (to us and to others)
+            let fee = value_from_us
+                .checked_sub(value_to_us)
+                .and_then(|v| v.checked_sub(amount_sent_to_others));
+
             let recipient_info = if recipients.is_empty() {
-                "Self".to_string() // Sent to ourself
+                "Self (fee only)".to_string() // Sent to ourself
             } else if recipients.len() == 1 {
                 recipients.iter().next().unwrap().to_string()
             } else {
@@ -303,7 +312,15 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             };
             (
                 "Sent".to_string(),
-                format!("-{} WISP", total_sent_to_others.to_string_wisp()),
+                if let Some(fee_val) = fee {
+                    format!(
+                        "-{} (Fee: {})",
+                        amount_sent_to_others.to_string_wisp(),
+                        fee_val.to_string_wisp()
+                    )
+                } else {
+                    format!("-{} WISP", amount_sent_to_others.to_string_wisp())
+                },
                 recipient_info,
             )
         } else {
@@ -382,12 +399,12 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             total_pages
         );
         println!(
-            "{:<20} {:<10} {:>18}  {:<30}",
+            "{:<20} {:<10} {:>28}  {:<30}",
             "Date/Time", "Type", "Amount", "Counterparty/Memo"
         ); // Adjusted header width
-        println!("{}", "-".repeat(85)); // Adjust length based on column widths
+        println!("{}", "-".repeat(95)); // Adjust length based on column widths
 
-        let start_index = current_page * TRANSACTIONS_PER_PAGE; // Use a constant for items per page
+        let start_index = current_page * TRANSACTIONS_PER_PAGE;
         let end_index = (start_index + TRANSACTIONS_PER_PAGE).min(display_items.len());
 
         if display_items.is_empty() {
@@ -410,7 +427,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
 
             // Print the main transaction line with colors
             println!(
-                "{}{:<20} {:<10} {:>18}  {:<30}{}", // Adjusted widths
+                "{}{:<20} {:<10} {:>28}  {:<30}{}", // Adjusted widths
                 color_code,
                 tx_item.display_date_time,
                 tx_item.tx_type,
@@ -424,7 +441,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             );
             println!();
         }
-        println!("{}", "-".repeat(85));
+        println!("{}", "-".repeat(95));
 
         let mut page_options = Vec::new();
         if current_page > 0 {

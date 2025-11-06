@@ -149,7 +149,7 @@ impl SavedWallet {
     // Helper function to derive key using Argon2
     pub fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<Vec<u8>> {
         let params = ParamsBuilder::new()
-            .t_cost(1) // Number of iterations (reduced from 3 for faster UX)
+            .t_cost(1)
             .m_cost(65536) // Memory cost in KiB (64 MiB) - Increases resistance to brute-force attacks.
             .p_cost(1)
             .build()

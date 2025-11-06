@@ -589,22 +589,23 @@ impl Core {
             .parse::<PublicKey>()
             .context("Invalid recipient public key format")?;
 
-        // For a regular send, calculate the fee and total required amount upfront.
-        // For "send max", we don't know the total yet, so we'll calculate it after selecting all inputs.
-        let total_required = if !is_send_max {
-            let fee = match fee_type {
+        // --- Refactored Fee and Amount Logic ---
+        // Calculate the fee based on the user's intent for a regular send.
+        // For send_max, the fee will be recalculated later based on the total input amount.
+        let intended_fee = if !is_send_max {
+            match fee_type {
                 FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw),
                 FeeType::Percent => Amount::from_smallest_unit(
                     amount_to_send.as_smallest_unit() * fee_value_raw / 10_000,
                 ),
-            };
-            amount_to_send
-                .checked_add(fee)
-                .context("Total required amount overflow")?
+            }
         } else {
-            // For send_max, we need all UTXOs, so the initial requirement is effectively infinite until we sum them up.
-            Amount::MAX
+            Amount::zero() // Placeholder for send_max
         };
+
+        let total_required = amount_to_send
+            .checked_add(intended_fee)
+            .context("Total required amount overflow")?;
 
         // Fetch a fresh snapshot of spendable UTXOs from the node.
         // We use the locally cached UTXOs. The node will validate them upon submission.
@@ -624,7 +625,7 @@ impl Core {
 
         for (outpoint, utxo_output) in all_spendable_utxos {
             // For "send max", we take all UTXOs. For regular sends, we stop when we have enough.
-            if is_send_max || current_input_sum < total_required {
+            if is_send_max || (current_input_sum < total_required) {
                 selected_inputs.push(TransactionInput {
                     outpoint: *outpoint,
                     signature: None,
@@ -646,21 +647,14 @@ impl Core {
                 total_required
             ));
         }
+
+        // --- Finalize amounts based on whether it's a "send max" or regular transaction ---
         let (final_amount_to_send, transaction_fee) = if is_send_max {
             // For "send max", the fee is calculated from the total available input value.
             let fee = match fee_type {
-                FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw), // fee is fixed
+                FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw), // Fee is fixed
                 FeeType::Percent => Amount::from_smallest_unit(
-                    // Calculate fee based on total input value, then subtract it.
-                    // amount_to_send = total_input - fee
-                    // fee = (amount_to_send) * percent / 100
-                    // fee = (total_input - fee) * percent / 100
-                    // fee * (1 + percent/100) = total_input * percent / 100
-                    // fee = (total_input * percent / 100) / (1 + percent/100)
-                    // fee = (total_input * fee_value_raw / 10_000) / (1 + fee_value_raw / 10_000)
-                    // fee = (total_input * fee_value_raw) / (10_000 + fee_value_raw)
-                    (current_input_sum.as_smallest_unit() as u128 * fee_value_raw as u128
-                        / (10_000 + fee_value_raw as u128)) as u64,
+                    current_input_sum.as_smallest_unit() * fee_value_raw / 10_000,
                 ),
             };
             let amount = current_input_sum
@@ -668,14 +662,8 @@ impl Core {
                 .context("Fee calculation underflow for send max")?;
             (amount, fee)
         } else {
-            // For regular sends, the fee is calculated based on the amount the user wants to send.
-            let fee = match fee_type {
-                FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw),
-                FeeType::Percent => Amount::from_smallest_unit(
-                    amount_to_send.as_smallest_unit() * fee_value_raw / 10_000,
-                ),
-            };
-            (amount_to_send, fee)
+            // For regular sends, the amounts are what the user entered.
+            (amount_to_send, intended_fee)
         };
 
         // Create the transaction outputs.
@@ -685,13 +673,13 @@ impl Core {
             pubkey: recipient_public_key,
         });
 
-        // Calculate if change is needed and create a change output if necessary.
         let total_spent = final_amount_to_send
             .checked_add(transaction_fee)
             .context("Total spent calculation overflow")?;
         let change_amount = current_input_sum
             .checked_sub(total_spent)
             .context("Change calculation underflow")?;
+
         if change_amount > Amount::zero() {
             outputs.push(TransactionOutput {
                 // Send the change back to our own wallet.
@@ -707,13 +695,15 @@ impl Core {
             outputs,
         };
 
-        let transaction_hash_for_signing = new_transaction.txid()?;
+        // Calculate the transaction hash *before* adding signatures. This is the canonical txid.
+        let tx_hash_for_signing = new_transaction.txid()?;
+
         for input in &mut new_transaction.inputs {
             // Sign each input with the private key.
             let signature = wisp_core::signatures::Signature(
                 sender_private_key
                     .0
-                    .sign(&transaction_hash_for_signing.as_bytes()[..]),
+                    .sign(&tx_hash_for_signing.as_bytes()[..]),
             );
             input.signature = Some(signature.clone());
         }
@@ -745,10 +735,9 @@ impl Core {
                 // update our local state to reflect this. This prevents the UI from
                 // showing a pending transaction that was actually rejected.
 
-                let tx_hash = new_transaction.txid()?;
                 println!(
                     "🚀 Transaction submitted, waiting for confirmation. Hash: {}",
-                    tx_hash
+                    tx_hash_for_signing
                 );
 
                 // Add the transaction to our local transaction list with a pending status.
@@ -759,7 +748,7 @@ impl Core {
                     block_timestamp: Some(Utc::now()),
                     block_index: None,
                 };
-                transactions_guard.insert(tx_hash, tx_info);
+                transactions_guard.insert(tx_hash_for_signing, tx_info);
                 drop(transactions_guard);
 
                 // --- CRITICAL FIX ---
@@ -774,7 +763,7 @@ impl Core {
                         // This is our change output, add it to our spendable UTXOs.
                         utxos_guard.insert(
                             OutPoint {
-                                txid: tx_hash,
+                                txid: tx_hash_for_signing,
                                 vout: vout as u32,
                             },
                             output.clone(),
@@ -862,10 +851,15 @@ impl Core {
                 // Wait for the next tick.
                 interval.tick().await;
 
-                // Check if a wallet is loaded before attempting to sync.
-                let wallet_loaded = match self.get_current_wallet().await {
-                    Ok(wallet) => wallet.name.is_empty() == false,
-                    Err(_) => false,
+                let wallet_loaded = {
+                    let config_guard = self.config.lock().await;
+                    if let Some(name) = &config_guard.current_wallet_name {
+                        let wallets_guard = self.wallets.lock().await;
+                        // Check that the wallet is both set in config and loaded into memory.
+                        wallets_guard.iter().any(|w| w.name == *name)
+                    } else {
+                        false
+                    }
                 };
 
                 if wallet_loaded {

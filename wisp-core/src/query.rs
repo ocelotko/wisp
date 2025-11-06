@@ -15,12 +15,18 @@ use crate::{
 
 impl Blockchain {
     /// Gets all UTXOs belonging to a specific public key from the in-memory UTXO set.
+    /// This is now mempool-aware and will not include UTXOs that are spent by transactions
+    /// currently in the mempool.
     pub fn get_utxos_for_pubkey(&self, pubkey: &PublicKey) -> Vec<(OutPoint, TransactionOutput)> {
         self.utxo_set
             .utxos
             .iter()
             .filter_map(|(outpoint, output)| {
-                (output.pubkey == *pubkey).then_some((*outpoint, output.clone()))
+                if output.pubkey == *pubkey && !self.mempool_spent_utxos.contains(outpoint) {
+                    Some((*outpoint, output.clone()))
+                } else {
+                    None
+                }
             })
             .collect()
     }

@@ -591,7 +591,7 @@ impl Blockchain {
         // This is now the canonical in-memory state.
         self.utxo_set = simulated_utxos;
 
-        // 2. Promote the pending snapshot to the main snapshot for future rebuilds.
+        // Promote the pending snapshot to the main snapshot for future rebuilds.
         // This is done atomically with removing the pending key.
         if let Some(pending_bytes) = self.db.get(DBKeys::PENDING_UTXO_SNAPSHOT)? {
             self.db
@@ -613,12 +613,12 @@ impl Blockchain {
             ));
         }
 
-        // 2. Remove transactions from the mempool that were included in the block
+        // Remove transactions from the mempool that were included in the block
         self.clear_mempool_of_block_transactions(&new_block, new_block_hash);
 
-        // 3. Update in-memory state to reflect the new tip. This is critical.
+        // Update in-memory state to reflect the new tip. This is critical.
         self.target = expected_next_target;
-        self.total_supply = Amount::from_smallest_unit(new_supply);
+        self.total_supply = Amount::from_smallest_unit(new_supply); // Correctly update from the transaction result
         self.total_tx_count = new_tx_count;
 
         // 4. Update the in-memory tip cache. This is the key fix for the template generation bug.

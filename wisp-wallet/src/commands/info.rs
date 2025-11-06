@@ -103,6 +103,11 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
                             }
                         }
                     }
+                    for output in &tx_info.transaction.outputs {
+                        if output.pubkey == wallet.public_key {
+                            pending_change += output.value.as_smallest_unit() as i64;
+                        }
+                    }
                 }
             }
 
