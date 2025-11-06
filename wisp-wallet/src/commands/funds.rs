@@ -102,32 +102,39 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
         }
         FeeType::Percent => {
             // Avoid using f64 for financial calculations to prevent precision loss.
-            // Instead, parse the integer and fractional parts of the percentage string.
             let parts: Vec<&str> = fee_value_str_input.split('.').collect();
-            let integer_part = parts[0]
-                .parse::<u64>()
-                .context("Invalid integer part of percentage")?;
+            let integer_part_str = parts[0];
+            let fractional_part_str = if parts.len() > 1 { parts[1] } else { "" };
 
-            // We support up to 2 decimal places for basis points (e.g., 1.23% = 123 basis points).
-            let fractional_part_str = if parts.len() > 1 { parts[1] } else { "0" };
             if fractional_part_str.len() > 2 {
                 return Err(anyhow!("Percentage fee supports up to two decimal places."));
             }
 
-            // Pad with a '0' if only one decimal place is given (e.g., "1.2" -> "20")
-            let fractional_part_str_padded = format!("{:<02}", fractional_part_str);
-            let fractional_part = fractional_part_str_padded
-                .parse::<u64>()
-                .context("Invalid fractional part of percentage")?;
+            let integer_part = if integer_part_str.is_empty() {
+                0
+            } else {
+                integer_part_str
+                    .parse::<u64>()
+                    .context("Invalid integer part of percentage")?
+            };
+
+            let mut fractional_part = if fractional_part_str.is_empty() {
+                0
+            } else {
+                fractional_part_str
+                    .parse::<u64>()
+                    .context("Invalid fractional part of percentage")?
+            };
+
+            // Scale fractional part to basis points. E.g. "5" -> 50, "55" -> 55
+            if fractional_part_str.len() == 1 {
+                fractional_part *= 10;
+            }
 
             // Calculate basis points (1% = 100 basis points).
             fee_value_for_core = integer_part
                 .saturating_mul(100)
                 .saturating_add(fractional_part);
-
-            if fee_value_for_core > 10_000 {
-                return Err(anyhow!("Percentage fee cannot exceed 100.00%"));
-            }
 
             if fee_value_for_core > 10_000 {
                 // Cap at 100%
@@ -222,14 +229,11 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         let is_pending = tx_info.status == TransactionStatus::Pending;
         let is_coinbase = tx.is_coinbase();
 
-        let display_date_time = if is_pending {
-            format!("{} (Pending)", Utc::now().format("%d.%m.%Y %H:%M:%S"))
-        } else {
-            tx_info
-                .block_timestamp
-                .map(|ts| ts.format("%d.%m.%Y %H:%M:%S").to_string())
-                .unwrap_or_else(|| "Unknown Date/Time".to_string())
-        };
+        let display_date_time = tx_info
+            .block_timestamp
+            .unwrap_or_else(Utc::now)
+            .format("%d.%m.%Y %H:%M:%S")
+            .to_string();
 
         let mut value_from_us = Amount::zero();
         let mut value_to_us = Amount::zero();
@@ -400,10 +404,10 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             total_pages
         );
         println!(
-            "{:<20} {:<10} {:>28}  {:<30}",
-            "Date/Time", "Type", "Amount", "Counterparty/Memo"
+            "{:<20} {:<10} {:<10} {:>25}  {:<30}",
+            "Date/Time", "Status", "Type", "Amount", "Counterparty/Memo"
         ); // Adjusted header width
-        println!("{}", "-".repeat(95)); // Adjust length based on column widths
+        println!("{}", "-".repeat(105)); // Adjust length based on column widths
 
         let start_index = current_page * TRANSACTIONS_PER_PAGE;
         let end_index = (start_index + TRANSACTIONS_PER_PAGE).min(display_items.len());
@@ -417,6 +421,11 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         }
 
         for tx_item in display_items[start_index..end_index].iter() {
+            let status_str = if tx_item.is_pending {
+                "Pending"
+            } else {
+                "Confirmed"
+            };
             let color_code = if tx_item.is_pending {
                 "\x1B[33m" // Yellow for pending (Outgoing/Incoming Unconfirmed)
             } else if tx_item.amount_str.starts_with('+') {
@@ -428,21 +437,19 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
 
             // Print the main transaction line with colors
             println!(
-                "{}{:<20} {:<10} {:>28}  {:<30}{}", // Adjusted widths
+                "{}{:<20} {:<10} {:<10} {:>25}  {:<30}{}", // Adjusted widths
                 color_code,
                 tx_item.display_date_time,
+                status_str,
                 tx_item.tx_type,
                 tx_item.amount_str,
                 tx_item.counterparty_info,
                 reset_color
             );
-            println!(
-                "  \x1B[90mLink: \x1B[4mhttps://localhost:8000/transaction/{}\x1B[0m", // TODO: Change to wisp.com
-                tx_item.tx_hash.to_string()
-            );
+            println!("  \x1B[90mTx Hash: {}\x1B[0m", tx_item.tx_hash.to_string());
             println!();
         }
-        println!("{}", "-".repeat(95));
+        println!("{}", "-".repeat(105));
 
         let mut page_options = Vec::new();
         if current_page > 0 {
