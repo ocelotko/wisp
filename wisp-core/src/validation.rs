@@ -379,8 +379,8 @@ impl Block {
             .as_ref()
             .ok_or_else(|| anyhow!("Coinbase input is missing coinbase_data (scriptSig)"))?;
 
-        const MIN_COINBASE_DATA_SIZE: usize = 2;
-        const MAX_COINBASE_DATA_SIZE: usize = 100;
+        const MIN_COINBASE_DATA_SIZE: usize = std::mem::size_of::<u64>();
+        const MAX_COINBASE_DATA_SIZE: usize = 100; // As per BIP34
         if coinbase_data.len() < MIN_COINBASE_DATA_SIZE
             || coinbase_data.len() > MAX_COINBASE_DATA_SIZE
         {

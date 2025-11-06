@@ -397,7 +397,7 @@ impl Blockchain {
     pub(crate) fn apply_block_to_db(
         tx_db: &TransactionalTree,
         block_to_apply: &Block,
-        new_chain_segment_for_reorg: &[Block], // Empty for direct extension
+        new_chain_segment_for_reorg: &[Block], // Empty for direct extension, used for finding UTXOs
         initial_supply: u64,
         initial_tx_count: u64,
     ) -> Result<(u64, u64), ConflictableTransactionError<ReorgError>> {

@@ -29,11 +29,15 @@ struct Args {
 
     #[arg(short, long)]
     reward_address: String,
+
+    #[arg(long)]
+    coinbase_message: Option<String>,
 }
 
 struct Miner {
     public_key: PublicKey,
     stream: AsyncMutex<TcpStream>,
+    coinbase_message: Option<String>,
     current_template: Arc<Mutex<Option<Block>>>,
     mining: Arc<AtomicBool>,
     new_template_counter: Arc<AtomicU64>,
@@ -43,7 +47,11 @@ struct Miner {
 }
 
 impl Miner {
-    async fn new(address: String, public_key: PublicKey) -> Result<Self> {
+    async fn new(
+        address: String,
+        public_key: PublicKey,
+        coinbase_message: Option<String>,
+    ) -> Result<Self> {
         info!("Connecting to node at {}", address);
         let stream = AsyncMutex::new(
             TcpStream::connect(&address)
@@ -55,6 +63,7 @@ impl Miner {
         Ok(Self {
             public_key,
             stream,
+            coinbase_message,
             current_template: Arc::new(Mutex::new(None)),
             mining: Arc::new(AtomicBool::new(false)),
             new_template_counter: Arc::new(AtomicU64::new(0)),
@@ -219,7 +228,7 @@ impl Miner {
     async fn fetch_and_validate_template(&self) -> Result<()> {
         self.mining.store(false, Ordering::Relaxed);
         info!("Requesting new block template from node...");
-        let message = Message::FetchTemplate(self.public_key.clone());
+        let message = Message::FetchTemplate(self.public_key, self.coinbase_message.clone());
         let mut stream_lock = self.stream.lock().await;
         message.send_async(&mut *stream_lock).await?;
 
@@ -356,7 +365,7 @@ async fn main() -> Result<()> {
         num_cpus::get()
     );
 
-    let miner = Miner::new(args.node_address, public_key).await?;
+    let miner = Miner::new(args.node_address, public_key, args.coinbase_message).await?;
     miner.run().await?;
 
     Ok(())

@@ -260,6 +260,14 @@ impl Blockchain {
     ///
     /// The miner's job is to set a correct `timestamp` and find a `nonce` that satisfies the `target`.
     pub fn get_block_template_for_pubkey(&self, reward_pubkey: &PublicKey) -> Result<Block> {
+        self.get_block_template(reward_pubkey, None)
+    }
+
+    pub fn get_block_template(
+        &self,
+        reward_pubkey: &PublicKey,
+        coinbase_message: Option<&str>,
+    ) -> Result<Block> {
         let previous_hash = self.get_tip_hash()?.unwrap_or_else(Hash::zero);
         let index = self.block_height()? + 1;
         let target = self.calculate_next_target()?;
@@ -301,6 +309,16 @@ impl Blockchain {
         let coinbase_value = block_reward
             .checked_add(total_fees)
             .context("Coinbase value overflow")?;
+
+        let mut coinbase_data = index.to_le_bytes().to_vec();
+        if let Some(msg) = coinbase_message {
+            let msg_bytes = msg.as_bytes();
+            // Ensure we don't exceed the max size for coinbase data (100 bytes total)
+            if coinbase_data.len() + msg_bytes.len() <= 100 {
+                coinbase_data.extend_from_slice(msg_bytes);
+            }
+        }
+
         let coinbase_tx = Transaction::new(
             vec![TransactionInput {
                 outpoint: OutPoint {
@@ -308,7 +326,7 @@ impl Blockchain {
                     vout: u32::MAX,
                 },
                 signature: None,
-                coinbase_data: Some(index.to_le_bytes().to_vec()),
+                coinbase_data: Some(coinbase_data),
             }],
             vec![TransactionOutput {
                 value: coinbase_value,
@@ -561,12 +579,17 @@ impl Blockchain {
         self.db
             .transaction(
                 |tx_db| -> Result<(u64, u64), ConflictableTransactionError<ReorgError>> {
-                    let new_tx_count = self.total_tx_count;
-                    let new_supply = self.total_supply.as_smallest_unit();
+                    let initial_tx_count = self.total_tx_count;
+                    let initial_supply = self.total_supply.as_smallest_unit();
 
                     // Use the shared helper to apply the block's DB changes.
-                    Self::apply_block_to_db(tx_db, &new_block, &[], new_supply, new_tx_count)?;
+                    let (new_supply, new_tx_count) = Self::apply_block_to_db(tx_db, &new_block, &[], initial_supply, initial_tx_count)?;
 
+                    // Also update the chain height and tip hash atomically.
+                    let height_bytes = new_block.index.to_be_bytes().to_vec();
+                    let hash_bytes = bincode::encode_to_vec(&new_block_hash, bincode_config()).map_err(|e| ReorgError::Anyhow(e.into()))?;
+                    tx_db.insert(DBKeys::CHAIN_HEIGHT, height_bytes)?;
+                    tx_db.insert(DBKeys::TIP_HASH, hash_bytes)?;
                     // Store a pending UTXO snapshot to ensure atomicity with the block commit.
                     let simulated_utxos_bytes =
                         bincode::encode_to_vec(&simulated_utxos, bincode_config())

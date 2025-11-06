@@ -48,25 +48,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
 
     let mut blockchain_instance = Blockchain::new(db);
 
-    // Load the blockchain state from the database, or initialize a new one with a genesis block.
-    blockchain_instance.load_from_db()?;
-
-    if blockchain_instance.block_height()? > 0 {
-        info!(
-            "Successfully loaded blockchain with height: {}",
-            blockchain_instance.block_height()?
-        );
-    } else {
-        info!("Initialized new blockchain with genesis block.");
-    }
-
-    // Set the global BLOCKCHAIN static so other parts of the application can access it.
-    crate::BLOCKCHAIN
-        .set(std::sync::Arc::new(tokio::sync::RwLock::new(
-            blockchain_instance,
-        )))
-        .expect("BUG: BLOCKCHAIN static was already initialized.");
-
     utils::populate_connections(&nodes).await?;
     info!("Total amount of known nodes: {}", crate::NODES.len());
 
@@ -75,16 +56,7 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
         info!("Checking for longer chain against initial nodes...");
         // Find which of our known peers has the longest chain.
         let (longest_name, longest_count) = utils::find_longest_chain_node().await?;
-
-        let local_chain_length = crate::BLOCKCHAIN
-            .get()
-            .unwrap()
-            .read()
-            .await
-            .block_height()?
-            + 1;
-
-        // If a peer has a longer chain, download the missing blocks.
+        let local_chain_length = blockchain_instance.block_height()? + 1;
         if longest_count > local_chain_length {
             info!(
                 "Peer {} has a longer chain ({} blocks), preparing to download...",
@@ -106,12 +78,26 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
                     error!("Blockchain download failed: {:?}", e);
                 }
             }
-        } else {
-            info!("Local blockchain is up-to-date or longer.");
         }
-    } else {
-        info!("No initial nodes provided. Starting with local blockchain state.");
     }
+
+    // Load the blockchain state from the database. If it's empty and we didn't download
+    // a chain from peers, this is where we'll initialize the genesis block.
+    blockchain_instance.load_from_db()?;
+
+    if blockchain_instance.block_height()? > 0 {
+        info!(
+            "Successfully loaded blockchain with height: {}",
+            blockchain_instance.block_height()?
+        );
+    } else {
+        info!("Local blockchain is empty. State will depend on peers or genesis creation.");
+    }
+
+    // Set the global BLOCKCHAIN static so other parts of the application can access it.
+    crate::BLOCKCHAIN
+        .set(Arc::new(RwLock::new(blockchain_instance)))
+        .expect("BUG: BLOCKCHAIN static was already initialized.");
     {
         let blockchain_read = crate::BLOCKCHAIN.get().unwrap().read().await;
         if let Some(genesis_hash) = blockchain_read

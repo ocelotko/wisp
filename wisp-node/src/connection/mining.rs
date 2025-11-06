@@ -15,10 +15,11 @@ use wisp_core::{
 pub async fn handle_fetch_template(
     stream: &mut TcpStream,
     pubkey: PublicKey,
+    coinbase_message: Option<String>,
     blockchain: Arc<RwLock<Blockchain>>,
 ) -> Result<()> {
     let blockchain_lock = blockchain.read().await;
-    let template = blockchain_lock.get_block_template_for_pubkey(&pubkey)?;
+    let template = blockchain_lock.get_block_template(&pubkey, coinbase_message.as_deref())?;
     debug!(
         "Sending new template for block #{} to miner {}",
         template.index,
@@ -59,7 +60,8 @@ pub async fn handle_submit_template(
                 block_hash_for_log
             );
 
-            let next_template = blockchain_lock.get_block_template_for_pubkey(&miner_pubkey)?;
+            // When a miner submits, we don't know their new message, so we generate a template without one.
+            let next_template = blockchain_lock.get_block_template(&miner_pubkey, None)?;
             info!(
                 "Generated next template for block #{} for the same miner.",
                 next_template.index
@@ -93,7 +95,7 @@ pub async fn handle_submit_template(
                 block_hash_for_log
             );
             // In this case, we also generate a new template based on the new state.
-            let next_template = blockchain_lock.get_block_template_for_pubkey(&miner_pubkey)?;
+            let next_template = blockchain_lock.get_block_template(&miner_pubkey, None)?;
             Message::Template(next_template).send_async(stream).await?;
             drop(blockchain_lock);
             // The reorg logic will be handled by the node's regular block processing flow.

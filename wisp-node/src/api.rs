@@ -18,19 +18,24 @@ use wisp_core::{
 struct ApiBlock {
     version: u32,
     height: u64,
+    #[serde(with = "serde_hash_str")]
     hash: Hash,
     timestamp: i64,
-    transactions: Vec<Hash>,
+    transactions: Vec<String>,
     size: usize,
     nonce: u64,
     difficulty: String,
+    #[serde(with = "serde_hash_str")]
     previous_hash: Hash,
     #[serde(skip_serializing_if = "Option::is_none")]
     time_to_mine_secs: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mined_by: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 struct ApiTransactionSummary {
+    #[serde(with = "serde_hash_str")]
     hash: Hash,
     block_height: Option<u64>,
     input_count: usize,
@@ -49,12 +54,13 @@ struct ApiTransactionInput {
 #[derive(Serialize, Clone)]
 struct ApiTransactionOutput {
     value: String,
-    lock_script: String,
+    #[serde(with = "serde_pubkey_str")]
     pubkey: PublicKey,
 }
 
 #[derive(Serialize, Clone)]
 struct ApiTransactionDetail {
+    #[serde(with = "serde_hash_str")]
     hash: Hash,
     block_height: Option<u64>,
     timestamp: i64,
@@ -119,7 +125,7 @@ impl From<Block> for ApiBlock {
         let tx_hashes = block
             .transactions
             .iter()
-            .map(|tx| tx.txid().unwrap_or_default())
+            .map(|tx| tx.txid().unwrap_or_default().to_string())
             .collect();
 
         let difficulty_str = if block.target.is_zero() {
@@ -147,6 +153,17 @@ impl From<Block> for ApiBlock {
             nonce: block.nonce,
             previous_hash: block.previous_hash,
             time_to_mine_secs: None,
+            mined_by: block
+                .transactions
+                .first() // The coinbase transaction is always first
+                .filter(|tx| tx.is_coinbase())
+                .and_then(|coinbase_tx| {
+                    // The reward output is typically the first one
+                    coinbase_tx
+                        .outputs
+                        .first()
+                        .map(|output| output.pubkey.fingerprint())
+                }),
         }
     }
 }
@@ -208,16 +225,26 @@ async fn get_network_vitals(
         }
     };
 
-    let avg_block_time_secs = if current_height >= DAA_WINDOW as u64 {
-        let first_block_index = current_height - (DAA_WINDOW - 1) as u64;
+    let avg_block_time_secs = if current_height > 0 {
+        // If the chain is mature enough, use the full DAA window for the average.
+        // Otherwise, average over the blocks that do exist (from genesis to current).
+        let (start_block_index, window_size) = if current_height >= DAA_WINDOW as u64 {
+            (current_height - (DAA_WINDOW - 1) as u64, DAA_WINDOW)
+        } else {
+            (0, (current_height + 1) as usize)
+        };
+
         if let (Ok(Some(first_block)), Ok(Some(last_block))) = (
-            blockchain.get_block_by_index(first_block_index),
+            blockchain.get_block_by_index(start_block_index),
             blockchain.get_block_by_index(current_height),
         ) {
             let actual_timespan =
                 last_block.timestamp.timestamp() - first_block.timestamp.timestamp();
-            (actual_timespan as f64 / DAA_WINDOW as f64).max(0.0)
+            // For a window of N blocks, there are N-1 intervals.
+            let num_intervals = (window_size - 1).max(1); // Avoid division by zero if only 1 block exists
+            (actual_timespan as f64 / num_intervals as f64).max(1.0) // Ensure avg time is at least 1.0
         } else {
+            // Fallback if blocks can't be fetched, which is unlikely for a valid chain.
             IDEAL_BLOCK_TIME as f64
         }
     } else {
@@ -228,29 +255,35 @@ async fn get_network_vitals(
     let blockchain_size_bytes = blockchain.db.size_on_disk().unwrap_or(0);
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
-    // The number of hashes to find a block is estimated by MAX_TARGET / current_target.
-    let hashes_per_block = if !current_target.is_zero() {
-        wisp_core::MAX_TARGET / current_target
+
+    // Hashrate calculation, inspired by Bitcoin.
+    // Hashrate = Difficulty * 2^256 / (MAX_TARGET * avg_block_time)
+    // Since Difficulty = MAX_TARGET / current_target, this simplifies to:
+    // Hashrate = (2^256 / current_target) / avg_block_time
+    // We use floating point numbers for this calculation to handle the large values.
+    let hashrate_f64 = if avg_block_time_secs > 0.0 && !current_target.is_zero() {
+        // The number of expected hashes to find a block is approximately 2^256 / current_target.
+        // We can calculate this using logarithms to avoid dealing with numbers larger than U256.
+        // log2(2^256 / T) = log2(2^256) - log2(T) = 256 - log2(T)
+        // Expected_Hashes = 2^(256 - log2(T))
+
+        // .bits() gives the position of the most significant bit, which is floor(log2(T)) + 1.
+        let target_log2 = current_target.bits() as f64;
+        let expected_hashes_log2 = 256.0 - target_log2;
+        if expected_hashes_log2 > 0.0 {
+            let expected_hashes = 2.0_f64.powf(expected_hashes_log2);
+            expected_hashes / avg_block_time_secs
+        } else {
+            0.0
+        }
     } else {
-        wisp_core::U256::zero()
+        0.0
     };
 
-    // To convert the U256 `hashes_per_block` to f64 for the hashrate calculation,
-    // we find the most significant limb (u64 part) and scale it appropriately.
-    // This is more accurate than the previous bit-shifting method.
-    let mut hashrate_f64 = 0.0;
-    if avg_block_time_secs > 0.0 && !hashes_per_block.is_zero() {
-        let limbs = hashes_per_block.0;
-        if let Some((i, &limb)) = limbs.iter().enumerate().rev().find(|&(_, &l)| l > 0) {
-            // The most significant limb is at index `i`.
-            // We scale it by 2^(64*i) to approximate the full U256 value.
-            let scale = 2.0f64.powi(64 * i as i32);
-            let hashes_f64 = limb as f64 * scale;
-            hashrate_f64 = hashes_f64 / avg_block_time_secs;
-        }
-    }
-
-    let total_transactions = blockchain.get_total_transaction_count().unwrap_or(0);
+    let confirmed_tx_count = blockchain
+        .get_total_transaction_count_from_db()
+        .unwrap_or(0);
+    let total_transactions = confirmed_tx_count + mempool_size as u64;
     let vitals = ApiNetworkVitals {
         current_height,
         difficulty,
@@ -267,6 +300,30 @@ async fn get_network_vitals(
     Json(vitals).into_response()
 }
 
+mod serde_hash_str {
+    use serde::{self, Serializer};
+    use wisp_core::sha256::Hash;
+
+    pub fn serialize<S>(val: &Hash, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&val.to_string())
+    }
+}
+
+mod serde_pubkey_str {
+    use serde::{self, Serializer};
+    use wisp_core::signatures::PublicKey;
+
+    pub fn serialize<S>(val: &PublicKey, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&val.fingerprint())
+    }
+}
+
 mod serde_str {
     use serde::{self, Serializer};
     use wisp_core::U256;
@@ -279,36 +336,33 @@ mod serde_str {
     }
 }
 
+/// Helper function to process a block and enrich it with `time_to_mine_secs`.
+fn process_and_enrich_block(
+    blockchain: &wisp_core::blockchain::Blockchain,
+    block: Block,
+) -> axum::response::Response {
+    let mut api_block: ApiBlock = block.clone().into();
+    if api_block.height > 0 {
+        if let Ok(Some(prev_block)) = blockchain.get_block_by_index(api_block.height - 1) {
+            let time_diff = block.timestamp.timestamp() - prev_block.timestamp.timestamp();
+            api_block.time_to_mine_secs = Some(time_diff);
+        } else {
+            log::warn!(
+                "Could not find previous block for height {} to calculate mining time.",
+                api_block.height
+            );
+        }
+    }
+    Json(api_block).into_response()
+}
+
 async fn get_block_by_height(
     State(blockchain_lock): State<Arc<RwLock<wisp_core::blockchain::Blockchain>>>,
     Path(height): Path<u64>,
 ) -> impl IntoResponse {
     let blockchain = blockchain_lock.read().await;
     match blockchain.get_block_by_index(height) {
-        Ok(Some(block)) => {
-            let mut api_block: ApiBlock = block.clone().into();
-
-            if height > 0 {
-                match blockchain.get_block_by_index(height - 1) {
-                    Ok(Some(prev_block)) => {
-                        let time_diff =
-                            block.timestamp.timestamp() - prev_block.timestamp.timestamp();
-                        api_block.time_to_mine_secs = Some(time_diff);
-                    }
-                    Ok(None) => {
-                        log::warn!(
-                            "Could not find previous block for height {} to calculate mining time.",
-                            height
-                        );
-                    }
-                    Err(e) => {
-                        log::error!("Error fetching previous block for height {}: {}", height, e);
-                    }
-                }
-            }
-
-            Json(api_block).into_response()
-        }
+        Ok(Some(block)) => process_and_enrich_block(&blockchain, block),
         Ok(None) => (StatusCode::NOT_FOUND, Json("Block not found".to_string())).into_response(),
         Err(e) => {
             log::error!("Failed to get block by height {}: {}", height, e);
@@ -323,37 +377,17 @@ async fn get_block_by_height(
 
 async fn get_block_by_hash(
     State(blockchain_lock): State<Arc<RwLock<wisp_core::blockchain::Blockchain>>>,
-    Path(hash): Path<Hash>,
+    Path(hash_str): Path<String>,
 ) -> impl IntoResponse {
+    let hash = match Hash::try_from(hash_str.as_str()) {
+        Ok(h) => h,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json("Invalid block hash")).into_response();
+        }
+    };
     let blockchain = blockchain_lock.read().await;
     match blockchain.get_block_by_hash(&hash) {
-        Ok(Some(block)) => {
-            let mut api_block: ApiBlock = block.clone().into();
-            if api_block.height > 0 {
-                match blockchain.get_block_by_index(api_block.height - 1) {
-                    Ok(Some(prev_block)) => {
-                        let time_diff =
-                            block.timestamp.timestamp() - prev_block.timestamp.timestamp();
-                        api_block.time_to_mine_secs = Some(time_diff);
-                    }
-                    Ok(None) => {
-                        log::warn!(
-                            "Could not find previous block for height {} to calculate mining time.",
-                            api_block.height
-                        );
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Error fetching previous block for height {}: {}",
-                            api_block.height,
-                            e
-                        );
-                    }
-                }
-            }
-
-            Json(api_block).into_response()
-        }
+        Ok(Some(block)) => process_and_enrich_block(&blockchain, block),
         Ok(None) => (StatusCode::NOT_FOUND, Json("Block not found".to_string())).into_response(),
         Err(e) => {
             log::error!("Failed to get block by hash {}: {}", hash, e);
@@ -387,8 +421,10 @@ async fn get_transaction_by_hash(
                     .first()
                     .and_then(|i| i.coinbase_data.as_ref())
                     .and_then(|data| {
-                        // Skip the first 8 bytes (height) and try to parse the rest as a string.
-                        let message_bytes = data.get(8..).unwrap_or_default();
+                        // The first 8 bytes are the block height. The message is the rest.
+                        // We must check if there are any bytes beyond the height.
+                        let message_bytes =
+                            data.get(std::mem::size_of::<u64>()..).unwrap_or_default();
                         String::from_utf8(message_bytes.to_vec()).ok()
                     })
             } else {
@@ -433,7 +469,6 @@ async fn get_transaction_by_hash(
                     .iter()
                     .map(|o| ApiTransactionOutput {
                         value: o.value.to_string_wisp(),
-                        lock_script: format!("OP_CHECKSIG for pubkey {}", o.pubkey.fingerprint()),
                         pubkey: o.pubkey.clone(),
                     })
                     .collect(),

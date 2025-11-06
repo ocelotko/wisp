@@ -59,8 +59,14 @@ pub async fn handle_connection(mut stream: TcpStream, addr: SocketAddr) -> Resul
             }
 
             // Mining Messages
-            Message::FetchTemplate(pubkey) => {
-                mining::handle_fetch_template(&mut stream, pubkey, blockchain.clone()).await
+            Message::FetchTemplate(pubkey, coinbase_message) => {
+                mining::handle_fetch_template(
+                    &mut stream,
+                    pubkey,
+                    coinbase_message,
+                    blockchain.clone(),
+                )
+                .await
             }
             Message::SubmitTemplate(pubkey, block) => {
                 mining::handle_submit_template(&mut stream, pubkey, block, blockchain.clone()).await

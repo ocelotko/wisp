@@ -54,11 +54,11 @@ pub enum Message {
     },
 
     // --- Mining Messages ---
-    FetchTemplate(PublicKey), // Miner requests a block template to work on.
-    Template(Block),          // Node responds with a block template.
-    NewTemplate(Block),       // Node pushes a new template to miners when the chain tip changes.
-    ValidateTemplate(Block),  // Miner asks node to validate a found template before submitting.
-    TemplateValidity(bool),   // Node responds with validity of the template.
+    FetchTemplate(PublicKey, Option<String>), // Miner requests a block template to work on.
+    Template(Block),                          // Node responds with a block template.
+    NewTemplate(Block), // Node pushes a new template to miners when the chain tip changes.
+    ValidateTemplate(Block), // Miner asks node to validate a found template before submitting.
+    TemplateValidity(bool), // Node responds with validity of the template.
     SubmitTemplate(PublicKey, Block), // Miner submits a mined block, including their pubkey for the next template.
     BlockSubmittedConfirmation,       // Node confirms receipt and successful addition of the block.
     BlockRejected(String),            // Node rejects a submitted block.

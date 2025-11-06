@@ -367,24 +367,6 @@ impl Blockchain {
             .transpose() // Option<Result<T>> -> Result<Option<T>>
     }
 
-    /// Atomically updates the chain height and tip hash in the database.
-    /// This is a transactional operation to ensure consistency.
-    pub fn update_chain_metadata(&self, height: u64, tip_hash: &Hash) -> Result<()> {
-        let height_bytes = height.to_be_bytes().to_vec();
-        let hash_bytes = bincode::encode_to_vec(tip_hash, bincode_config())?;
-
-        self.db
-            .transaction(|tx| {
-                tx.insert(DBKeys::CHAIN_HEIGHT, height_bytes.clone())?;
-                tx.insert(DBKeys::TIP_HASH, hash_bytes.clone())?;
-                Ok(())
-            })
-            .map_err(|e: sled::transaction::TransactionError| {
-                anyhow!("Failed to update chain metadata transactionally: {:?}", e)
-            })?;
-        Ok(())
-    }
-
     /// Gets the total number of confirmed (non-coinbase) transactions from the database.
     pub fn get_total_transaction_count_from_db(&self) -> Result<u64> {
         if let Some(ivec) = self.db.get(DBKeys::TOTAL_TX_COUNT)? {
