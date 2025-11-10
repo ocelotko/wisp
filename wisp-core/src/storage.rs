@@ -78,6 +78,7 @@ impl Blockchain {
                 return Err(e);
             }
 
+            //TODO: Remove this logic
             // The PENDING_UTXO_SNAPSHOT key is now deprecated, as snapshotting is atomic with block commits.
             // However, we keep this recovery logic for nodes upgrading from a version that might have crashed
             // and left a pending snapshot.

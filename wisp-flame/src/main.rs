@@ -204,7 +204,7 @@ impl Miner {
                                 // The block is now mined, so its hash is final.
                                 if let Ok(block_hash) = block_to_mine.id() {
                                     println!(
-                                        "\nBlock Found!\n  - Index: {}\n  - Nonce: {}\n  - Hash:  {}\n  - Thread: {}",
+                                        "Block Found!\n  - Index: {}\n  - Nonce: {}\n  - Hash:  {}\n  - Thread: {}",
                                         block_to_mine.index, block_to_mine.nonce, block_hash, i
                                     );
                                 }
@@ -292,7 +292,7 @@ impl Miner {
             // The node now responds with a new template directly as confirmation.
             Ok(Ok(Message::Template(new_template))) => {
                 // This is the primary success path
-                info!("✅ Submission successful! Block accepted by node.");
+                info!("Submission successful: Block accepted by node.");
                 info!(
                     "Received new template for block #{}. Resuming mining.",
                     new_template.index
@@ -306,7 +306,7 @@ impl Miner {
             // Legacy confirmation for compatibility, though our new node won't send this.
             Ok(Ok(Message::BlockSubmittedConfirmation)) => {
                 // Fallback path
-                info!("✅ Submission successful! Block accepted by node (legacy confirmation).");
+                info!("Submission successful: Block accepted by node (legacy confirmation).");
                 Ok(())
             }
             Ok(Ok(Message::BlockRejected(reason))) => {
@@ -353,13 +353,12 @@ async fn main() -> Result<()> {
     let public_key = PublicKey(verifying_key);
 
     info!(
-        "\n\n\
-        🔥 Starting Wisp Flame Miner\n\
+        "Starting Wisp Flame Miner\n\
         --------------------------------------------------\n\
         - Node Address:   {}\n\
         - Reward Address: {}\n\
         - CPU Threads:    {}\n\
-        --------------------------------------------------\n",
+        --------------------------------------------------",
         args.node_address,
         public_key.fingerprint(),
         num_cpus::get()

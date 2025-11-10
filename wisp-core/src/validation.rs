@@ -172,6 +172,8 @@ impl Block {
                     .context("Fee sum overflow during block validation")?;
             }
         }
+
+        //TODO: Implement reorg validation path
         // Note: Reorg validation path would need a similar loop using a DB-transaction-aware fee calculation.
         // For now, this covers the primary block addition path.
         self.verify_coinbase_transaction(total_fees_in_block)

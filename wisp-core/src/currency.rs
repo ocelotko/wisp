@@ -9,9 +9,6 @@ use std::fmt;
 use std::ops::{Add, Sub};
 
 /// Represents a currency amount in the smallest indivisible unit.
-///
-/// This struct is used to prevent floating-point errors in financial calculations
-/// by always working with integers.
 #[derive(
     Encode,
     Decode,
@@ -120,7 +117,6 @@ impl Amount {
         let integer_str = parts[0];
         let fractional_str = parts.get(1).unwrap_or(&"");
 
-        // CRITICAL FIX: This check must happen before calculating scale_factor to prevent underflow.
         if fractional_str.len() > Self::DECIMAL_PLACES as usize {
             return Err(anyhow!(
                 "Too many decimal places in '{}'. Max {} allowed.",

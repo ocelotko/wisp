@@ -79,6 +79,7 @@ pub enum Message {
     }, // Request a sequence of block headers.
     BlockHeaders(Vec<BlockHeader>), // Response with the requested headers.
 
+    //TODO: Deprecate this
     FetchChainSegment(u64), // DEPRECATED: Prefer GetBlockHeaders and FetchBlock. Request blocks from a certain index onwards.
     ChainSegment(Vec<Block>), // DEPRECATED: Response with the requested blocks.
 

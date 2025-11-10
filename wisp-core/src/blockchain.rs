@@ -253,12 +253,6 @@ impl Blockchain {
     }
 
     /// Creates a block template for a miner.
-    ///
-    /// The template includes the next block's index, the current PoW target, the hash of the
-    /// current tip, and a selection of transactions from the mempool. It also creates a
-    /// coinbase transaction that pays the block reward to the provided public key.
-    ///
-    /// The miner's job is to set a correct `timestamp` and find a `nonce` that satisfies the `target`.
     pub fn get_block_template_for_pubkey(&self, reward_pubkey: &PublicKey) -> Result<Block> {
         self.get_block_template(reward_pubkey, None)
     }
@@ -363,7 +357,6 @@ impl Blockchain {
             return Ok(Amount::zero());
         }
 
-        // Optimization: If the transaction is in the mempool, its fee is already calculated.
         let tx_hash = transaction.txid()?;
         if let Some(entry) = self.mempool.get(&tx_hash) {
             return Ok(entry.fee);
@@ -531,7 +524,6 @@ impl Blockchain {
                     info!("[ORPHAN] Stored orphan block {} to disk.", new_block_hash);
                 }
                 // If it was rejected, we don't save it, preventing DB pollution.
-                // The `add_to_orphan_pool` function returns the appropriate `OrphanRejected` result.
 
                 Ok(orphan_result)
             }
@@ -649,7 +641,7 @@ impl Blockchain {
 
         // This log provides clear, consistent confirmation when a block is added.
         info!(
-            "✅ Block {} (index {}) accepted and added to chain. New height: {}",
+            "Block {} (index {}) accepted and added to chain. New height: {}",
             new_block_hash, new_block.index, new_block.index
         );
 

@@ -158,7 +158,6 @@ impl From<Block> for ApiBlock {
                 .first() // The coinbase transaction is always first
                 .filter(|tx| tx.is_coinbase())
                 .and_then(|coinbase_tx| {
-                    // The reward output is typically the first one
                     coinbase_tx
                         .outputs
                         .first()
@@ -256,18 +255,8 @@ async fn get_network_vitals(
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
 
-    // Hashrate calculation, inspired by Bitcoin.
-    // Hashrate = Difficulty * 2^256 / (MAX_TARGET * avg_block_time)
-    // Since Difficulty = MAX_TARGET / current_target, this simplifies to:
-    // Hashrate = (2^256 / current_target) / avg_block_time
-    // We use floating point numbers for this calculation to handle the large values.
+    // TODO: This hashrate calculation is a rough estimate and can be improved.
     let hashrate_f64 = if avg_block_time_secs > 0.0 && !current_target.is_zero() {
-        // The number of expected hashes to find a block is approximately 2^256 / current_target.
-        // We can calculate this using logarithms to avoid dealing with numbers larger than U256.
-        // log2(2^256 / T) = log2(2^256) - log2(T) = 256 - log2(T)
-        // Expected_Hashes = 2^(256 - log2(T))
-
-        // .bits() gives the position of the most significant bit, which is floor(log2(T)) + 1.
         let target_log2 = current_target.bits() as f64;
         let expected_hashes_log2 = 256.0 - target_log2;
         if expected_hashes_log2 > 0.0 {

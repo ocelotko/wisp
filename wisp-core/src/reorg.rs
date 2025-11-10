@@ -280,7 +280,7 @@ impl Blockchain {
         }
 
         info!(
-            "✅ [REORG] Chain reorganization completed successfully. New chain height: {}",
+            "[REORG] Chain reorganization completed successfully. New chain height: {}",
             self.block_height()?
         );
         Ok(())
@@ -317,8 +317,7 @@ impl Blockchain {
                     bincode::decode_from_slice(&hash_ivec, bincode_config()).map_err(|e| {
                         ConflictableTransactionError::Abort(ReorgError::Anyhow(e.into()))
                     })?;
-                // Optimization: Instead of deserializing the whole block, find the specific transaction
-                // and then the output. This avoids unnecessary work if the tx isn't in this block.
+
                 if let Some(block_ivec) = tx_db.get(DBKeys::block(&block_hash))? {
                     let (checked_block, _): (crate::blockchain::CheckedBlock, _) = // This line is now valid
                         bincode::decode_from_slice(&block_ivec, bincode_config()).map_err(|e| {
