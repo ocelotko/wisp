@@ -84,6 +84,7 @@ pub enum Message {
     ChainSegment(Vec<Block>), // DEPRECATED: Response with the requested blocks.
 
     // --- General & Peer Discovery Messages ---
+    Hello(String), // The first message sent, advertising the node's listening address.
     Ping,
     Pong,
     DiscoverNodes,

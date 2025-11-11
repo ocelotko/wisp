@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use argh::FromArgs;
 use dashmap::DashMap;
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::Arc;
 use tokio::{net::TcpListener, net::TcpStream, sync::OnceCell, sync::RwLock};
 use wisp_core::blockchain::Blockchain;
@@ -48,56 +48,32 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
 
     let mut blockchain_instance = Blockchain::new(db);
 
-    utils::populate_connections(&nodes).await?;
-    info!("Total amount of known nodes: {}", crate::NODES.len());
-
-    // If initial peer nodes are provided, synchronize the blockchain.
-    if !nodes.is_empty() {
-        info!("Checking for longer chain against initial nodes...");
-        // Find which of our known peers has the longest chain.
-        let (longest_name, longest_count) = utils::find_longest_chain_node().await?;
-        let local_chain_length = blockchain_instance.block_height()? + 1;
-        if longest_count > local_chain_length {
-            info!(
-                "Peer {} has a longer chain ({} blocks), preparing to download...",
-                longest_name, longest_count
-            );
-
-            if crate::NODES.remove(&longest_name).is_some() {
-                info!(
-                    "Closed idle connection to {} before starting download.",
-                    longest_name
-                );
-            }
-
-            match utils::download_blockchain(&longest_name, longest_count).await {
-                Ok(_) => {
-                    info!("Blockchain download completed successfully.");
-                }
-                Err(e) => {
-                    error!("Blockchain download failed: {:?}", e);
-                }
-            }
-        }
-    }
-
-    // Load the blockchain state from the database. If it's empty and we didn't download
-    // a chain from peers, this is where we'll initialize the genesis block.
+    // Load the blockchain state from the database *before* any network activity.
+    // This ensures we know our own state before talking to peers.
     blockchain_instance.load_from_db()?;
 
-    if blockchain_instance.block_height()? > 0 {
-        info!(
-            "Successfully loaded blockchain with height: {}",
-            blockchain_instance.block_height()?
-        );
-    } else {
-        info!("Local blockchain is empty. State will depend on peers or genesis creation.");
-    }
-
-    // Set the global BLOCKCHAIN static so other parts of the application can access it.
-    crate::BLOCKCHAIN
+    // Set the global BLOCKCHAIN static *before* calling functions that might access it.
+    BLOCKCHAIN
         .set(Arc::new(RwLock::new(blockchain_instance)))
         .expect("BUG: BLOCKCHAIN static was already initialized.");
+
+    // Start listening for incoming P2P connections *before* we connect to others.
+    // This ensures that if a peer tries to connect back to us during our handshake,
+    // we are ready to accept their connection.
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await?;
+    info!("Listening on {}", addr);
+
+    // Spawn a separate task for initial peer connection and synchronization.
+    // This allows the main task to immediately start accepting connections.
+    tokio::spawn(initial_sync_and_discovery(nodes, port));
+
+    let final_height = BLOCKCHAIN.get().unwrap().read().await.block_height()?; // This is now just the local height
+    info!(
+        "Successfully loaded blockchain with height: {}",
+        final_height
+    );
+
     {
         let blockchain_read = crate::BLOCKCHAIN.get().unwrap().read().await;
         if let Some(genesis_hash) = blockchain_read
@@ -113,11 +89,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
     tokio::spawn(async move {
         api::run_api_server(blockchain_for_api).await;
     });
-
-    // Start listening for incoming P2P connections.
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on {}", addr);
 
     tokio::spawn(utils::cleanup());
 
@@ -139,6 +110,66 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
     }
 }
 
+/// A separate async function to handle the initial connection and sync logic.
+/// This is spawned as a background task so it doesn't block the main connection listener.
+async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
+    // A small delay to ensure the listener is fully up.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    if let Err(e) = utils::populate_connections(&nodes, self_port).await {
+        warn!("Error during initial peer population: {}", e);
+    }
+
+    info!("Total amount of known nodes: {}", crate::NODES.len());
+
+    // If initial peer nodes were provided, check if we need to sync from them.
+    if !nodes.is_empty() {
+        info!("Checking for longer chain against initial nodes...");
+        let (longest_name, longest_count) = match {
+            let bc = BLOCKCHAIN.get().unwrap().read().await;
+            utils::find_longest_chain_node(&bc).await
+        } {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Failed to find longest chain node: {}", e);
+                return;
+            }
+        };
+
+        let local_chain_length = match BLOCKCHAIN.get().unwrap().read().await.block_height() {
+            Ok(h) => h + 1,
+            Err(e) => {
+                error!("Failed to get local chain height: {}", e);
+                return;
+            }
+        };
+
+        if longest_count > local_chain_length {
+            info!(
+                "Peer {} has a longer chain ({} blocks), preparing to download...",
+                longest_name, longest_count
+            );
+
+            if let Some(mut peer) = crate::NODES.get_mut(&longest_name) {
+                let stream = peer.value_mut();
+                if let Err(e) = utils::download_blockchain_with_existing_stream(
+                    stream,
+                    &longest_name,
+                    longest_count,
+                )
+                .await
+                {
+                    error!("Initial blockchain download failed: {:?}", e);
+                }
+            } else {
+                warn!(
+                    "Could not find peer {} in connection map to start download.",
+                    longest_name
+                );
+            }
+        }
+    }
+}
 /// The application entry point.
 #[tokio::main]
 async fn main() -> Result<()> {
