@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use log::{error, info, warn};
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, time};
 use wisp_core::network::Message;
 
 pub mod blocks;
@@ -14,6 +14,42 @@ pub mod transactions;
 pub async fn handle_connection(mut stream: TcpStream, addr: SocketAddr) -> Result<()> {
     // Get a clonable handle to the global blockchain state.
     let blockchain = crate::BLOCKCHAIN.get().unwrap().clone();
+
+    // --- Bidirectional Sync Handshake ---
+    // 1. Send our latest block info to the new peer so they know our height.
+    let (our_tip, our_height) = {
+        let bc = blockchain.read().await;
+        (bc.get_tip_block()?, bc.block_height()?)
+    };
+    if let Some(tip) = our_tip {
+        Message::LatestBlock(Some((tip, our_height)))
+            .send_async(&mut stream)
+            .await?;
+    } else {
+        // We have an empty chain
+        Message::LatestBlock(None).send_async(&mut stream).await?;
+    }
+
+    // 2. Ask the new peer for their latest block info.
+    Message::FetchLatestBlock.send_async(&mut stream).await?;
+
+    // 3. Wait for their response and decide if we need to sync from them.
+    // This is the same logic as the startup sync, but happens for every new connection.
+    if let Ok(Ok(Message::LatestBlock(Some((_, their_height))))) = time::timeout(
+        time::Duration::from_secs(5),
+        Message::receive_async(&mut stream),
+    )
+    .await
+    {
+        if their_height > our_height {
+            warn!(
+                "Peer {} has a longer chain ({} vs our {}). Attempting to sync.",
+                addr, their_height, our_height
+            );
+            // The download_blockchain function handles the sync process.
+            crate::utils::download_blockchain(&addr.to_string(), their_height + 1).await?;
+        }
+    }
 
     loop {
         // Wait for a message from the peer.
@@ -42,6 +78,22 @@ pub async fn handle_connection(mut stream: TcpStream, addr: SocketAddr) -> Resul
             }
             Message::FetchLatestBlock => {
                 sync::handle_fetch_latest_block(&mut stream, blockchain.clone()).await
+            }
+            // This is the other side of the handshake. A peer receives our height.
+            Message::LatestBlock(Some((_, their_height))) => {
+                let our_height = blockchain.read().await.block_height()?;
+                if their_height > our_height {
+                    warn!(
+                        "Peer {} has a longer chain ({} vs our {}). Attempting to sync.",
+                        addr, their_height, our_height
+                    );
+                    // The download_blockchain function handles the sync process.
+                    crate::utils::download_blockchain(&addr.to_string(), their_height + 1).await?;
+                }
+                Ok(())
+            }
+            Message::LatestBlock(None) => {
+                Ok(()) // Peer has an empty chain, nothing to do.
             }
             Message::GetBlockHeaders { from_index, count } => {
                 sync::handle_get_block_headers(&mut stream, from_index, count, blockchain.clone())

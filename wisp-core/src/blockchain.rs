@@ -10,6 +10,7 @@ use crate::{
     utxo::UtxoSet,
     U256,
 };
+
 use anyhow::Result;
 use anyhow::{anyhow, Context};
 use bincode::config::standard as bincode_config;
