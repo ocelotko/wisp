@@ -121,8 +121,15 @@ pub async fn handle_connection(mut stream: TcpStream, addr: SocketAddr) -> Resul
                 )
                 .await
             }
-            Message::SubmitTemplate(pubkey, block) => {
-                mining::handle_submit_template(&mut stream, pubkey, block, blockchain.clone()).await
+            Message::SubmitTemplate(pubkey, block, coinbase_message) => {
+                mining::handle_submit_template(
+                    &mut stream,
+                    pubkey,
+                    block,
+                    coinbase_message,
+                    blockchain.clone(),
+                )
+                .await
             }
 
             // Peer Discovery Messages

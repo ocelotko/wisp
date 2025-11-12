@@ -39,6 +39,7 @@ pub async fn handle_submit_template(
     stream: &mut TcpStream,
     miner_pubkey: PublicKey, // We need the pubkey to generate the next template
     block: Block,
+    coinbase_message: Option<String>,
     blockchain: Arc<RwLock<Blockchain>>,
 ) -> Result<()> {
     let block_hash_for_log = block.id().unwrap_or_default();
@@ -61,7 +62,8 @@ pub async fn handle_submit_template(
             );
 
             // When a miner submits, we don't know their new message, so we generate a template without one.
-            let next_template = blockchain_lock.get_block_template(&miner_pubkey, None)?;
+            let next_template =
+                blockchain_lock.get_block_template(&miner_pubkey, coinbase_message.as_deref())?;
             info!(
                 "Generated next template for block #{} for the same miner.",
                 next_template.index
@@ -95,7 +97,8 @@ pub async fn handle_submit_template(
                 block_hash_for_log
             );
             // In this case, we also generate a new template based on the new state.
-            let next_template = blockchain_lock.get_block_template(&miner_pubkey, None)?;
+            let next_template =
+                blockchain_lock.get_block_template(&miner_pubkey, coinbase_message.as_deref())?;
             Message::Template(next_template).send_async(stream).await?;
             drop(blockchain_lock);
             // The reorg logic will be handled by the node's regular block processing flow.

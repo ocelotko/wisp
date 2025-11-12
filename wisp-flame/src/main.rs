@@ -272,7 +272,8 @@ impl Miner {
             "Submitting mined block: {}",
             block.id().expect("Failed to hash mined block for logging")
         );
-        let message = Message::SubmitTemplate(self.public_key, block);
+        let message =
+            Message::SubmitTemplate(self.public_key, block, self.coinbase_message.clone());
 
         let mut stream_lock = self.stream.lock().await;
         message
