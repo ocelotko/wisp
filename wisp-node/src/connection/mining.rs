@@ -101,6 +101,11 @@ pub async fn handle_submit_template(
                 blockchain_lock.get_block_template(&miner_pubkey, coinbase_message.as_deref())?;
             Message::Template(next_template).send_async(stream).await?;
             drop(blockchain_lock);
+
+            // Also broadcast the block in this case. It's valid work.
+            tokio::spawn(async move {
+                broadcast_block(block).await;
+            });
             // The reorg logic will be handled by the node's regular block processing flow.
         }
         Ok(other) => {
