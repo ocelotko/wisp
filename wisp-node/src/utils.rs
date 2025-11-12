@@ -101,8 +101,11 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     // --- Step 4: Finalize Connection ---
     // If the handshake was successful, add the peer to our global map.
     // We move the stream into the map, giving it a permanent home.
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
     if !crate::NODES.contains_key(node_addr) {
-        crate::NODES.insert(node_addr.to_string(), stream);
+        let stream_arc = Arc::new(AsyncMutex::new(stream));
+        crate::NODES.insert(node_addr.to_string(), stream_arc);
         info!("Handshake successful. Added initial node: {}", node_addr);
     }
 
@@ -128,13 +131,13 @@ pub async fn find_longest_chain_node(
     for node_addr in peers_to_query {
         // Re-acquire a mutable reference to the stream for this peer.
         if let Some(mut peer) = crate::NODES.get_mut(&node_addr) {
-            let stream = peer.value_mut();
+            let mut stream_lock = peer.value_mut().lock().await;
 
             debug!("Querying {} for blockchain length", node_addr);
             let message = Message::FetchLatestBlock;
 
             // Send a message asking for the peer's chain height.
-            if let Err(e) = message.send_async(stream).await {
+            if let Err(e) = message.send_async(&mut *stream_lock).await {
                 warn!(
                     "Failed to send FetchLatestBlock to {}: {}. Skipping.",
                     node_addr, e
@@ -145,7 +148,12 @@ pub async fn find_longest_chain_node(
             debug!("Sent FetchLatestBlock to {}", node_addr);
 
             // Wait for the peer's response.
-            match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
+            match time::timeout(
+                Duration::from_secs(5),
+                Message::receive_async(&mut *stream_lock),
+            )
+            .await
+            {
                 Ok(Ok(Message::LatestBlock(Some((_, remote_height))))) => {
                     let remote_block_count = remote_height + 1;
                     debug!(

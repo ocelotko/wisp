@@ -139,7 +139,8 @@ pub async fn broadcast_block(block: Block) {
 
     for mut peer in crate::NODES.iter_mut() {
         let addr = peer.key().clone();
-        if let Err(e) = message.send_async(peer.value_mut()).await {
+        let mut stream_lock = peer.value_mut().lock().await;
+        if let Err(e) = message.send_async(&mut *stream_lock).await {
             warn!(
                 "Failed to broadcast block to {}: {}. Marking for removal.",
                 addr, e

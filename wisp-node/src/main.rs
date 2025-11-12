@@ -3,7 +3,11 @@ use argh::FromArgs;
 use dashmap::DashMap;
 use log::{error, info, warn};
 use std::sync::Arc;
-use tokio::{net::TcpListener, net::TcpStream, sync::OnceCell, sync::RwLock};
+use tokio::{
+    net::TcpListener,
+    net::TcpStream,
+    sync::{Mutex as AsyncMutex, OnceCell, RwLock},
+};
 use wisp_core::blockchain::Blockchain;
 
 pub mod api;
@@ -33,7 +37,7 @@ struct Args {
 lazy_static! {
     /// A global, thread-safe map of connected peer nodes.
     /// The key is the peer's address string, and the value is the TCP stream.
-    pub static ref NODES: DashMap<String, TcpStream> = DashMap::new();
+    pub static ref NODES: DashMap<String, Arc<AsyncMutex<TcpStream>>> = DashMap::new();
 
     /// A global, thread-safe handle to the blockchain state.
     /// `OnceCell` ensures it's initialized only once.
@@ -98,7 +102,8 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> 
             Ok((socket, addr)) => {
                 info!("Accepted new connection from {}", addr);
                 tokio::spawn(async move {
-                    if let Err(e) = connection::handle_connection(socket, addr).await {
+                    let stream_arc = Arc::new(AsyncMutex::new(socket));
+                    if let Err(e) = connection::handle_connection(stream_arc, addr).await {
                         error!("Error in connection handler from {}: {:?}", addr, e);
                     }
                 });
@@ -151,9 +156,9 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
             );
 
             if let Some(mut peer) = crate::NODES.get_mut(&longest_name) {
-                let stream = peer.value_mut();
+                let mut stream = peer.value_mut().lock().await;
                 if let Err(e) = utils::download_blockchain_with_existing_stream(
-                    stream,
+                    &mut stream,
                     &longest_name,
                     longest_count,
                 )

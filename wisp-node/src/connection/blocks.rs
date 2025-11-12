@@ -126,10 +126,11 @@ async fn fetch_chain_segment(
 
             // Iterate over peers to find one that has the block.
             for mut peer in crate::NODES.iter_mut() {
-                if let Ok(_) = message.send_async(peer.value_mut()).await {
+                let mut stream_lock = peer.value_mut().lock().await;
+                if let Ok(_) = message.send_async(&mut *stream_lock).await {
                     match time::timeout(
                         time::Duration::from_secs(5),
-                        Message::receive_async(peer.value_mut()),
+                        Message::receive_async(&mut *stream_lock),
                     )
                     .await
                     {
@@ -167,11 +168,12 @@ async fn broadcast_request_for_block(hash: Hash) {
     let message = Message::FetchBlockByHash(hash);
 
     for mut peer in crate::NODES.iter_mut() {
-        if let Err(e) = message.send_async(peer.value_mut()).await {
+        let addr = peer.key().clone();
+        let mut stream_lock = peer.value_mut().lock().await;
+        if let Err(e) = message.send_async(&mut *stream_lock).await {
             warn!(
                 "Failed to send block request to {}: {}. Connection may be stale.",
-                peer.key(),
-                e
+                addr, e
             );
         }
     }

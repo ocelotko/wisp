@@ -94,7 +94,8 @@ async fn broadcast_transaction(tx: Transaction, original_sender: SocketAddr) {
             continue;
         }
 
-        if let Err(e) = message.send_async(peer.value_mut()).await {
+        let mut stream_lock = peer.value_mut().lock().await;
+        if let Err(e) = message.send_async(&mut *stream_lock).await {
             warn!(
                 "Failed to broadcast transaction to {}: {}. Marking for removal.",
                 addr, e
