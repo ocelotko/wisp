@@ -17,8 +17,11 @@ pub struct Transaction {
     pub outputs: Vec<TransactionOutput>,
 }
 
-/// An "OutPoint" is a pointer to a specific transaction output. It consists of the hash of the transaction
-/// that created the output and the output's index within that transaction (`vout`).
+/// A pointer to a specific transaction output.
+///
+/// An `OutPoint` uniquely identifies a spendable output by referencing the hash
+/// of the transaction that created it (`txid`) and its index within that
+/// transaction's outputs list (`vout`).
 #[derive(
     Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash, Copy, Default,
 )]
@@ -33,6 +36,7 @@ impl fmt::Display for OutPoint {
     }
 }
 
+/// Represents an input to a transaction, which spends a previous transaction's output.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionInput {
     pub outpoint: OutPoint,
@@ -42,8 +46,10 @@ pub struct TransactionInput {
     pub coinbase_data: Option<Vec<u8>>,
 }
 
-/// A transaction output, which creates new spendable value. It specifies the amount, the public key
-/// that can spend it (the "lock script"), and an optional message.
+/// A transaction output, which creates new spendable value on the blockchain.
+///
+/// It specifies the `value` (amount) and the `pubkey` (script) that is
+/// required to spend this output in a future transaction.
 #[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash, Default)]
 pub struct TransactionOutput {
     pub value: Amount,
@@ -53,6 +59,7 @@ pub struct TransactionOutput {
 use crate::sha256::{hash, witness_hash, Hashable, WitnessHashable};
 use sha2::{Digest, Sha256};
 
+/// Implements `Hashable` for `OutPoint` to include it in the transaction hash.
 impl Hashable for OutPoint {
     fn update_hasher(&self, hasher: &mut Sha256) {
         hasher.update(&self.txid.as_bytes());
@@ -60,6 +67,7 @@ impl Hashable for OutPoint {
     }
 }
 
+/// Implements `Hashable` for `TransactionOutput` to include it in the transaction hash.
 impl Hashable for TransactionOutput {
     fn update_hasher(&self, hasher: &mut Sha256) {
         self.value.update_hasher(hasher);
@@ -67,6 +75,7 @@ impl Hashable for TransactionOutput {
     }
 }
 
+/// Implements `Hashable` for `Transaction` to define how a `txid` is calculated.
 impl Hashable for Transaction {
     fn update_hasher(&self, hasher: &mut Sha256) {
         for input in &self.inputs {
@@ -81,6 +90,7 @@ impl Hashable for Transaction {
     }
 }
 
+/// Implements `WitnessHashable` for `Transaction` to define how a `wtxid` is calculated.
 impl WitnessHashable for Transaction {
     fn update_witness_hasher(&self, hasher: &mut Sha256) {
         for input in &self.inputs {
@@ -96,6 +106,7 @@ impl WitnessHashable for Transaction {
 }
 
 impl Transaction {
+    /// Creates a new transaction from a vector of inputs and outputs.
     pub fn new(inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>) -> Self {
         Transaction { inputs, outputs }
     }
@@ -105,8 +116,11 @@ impl Transaction {
         self.inputs.len() == 1 && self.inputs[0].outpoint.txid == Hash::zero()
     }
 
-    /// Creates and signs a transaction from a set of UTXOs.
-    /// This version is designed for a wallet where a single private key controls all inputs.
+    /// Creates and signs a new transaction from a set of UTXOs to be spent.
+    ///
+    /// This function is designed for a simple wallet where a single private key controls
+    /// all input UTXOs. It creates a transaction, signs it with the provided key,
+    /// and places the signature in all input fields.
     pub fn new_signed_from_utxos(
         outpoints_to_spend: &[OutPoint],
         outputs: Vec<TransactionOutput>,
@@ -146,13 +160,16 @@ impl Transaction {
         })
     }
 
-    /// The transaction ID (txid) is the hash of the signable components of the transaction.
+    /// Calculates the transaction ID (`txid`).
+    ///
+    /// The `txid` is the double-SHA256 hash of the transaction's signable components
+    /// (i.e., excluding witness data like signatures).
     pub fn txid(&self) -> Result<Hash, anyhow::Error> {
         Ok(hash(self))
     }
 
-    /// The witness transaction ID (wtxid) is the hash of the transaction including witness data (signatures).
-    /// This is used for the Merkle Root calculation to prevent malleability.
+    /// Calculates the witness transaction ID (`wtxid`).
+    /// The `wtxid` is the hash of the transaction including witness data (signatures).
     pub fn wtxid(&self) -> Result<Hash, anyhow::Error> {
         Ok(witness_hash(self))
     }

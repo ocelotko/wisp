@@ -15,6 +15,10 @@ use log::{debug, info};
 use sled::transaction::TransactionalTree;
 use std::collections::{HashMap, HashSet};
 
+/// Represents the context in which block validation is occurring.
+///
+/// This allows the validation logic to be shared between normal block addition (`Live`)
+/// and chain reorganizations (`Reorg`), which have different sources for state data.
 pub enum ValidationState<'a> {
     Live(&'a Blockchain),
     Reorg {
@@ -24,9 +28,10 @@ pub enum ValidationState<'a> {
 }
 
 impl Block {
-    /// Performs a lightweight validation of the block's header and proof-of-work.
-    /// This is a cheaper check used for incoming fork/orphan blocks before persisting them,
-    /// to avoid storing obvious junk.
+    /// Performs a lightweight, context-free validation of the block's header and proof-of-work.
+    ///
+    /// This is a fast check used for incoming fork or orphan blocks before persisting them,
+    /// which helps to avoid storing obviously invalid or spam blocks.
     pub fn validate_header_and_pow(&self) -> Result<()> {
         // 1. Check if the block's hash meets its own declared PoW target.
         let block_hash = self
@@ -49,13 +54,16 @@ impl Block {
 
         Ok(())
     }
-    /// Performs a comprehensive validation of a block's contents and rules.
-    /// This is a critical function for ensuring the integrity of the blockchain. It's called when adding a new block.
+    /// Performs a comprehensive, context-aware validation of a block's contents and consensus rules.
+    ///
+    /// This is a critical function for ensuring the integrity of the blockchain. It is called
+    /// when adding a new block to the main chain.
     pub fn validate_block(&self, blockchain: &Blockchain, expected_target: &U256) -> Result<()> {
         self.validate_block_with_state(ValidationState::Live(blockchain), expected_target)
     }
 
-    /// A unified block validation function that works for both live chain and reorg contexts.
+    /// A unified block validation function that works for both live chain and reorg contexts,
+    /// using the `ValidationState` enum to abstract the data source.
     fn validate_block_with_state(
         &self,
         state: ValidationState,
@@ -162,20 +170,24 @@ impl Block {
 
         // Use the block's own fee calculation method, which correctly handles intra-block spends
         // by passing it the blockchain's current UTXO set.
-        let mut total_fees_in_block = Amount::zero();
-        if let ValidationState::Live(blockchain) = state {
-            // Skip the coinbase transaction itself when summing fees.
-            for tx in self.transactions.iter().skip(1) {
-                let fee = blockchain.calculate_transaction_fee(tx)?;
-                total_fees_in_block = total_fees_in_block
-                    .checked_add(fee)
-                    .context("Fee sum overflow during block validation")?;
+        let total_fees_in_block = match state {
+            ValidationState::Live(blockchain) => {
+                let mut fees = Amount::zero();
+                // Skip the coinbase transaction itself when summing fees.
+                for tx in self.transactions.iter().skip(1) {
+                    let fee = blockchain.calculate_transaction_fee(tx)?;
+                    fees = fees
+                        .checked_add(fee)
+                        .context("Fee sum overflow during block validation")?;
+                }
+                fees
             }
-        }
-
-        //TODO: Implement reorg validation path
-        // Note: Reorg validation path would need a similar loop using a DB-transaction-aware fee calculation.
-        // For now, this covers the primary block addition path.
+            ValidationState::Reorg { tx_db, .. } => {
+                // During a reorg, we must use the special fee calculation function that operates on the DB transaction.
+                Blockchain::calculate_block_fees_for_reorg(self, tx_db)
+                    .map_err(|e| anyhow::anyhow!("Reorg fee calculation failed: {:?}", e))?
+            }
+        };
         self.verify_coinbase_transaction(total_fees_in_block)
             .context("Coinbase transaction verification failed")?;
         info!("DEBUG: Coinbase transaction validation passed.");
@@ -193,7 +205,9 @@ impl Block {
     }
 
     /// A specialized version of `validate_block` for use within a database transaction during a reorg.
-    /// It uses the transactional database view (`tx_db`) instead of a `Blockchain` instance to avoid deadlocks.
+    ///
+    /// It uses a temporary UTXO set and a transactional database view (`tx_db`) instead of
+    /// a live `Blockchain` instance to ensure atomicity and avoid deadlocks.
     pub fn validate_block_for_reorg(
         &self,
         temp_utxos: &HashMap<OutPoint, TransactionOutput>,
@@ -207,8 +221,10 @@ impl Block {
     }
 
     /// Verifies all non-coinbase transactions within the block.
-    /// This includes checking for double-spends within the block, verifying signatures,
-    /// and ensuring that input values are sufficient to cover output values.
+    ///
+    /// This includes checking for transaction size, duplicate transactions, double-spends
+    /// (both within the block and against the chain's UTXO set), signature validity,
+    /// and ensuring that input values are sufficient to cover output values (plus fees).
     pub fn verify_transactions(
         &self,
         chain_utxos: &HashMap<OutPoint, TransactionOutput>,
@@ -363,8 +379,11 @@ impl Block {
     }
 
     /// Verifies the coinbase transaction (the first transaction in a block).
-    /// It checks that it has no inputs and that its output value equals the
-    /// block reward plus the sum of all transaction fees in the block.
+    ///
+    /// This function checks that the coinbase transaction follows all consensus rules:
+    /// - It must be the first transaction.
+    /// - Its `coinbase_data` must start with the block height (BIP 34).
+    /// - Its output value must equal the block reward plus the sum of all transaction fees in the block.
     pub fn verify_coinbase_transaction(&self, total_fees_in_block: Amount) -> Result<()> {
         if self.transactions.is_empty() {
             // This check is technically redundant if verify_transactions is called, but good for defense-in-depth.
@@ -442,6 +461,10 @@ impl Block {
     }
 
     /// Calculates the median timestamp of the last 11 blocks.
+    ///
+    /// This is used to enforce the Median Time Past (MTP) rule, which prevents miners
+    /// from arbitrarily setting block timestamps far in the future. A block's timestamp
+    /// must be greater than the MTP of the 11 preceding blocks.
     fn calculate_median_time_past(
         block_index: u64,
         blockchain: Option<&Blockchain>,

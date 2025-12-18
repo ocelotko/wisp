@@ -9,6 +9,11 @@ use std::fmt;
 use std::ops::{Add, Sub};
 
 /// Represents a currency amount in the smallest indivisible unit.
+///
+/// This struct wraps a `u64` and provides methods for safe arithmetic,
+/// conversion to and from the main currency unit (WISP), and string formatting.
+/// Using this struct ensures that all currency operations are handled consistently
+/// and avoids floating-point precision issues.
 #[derive(
     Encode,
     Decode,
@@ -29,6 +34,7 @@ pub struct Amount(pub u64);
 use crate::sha256::Hashable;
 use sha2::{Digest, Sha256};
 
+/// Implements the `Hashable` trait for `Amount` to allow it to be included in hashed data structures.
 impl Hashable for Amount {
     fn update_hasher(&self, hasher: &mut Sha256) {
         hasher.update(&self.0.to_be_bytes());
@@ -174,18 +180,22 @@ impl Sub for Amount {
     }
 }
 
+/// Implements `AddAssign` for `Amount` for in-place addition.
 impl AddAssign for Amount {
     fn add_assign(&mut self, other: Self) {
         *self = *self + other;
     }
 }
 
+/// Implements `SubAssign` for `Amount` for in-place subtraction.
 impl SubAssign for Amount {
     fn sub_assign(&mut self, other: Self) {
         *self = *self - other;
     }
 }
 
+/// Implements `Sum` for `Amount`, allowing an iterator of `Amount`s to be summed up.
+/// On overflow, the sum will saturate at `Amount::MAX`.
 impl Sum for Amount {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Amount::zero(), |acc, x| {
@@ -194,6 +204,7 @@ impl Sum for Amount {
     }
 }
 
+/// Implements `Display` for `Amount`, formatting it as a WISP string.
 impl fmt::Display for Amount {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.to_string_wisp())

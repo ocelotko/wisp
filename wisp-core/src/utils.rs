@@ -15,13 +15,15 @@ use std::{
     io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Write},
 };
 
-/// A wrapper around a `Hash` to represent the root of a Merkle tree.
+/// Represents the root of a Merkle tree of transactions.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MerkleRoot(pub Hash);
 
 impl MerkleRoot {
-    /// Calculates the Merkle root for a list of transactions using a binary Merkle tree
-    /// with double-SHA256 hashing.
+    /// Calculates the Merkle root for a list of transactions.
+    ///
+    /// The tree is constructed using the witness transaction IDs (`wtxid`) to prevent
+    /// transaction malleability. It uses a binary tree structure with double-SHA256 hashing.
     /// It repeatedly hashes pairs of hashes in a layer until only one root hash remains.
     pub fn calculate(transactions: &[Transaction]) -> Result<MerkleRoot, anyhow::Error> {
         let mut layer: Vec<Hash> = vec![];
@@ -59,7 +61,9 @@ impl MerkleRoot {
 }
 
 /// Calculates the block reward for a given block height.
-/// The reward is halved every `HALVING_INTERVAL` blocks.
+///
+/// The reward starts at `INITIAL_BLOCK_REWARD_SMALLEST_UNITS` and is halved
+/// every `HALVING_INTERVAL` blocks.
 pub fn calculate_block_reward(block_height: u64) -> Amount {
     let halvings = block_height / crate::HALVING_INTERVAL;
 
@@ -75,7 +79,9 @@ pub fn calculate_block_reward(block_height: u64) -> Amount {
 }
 
 /// Constructs the genesis block of the blockchain.
-/// This block is hardcoded and serves as the foundation of the chain.
+///
+/// This block is hardcoded with a specific message, timestamp, and other parameters.
+/// It serves as the immutable foundation of the entire chain.
 pub fn genesis_block() -> AnyhowResult<Block> {
     let genesis_pubkey_hex = "020000000000000000000000000000000000000000000000000000000000000001";
     let genesis_pubkey_bytes =
@@ -122,15 +128,18 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     Ok(genesis_block)
 }
 
-/// A trait for objects that can be saved to and loaded from a stream or file.
+/// A trait for objects that can be saved to and loaded from a stream or file using `bincode`.
 pub trait Saveable
 where
     Self: Sized,
 {
+    /// Serializes and saves the object to a writer.
     fn save<O: Write>(&self, writer: O) -> IoResult<()>;
+    /// Deserializes and loads the object from a reader.
     fn load<I: Read>(reader: I) -> IoResult<Self>;
 
     fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> IoResult<()> {
+        /// Saves the object to a file at the given path.
         use std::io::BufWriter;
         let file = File::create(&path)?;
         self.save(BufWriter::new(file))
@@ -138,7 +147,6 @@ where
 
     fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> IoResult<Self> {
         // Open the file and wrap it in a BufReader for efficiency,
-        // which is common practice and also implements the required traits.
         use std::io::BufReader;
         let file = File::open(&path)?;
         let reader = BufReader::new(file);

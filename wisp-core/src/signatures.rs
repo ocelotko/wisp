@@ -20,7 +20,7 @@ use std::{
 
 use crate::sha256::{Hash, Hashable};
 
-/// A wrapper around a `k256::ecdsa::Signature` to provide domain-specific methods.
+/// A wrapper around a `k256::ecdsa::Signature` to provide serialization and domain-specific methods.
 #[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Signature(#[bincode(with_serde)] pub EcdsaSignature<Secp256k1>);
 
@@ -57,7 +57,7 @@ impl Signature {
     }
 }
 
-/// A wrapper around a `k256::ecdsa::VerifyingKey` representing a public key.
+/// A wrapper around a `k256::ecdsa::VerifyingKey` representing a secp256k1 public key.
 #[derive(
     Encode, Decode, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Copy,
 )]
@@ -65,9 +65,9 @@ pub struct PublicKey(#[bincode(with_serde)] pub VerifyingKey<Secp256k1>);
 
 impl Default for PublicKey {
     /// Creates a default `PublicKey`.
-    /// This uses the hardcoded "burn" public key from the genesis block utility,
-    /// as `VerifyingKey` itself does not have a natural default. This must be a constant
-    /// to avoid re-calculating it, which can cause deadlocks in test environments.
+    ///
+    /// This uses the hardcoded "burn" public key from the genesis block utility.
+    /// This is necessary because `VerifyingKey` itself does not have a natural default.
     fn default() -> Self {
         let genesis_pubkey_hex =
             "020000000000000000000000000000000000000000000000000000000000000001";
@@ -79,6 +79,7 @@ impl Default for PublicKey {
 }
 
 use sha2::Digest;
+/// Implements `Hashable` for `PublicKey` to allow it to be included in hashed data structures.
 impl Hashable for PublicKey {
     fn update_hasher(&self, hasher: &mut sha2::Sha256) {
         hasher.update(self.0.to_encoded_point(true).as_bytes());
@@ -97,7 +98,8 @@ impl FromStr for PublicKey {
 }
 
 impl PublicKey {
-    /// Returns the compressed SEC1-encoded public key as a hex string. This is used as the wallet address.
+    /// Returns the compressed SEC1-encoded public key as a hex string.
+    /// This is commonly used as the wallet address.
     pub fn fingerprint(&self) -> String {
         let encoded_point = self.0.to_encoded_point(true);
         hex::encode(encoded_point.as_bytes())
@@ -120,7 +122,7 @@ impl StdHash for PublicKey {
     }
 }
 
-/// A wrapper around a `k256::ecdsa::SigningKey` representing a private key.
+/// A wrapper around a `k256::ecdsa::SigningKey` representing a secp256k1 private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateKey(pub SigningKey<Secp256k1>);
 

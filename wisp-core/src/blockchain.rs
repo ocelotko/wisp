@@ -100,6 +100,10 @@ impl CheckedBlock {
     }
 }
 
+/// Represents the header of a block, containing all metadata except the transaction list.
+///
+/// The block header is the part of the block that is hashed to produce the block's unique ID
+/// and for the proof-of-work verification.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct BlockHeader {
     pub version: u32,
@@ -124,6 +128,19 @@ impl Hashable for BlockHeader {
 }
 
 impl Block {
+    /// Creates a new `Block`.
+    ///
+    /// # Arguments
+    ///
+    /// * `version` - The block version.
+    /// * `timestamp` - The time the block was created.
+    /// * `nonce` - The nonce found during mining.
+    /// * `previous_hash` - The hash of the preceding block.
+    /// * `merkle_root` - The Merkle root of the block's transactions.
+    /// * `target` - The proof-of-work target for this block.
+    /// * `index` - The height of the block in the chain.
+    /// * `transactions` - The list of transactions included in the block.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         version: u32,
         timestamp: DateTime<Utc>,
@@ -147,7 +164,6 @@ impl Block {
     }
 
     /// Creates a `BlockHeader` for this block, used for hashing and validation.
-    /// This is a lightweight, temporary struct that borrows data from the full block.
     pub fn header(&self) -> BlockHeader {
         BlockHeader {
             version: self.version,
@@ -159,14 +175,14 @@ impl Block {
         }
     }
 
-    /// Calculates the hash of the block header, which serves as the block's unique identifier (txid).
+    /// Calculates the hash of the block header, which serves as the block's unique identifier.
     pub fn id(&self) -> Result<Hash, anyhow::Error> {
         Ok(hash(&self.header()))
     }
 }
 
-#[derive(Serialize, Clone, Debug)]
 /// Represents the state of the blockchain.
+#[derive(Serialize, Clone, Debug)]
 /// NOTE: This struct is NOT thread-safe. Concurrent access must be managed externally, for example, using `Arc<RwLock<Blockchain>>`.
 pub struct Blockchain {
     /// The in-memory set of Unspent Transaction Outputs (UTXOs).
@@ -231,10 +247,12 @@ impl Blockchain {
         }
     }
 
+    /// Returns a reference to the current UTXO set.
     pub fn utxos(&self) -> &HashMap<OutPoint, TransactionOutput> {
         &self.utxo_set.utxos
     }
 
+    /// Returns a reference to the current mempool.
     pub fn mempool(&self) -> &HashMap<Hash, MempoolEntry> {
         &self.mempool
     }
@@ -254,10 +272,12 @@ impl Blockchain {
     }
 
     /// Creates a block template for a miner.
+    /// This version uses a provided public key for the coinbase reward.
     pub fn get_block_template_for_pubkey(&self, reward_pubkey: &PublicKey) -> Result<Block> {
         self.get_block_template(reward_pubkey, None)
     }
 
+    /// Creates a full block template for a miner to work on.
     pub fn get_block_template(
         &self,
         reward_pubkey: &PublicKey,
@@ -349,10 +369,12 @@ impl Blockchain {
         Ok(template)
     }
 
+    /// Returns the current proof-of-work target.
     pub fn get_target(&self) -> U256 {
         self.target
     }
 
+    /// Calculates the fee for a given transaction.
     pub fn calculate_transaction_fee(&self, transaction: &Transaction) -> Result<Amount> {
         if transaction.is_coinbase() {
             return Ok(Amount::zero());
@@ -415,9 +437,9 @@ impl Blockchain {
         );
 
         // Explicitly get the current tip block to make logic clearer.
-        let maybe_current_tip = self.get_tip_block()?;
+        let current_tip_option = self.get_tip_block()?;
 
-        let current_chain_tip = if let Some(block) = maybe_current_tip {
+        let current_chain_tip = if let Some(block) = current_tip_option {
             block
         } else {
             // Chain is empty. We must be processing the genesis block.
@@ -776,8 +798,8 @@ impl Blockchain {
     }
 
     /// Periodically saves a UTXO snapshot to disk to speed up future startups.
-    pub fn maybe_save_snapshot(&self, height: u64) -> Result<()> {
-        if height > 0 && height % 720 == 0 {
+    pub fn save_snapshot_if_needed(&mut self, height: u64) -> Result<()> {
+        if height > 0 && height % Self::UTXO_SNAPSHOT_INTERVAL == 0 {
             self.save_utxo_snapshot(height)?;
         }
         Ok(())

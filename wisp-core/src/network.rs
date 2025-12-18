@@ -15,6 +15,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Represents the confirmation status of a transaction.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum TransactionStatus {
     Pending,
@@ -23,6 +24,7 @@ pub enum TransactionStatus {
     NotFound,
 }
 
+/// Contains detailed information about a transaction relevant to a wallet.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletTransactionInfo {
     pub transaction: Transaction,
@@ -32,12 +34,14 @@ pub struct WalletTransactionInfo {
     pub block_index: Option<u64>,
 }
 
+/// A snapshot of a wallet's state, including its transactions and UTXOs.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletStateSnapshot {
     pub transactions: Vec<WalletTransactionInfo>,
     pub utxos: Vec<(OutPoint, TransactionOutput)>,
 }
 
+/// Defines the set of messages that can be exchanged between nodes on the network.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Message {
     // --- Wallet & Transaction Messages ---
@@ -54,14 +58,14 @@ pub enum Message {
     },
 
     // --- Mining Messages ---
-    FetchTemplate(PublicKey, Option<String>), // Miner requests a block template to work on.
-    Template(Block),                          // Node responds with a block template.
-    NewTemplate(Block), // Node pushes a new template to miners when the chain tip changes.
-    ValidateTemplate(Block), // Miner asks node to validate a found template before submitting.
-    TemplateValidity(bool), // Node responds with validity of the template.
-    SubmitTemplate(PublicKey, Block, Option<String>), // Miner submits a mined block, including their pubkey and coinbase message for the next template.
-    BlockSubmittedConfirmation, // Node confirms receipt and successful addition of the block.
-    BlockRejected(String),      // Node rejects a submitted block.
+    FetchTemplate(PublicKey, Option<String>),
+    Template(Block),
+    NewTemplate(Block),
+    ValidateTemplate(Block),
+    TemplateValidity(bool),
+    SubmitTemplate(PublicKey, Block, Option<String>),
+    BlockSubmittedConfirmation,
+    BlockRejected(String),
 
     // --- Chain & Block Sync Messages ---
     NewBlock(Block),
@@ -77,14 +81,10 @@ pub enum Message {
         from_index: u64,
         count: u32,
     }, // Request a sequence of block headers.
-    BlockHeaders(Vec<BlockHeader>), // Response with the requested headers.
-
-    //TODO: Deprecate this
-    FetchChainSegment(u64), // DEPRECATED: Prefer GetBlockHeaders and FetchBlock. Request blocks from a certain index onwards.
-    ChainSegment(Vec<Block>), // DEPRECATED: Response with the requested blocks.
+    BlockHeaders(Vec<BlockHeader>),
 
     // --- General & Peer Discovery Messages ---
-    Hello(String), // The first message sent, advertising the node's listening address.
+    Hello(String),
     Ping,
     Pong,
     DiscoverNodes,

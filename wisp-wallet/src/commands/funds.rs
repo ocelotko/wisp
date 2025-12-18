@@ -446,7 +446,10 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 tx_item.counterparty_info,
                 reset_color
             );
-            println!("  \x1B[90mTx Hash: {}\x1B[0m", tx_item.tx_hash.to_string());
+            println!(
+                "  \x1B[90mhttp://localhost:8000/transaction/{}\x1B[0m",
+                tx_item.tx_hash.to_string()
+            );
             println!();
         }
         println!("{}", "-".repeat(105));

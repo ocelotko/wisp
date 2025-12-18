@@ -14,8 +14,9 @@ use crate::{
 };
 
 impl Blockchain {
-    /// Gets all UTXOs belonging to a specific public key from the in-memory UTXO set.
-    /// This is now mempool-aware and will not include UTXOs that are spent by transactions
+    /// Gets all spendable UTXOs belonging to a specific public key.
+    ///
+    /// This function is mempool-aware and will not include UTXOs that are spent by transactions
     /// currently in the mempool.
     pub fn get_utxos_for_pubkey(&self, pubkey: &PublicKey) -> Vec<(OutPoint, TransactionOutput)> {
         self.utxo_set
@@ -32,7 +33,12 @@ impl Blockchain {
     }
 
     /// Determines the status of a transaction by checking the mempool and the database.
-    /// Returns `Pending`, `Confirmed`, or `NotFound`.
+    ///
+    /// # Returns
+    ///
+    /// * `TransactionStatus::Pending` if the transaction is in the mempool.
+    /// * `TransactionStatus::Confirmed` if the transaction is in a block on the main chain.
+    /// * `TransactionStatus::NotFound` if the transaction is not found.
     pub fn get_transaction_status(&self, tx_hash: &Hash) -> TransactionStatus {
         if self.mempool.contains_key(tx_hash) {
             debug!("Transaction {} found in mempool.", tx_hash);
@@ -90,7 +96,11 @@ impl Blockchain {
     }
 
     /// Retrieves a transaction and its associated metadata (block height, timestamp).
-    /// It first checks the mempool, then falls back to the database.
+    ///
+    /// This function first checks the mempool for unconfirmed transactions, then falls back
+    /// to the database for confirmed transactions.
+    ///
+    /// Returns `Ok(Some((transaction, block_index, timestamp)))` or `Ok(None)` if not found.
     pub fn get_transaction_with_details(
         &self,
         tx_hash: &Hash,
@@ -134,11 +144,15 @@ impl Blockchain {
     }
 
     /// Returns the total number of confirmed transactions in the blockchain.
+    /// This count excludes coinbase transactions.
     pub fn get_total_transaction_count(&self) -> Result<u64> {
         self.get_total_transaction_count_from_db()
     }
 
     /// Finds a specific transaction output by its `OutPoint`.
+    ///
+    /// It checks the live UTXO set first for performance, then falls back to searching
+    /// the entire chain history in the database if necessary.
     /// It checks the live UTXO set first, then falls back to searching the entire chain history.
     pub fn find_output_by_outpoint_in_chain_or_utxos(
         &self,
@@ -160,8 +174,9 @@ impl Blockchain {
     }
 
     /// Finds multiple transaction outputs by their `OutPoint`s.
-    /// It checks the live UTXO set first, then falls back to searching the database for historical transactions.
-    /// This is more efficient than calling `find_output_by_outpoint_in_chain_or_utxos` in a loop.
+    ///
+    /// This is more efficient than calling `find_output_by_outpoint_in_chain_or_utxos`
+    /// in a loop as it batches database lookups.
     pub fn find_outputs_by_outpoints(
         &self,
         outpoints: &[OutPoint],
@@ -189,7 +204,9 @@ impl Blockchain {
     }
 
     /// Finds a specific transaction output by its `OutPoint` by searching the database only.
-    /// This is useful for operations that need to look at historical state, like reorgs.
+    ///
+    /// This is useful for operations that need to look at historical state without
+    /// considering the live UTXO set, such as during a chain reorganization.
     pub fn find_output_by_outpoint_in_db(
         &self,
         outpoint: &OutPoint,
@@ -198,7 +215,6 @@ impl Blockchain {
     }
 
     /// A static version of `find_output_by_outpoint_in_db` that takes a `Db` reference directly.
-    /// This is used to break borrow checker conflicts, such as during a reorg.
     pub fn find_output_by_outpoint_in_db_static(
         db: &sled::Db,
         outpoint: &OutPoint,
@@ -250,7 +266,10 @@ impl Blockchain {
     }
 
     /// Compiles a complete transaction history for a given public key.
-    /// It fetches transactions from both the database (confirmed) and the mempool (pending).
+    ///
+    /// It fetches all transactions involving the public key from both the database (confirmed)
+    /// and the mempool (pending), then returns them as a sorted list of `WalletTransactionInfo`.
+    /// The list is sorted from newest to oldest.
     pub fn get_wallet_transaction_history(
         &self,
         pubkey: &PublicKey,

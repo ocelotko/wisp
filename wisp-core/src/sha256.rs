@@ -7,14 +7,15 @@ pub use sha2::Sha256;
 use std::{convert::TryFrom, fmt};
 
 /// A trait for objects that can be hashed in a standardized, consensus-critical way.
-/// This ensures that all parts of the codebase agree on how to serialize an object for hashing.
+///
+/// Implementing this trait ensures that all parts of the codebase agree on how to
+/// serialize an object for hashing, which is essential for consensus.
 pub trait Hashable {
     /// Updates a hasher with the object's consensus-critical byte representation.
     fn update_hasher(&self, hasher: &mut Sha256);
 }
 
 /// A trait for objects that can be hashed including their witness data.
-/// This is separate from `Hashable` to distinguish between txid and wtxid.
 pub trait WitnessHashable {
     fn update_witness_hasher(&self, hasher: &mut Sha256);
 }
@@ -64,8 +65,9 @@ impl Hashable for [u8] {
 }
 
 /// A private, generic function that performs the core double-SHA256 hashing logic.
-/// It takes a closure that defines how to update the hasher, allowing it to work
-/// with both `Hashable` and `WitnessHashable` traits without code duplication.
+///
+/// It takes a closure that defines how to update the hasher, allowing it to be used
+/// for both `Hashable` (for txid) and `WitnessHashable` (for wtxid) without code duplication.
 fn double_sha256_hash<F>(update_fn: F) -> Hash
 where
     F: FnOnce(&mut Sha256),
@@ -83,19 +85,21 @@ where
 }
 
 /// Performs a standardized double-SHA256 hash on any object that implements the `Hashable` trait.
-/// This is the single, canonical hashing function that should be used for all consensus-critical hashing.
+///
+/// This is the canonical hashing function for generating transaction IDs (`txid`) and block IDs.
 pub fn hash<T: Hashable + ?Sized>(data: &T) -> Hash {
     double_sha256_hash(|hasher| data.update_hasher(hasher))
 }
 
-/// Performs a double-SHA256 hash on an object's witness data.
+/// Performs a double-SHA256 hash on an object's witness data (including signatures).
+///
+/// This is used to generate the witness transaction ID (`wtxid`), which is included in the
+/// Merkle tree to prevent transaction malleability.
 pub fn witness_hash<T: WitnessHashable + ?Sized>(data: &T) -> Hash {
     double_sha256_hash(|hasher| data.update_witness_hasher(hasher))
 }
 
 /// Performs a tagged hash as specified in BIP-340 for Taproot.
-/// The tag is hashed, and the result is used to prefix the data hash,
-/// creating a domain-separated hash.
 pub fn tagged_hash(tag: &str, data: &[u8]) -> Hash {
     let tag_hash = hash(tag.as_bytes());
     let tag_hash_bytes = tag_hash.as_bytes();
@@ -107,7 +111,7 @@ pub fn tagged_hash(tag: &str, data: &[u8]) -> Hash {
     })
 }
 
-/// A wrapper around a `U256` to represent a 256-bit SHA-256 hash.
+/// A wrapper around a `U256` to represent a 256-bit double-SHA256 hash digest.
 #[serde_as]
 #[derive(
     Encode, Decode, Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize,
@@ -136,7 +140,7 @@ impl Hash {
         self.0.to_big_endian()
     }
 
-    /// Creates a `Hash` from a `U256`. This is private to ensure hashes are only created via the `hash` function.
+    /// Creates a `Hash` from a `U256`.
     pub(crate) fn from_u256(u: U256) -> Self {
         Hash(u)
     }

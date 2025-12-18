@@ -21,7 +21,7 @@ struct ApiBlock {
     #[serde(with = "serde_hash_str")]
     hash: Hash,
     timestamp: i64,
-    transactions: Vec<String>,
+    transactions: Vec<ApiTransactionSummary>,
     size: usize,
     nonce: u64,
     difficulty: String,
@@ -122,10 +122,21 @@ impl From<Block> for ApiBlock {
             .map(|v| v.len())
             .unwrap_or(0);
 
-        let tx_hashes = block
+        let transactions_summary = block
             .transactions
             .iter()
-            .map(|tx| tx.txid().unwrap_or_default().to_string())
+            .map(|tx| {
+                let total_output: Amount = tx.outputs.iter().map(|o| o.value).sum();
+                ApiTransactionSummary {
+                    hash: tx.txid().unwrap_or_default(),
+                    block_height: Some(block.index),
+                    input_count: tx.inputs.len(),
+                    output_count: tx.outputs.len(),
+                    is_coinbase: tx.is_coinbase(),
+                    total_output_wisp: total_output.to_string_wisp(),
+                    timestamp: block.timestamp.timestamp(),
+                }
+            })
             .collect();
 
         let difficulty_str = if block.target.is_zero() {
@@ -148,7 +159,7 @@ impl From<Block> for ApiBlock {
             hash: block.id().unwrap_or_default(),
             timestamp: block.timestamp.timestamp(),
             difficulty: difficulty_str,
-            transactions: tx_hashes,
+            transactions: transactions_summary,
             size: block_size,
             nonce: block.nonce,
             previous_hash: block.previous_hash,
@@ -255,20 +266,32 @@ async fn get_network_vitals(
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
 
-    // TODO: This hashrate calculation is a rough estimate and can be improved.
-    let hashrate_f64 = if avg_block_time_secs > 0.0 && !current_target.is_zero() {
-        let target_log2 = current_target.bits() as f64;
-        let expected_hashes_log2 = 256.0 - target_log2;
-        if expected_hashes_log2 > 0.0 {
-            let expected_hashes = 2.0_f64.powf(expected_hashes_log2);
-            expected_hashes / avg_block_time_secs
+    // Improved hashrate calculation over the DAA window for more stability.
+    let network_hashrate_hps = if current_height >= DAA_WINDOW as u64 {
+        let window_start_index = current_height - (DAA_WINDOW as u64 - 1);
+        if let (Ok(Some(start_block)), Ok(Some(end_block))) = (
+            blockchain.get_block_by_index(window_start_index),
+            blockchain.get_block_by_index(current_height),
+        ) {
+            let time_span_secs =
+                (end_block.timestamp.timestamp() - start_block.timestamp.timestamp()).max(1);
+
+            // Sum the work done over the window. Work is MAX_TARGET / target.
+            let total_work: wisp_core::U256 = (window_start_index..=current_height)
+                .filter_map(|i| blockchain.get_block_by_index(i).ok().flatten())
+                .map(|b| wisp_core::MAX_TARGET / b.target.max(wisp_core::MIN_TARGET))
+                .fold(wisp_core::U256::zero(), |acc, work| acc + work);
+
+            // Hashrate = (Total Hashes) / (Time). Total Hashes = Total Work * 2^32 (approx)
+            // This is a more accurate estimation of hashrate.
+            let total_hashes = u256_to_f64(total_work) * 2.0_f64.powi(32);
+            total_hashes / time_span_secs as f64
         } else {
             0.0
         }
     } else {
         0.0
     };
-
     let confirmed_tx_count = blockchain
         .get_total_transaction_count_from_db()
         .unwrap_or(0);
@@ -282,11 +305,23 @@ async fn get_network_vitals(
         next_halving_in_blocks,
         mempool_size,
         current_target,
-        network_hashrate_hps: hashrate_f64,
+        network_hashrate_hps,
         total_transactions,
     };
 
     Json(vitals).into_response()
+}
+
+/// Converts a U256 into an f64.
+/// This is an approximation, as f64 has limited precision.
+fn u256_to_f64(val: wisp_core::U256) -> f64 {
+    let words = val.0;
+    let mut result = 0.0;
+    result += words[0] as f64;
+    result += (words[1] as f64) * 2.0_f64.powi(64);
+    result += (words[2] as f64) * 2.0_f64.powi(128);
+    result += (words[3] as f64) * 2.0_f64.powi(192);
+    result
 }
 
 mod serde_hash_str {

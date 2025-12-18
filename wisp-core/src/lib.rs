@@ -1,17 +1,38 @@
+///! The core logic for the Wisp blockchain.
+///!
+///! This crate contains the fundamental data structures, consensus rules,
+///! and utilities that define the Wisp protocol. It is designed to be
+///! used by node implementations, wallets, and other tools that need to
+///! interact with the Wisp network at a low level.
+
+/// Manages the blockchain data structure, including blocks, headers, and chain state.
 pub mod blockchain;
+/// Defines the currency `Amount` type and handles currency-related arithmetic.
 pub mod currency;
 
+/// Implements the transaction memory pool for unconfirmed transactions.
 pub mod mempool;
+/// Defines network messages for peer-to-peer communication.
 pub mod network;
+/// Contains proof-of-work and difficulty adjustment logic.
 pub mod pow;
+/// Provides functions for querying blockchain data.
 pub mod query;
+/// Handles blockchain reorganizations (forks).
 pub mod reorg;
+/// Implements standardized hashing utilities (double-SHA256).
 pub mod sha256;
+/// Defines cryptographic signatures and key pairs.
 pub mod signatures;
+/// Manages persistent storage of blockchain data using `sled`.
 pub mod storage;
+/// Defines the structure of transactions, inputs, and outputs.
 pub mod transactions;
+/// Contains miscellaneous utility functions, such as genesis block creation.
 pub mod utils;
+/// Implements the Unspent Transaction Output (UTXO) set.
 pub mod utxo;
+/// Contains block and transaction validation logic.
 pub mod validation;
 
 use bincode::{Decode, Encode};
@@ -27,8 +48,8 @@ construct_uint! {
 /// The current version for newly created blocks.
 pub const BLOCK_VERSION: u32 = 1;
 
-/// The initial block reward in the smallest currency unit (e.g., satoshis).
-/// 100 WISP * 10^8.
+/// The initial block reward in the smallest currency unit.
+/// This is equivalent to 100 WISP.
 pub const INITIAL_BLOCK_REWARD_SMALLEST_UNITS: u64 =
     100 * 10u64.pow(currency::Amount::DECIMAL_PLACES);
 

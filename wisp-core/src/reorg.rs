@@ -9,7 +9,10 @@ use bincode::config::standard as bincode_config;
 use log::{info, warn};
 use sled::transaction::{ConflictableTransactionError, TransactionalTree};
 
-/// A custom error type for reorganization operations, designed to work with `sled::transaction`.
+/// A custom error type for reorganization operations.
+///
+/// This is designed to work with `sled::transaction` by allowing `anyhow::Error`
+/// to be wrapped and used within a transactional context.
 #[derive(Debug)]
 pub enum ReorgError {
     Anyhow(anyhow::Error),
@@ -22,14 +25,16 @@ impl From<ReorgError> for ConflictableTransactionError<ReorgError> {
 
 impl Blockchain {
     /// Handles a blockchain reorganization. This is a complex, atomic operation that switches the main chain to a new, longer fork.
+    /// # Process
     ///
-    /// The process involves:
-    /// 1. Pre-validating the new chain segment to ensure it's viable.
-    /// 2. Atomically updating the database:
-    ///    a. Reverting blocks from the old chain back to the common ancestor.
-    ///    b. Applying blocks from the new chain segment.
-    ///    c. Updating all associated metadata (tip hash, height, supply, transaction indices).
-    /// 3. Updating the in-memory state (UTXO set, mempool) to reflect the new chain.
+    /// 1.  **Rollback:** Blocks from the current main chain are reverted down to the common ancestor.
+    /// 2.  **Atomic Update:** In a single database transaction, the old block data is removed,
+    ///     and the new chain segment is validated and applied. This includes updating all
+    ///     metadata like chain height, total supply, and transaction indices. A temporary
+    ///     UTXO set is built within the transaction to validate the new blocks.
+    /// 3.  **State Commit:** After the database transaction succeeds, the in-memory state (UTXO set,
+    ///     mempool, DAA cache) is updated to reflect the new chain. Transactions from the reverted
+    ///     blocks are re-added to the mempool if they are still valid.
     pub fn reorganize_chain(
         &mut self,
         new_chain_segment: Vec<Block>,
@@ -286,8 +291,9 @@ impl Blockchain {
         Ok(())
     }
     /// A static helper function to find a transaction output during a reorg.
-    /// It can look for the output within the new (but not yet committed) chain segment,
-    /// or fall back to searching the database via the transactional view.
+    ///
+    /// It first checks if the output was created in the new chain segment being applied.
+    /// If not, it falls back to searching the database via the transactional view (`tx_db`).
     pub fn find_output_for_reorg_static(
         tx_db: &sled::transaction::TransactionalTree,
         outpoint: &crate::transactions::OutPoint,
@@ -338,8 +344,9 @@ impl Blockchain {
     }
 
     /// Adds a transaction hash to a list stored under a given key in the database.
-    /// This is used to maintain the `history_` index for wallet transaction lookups.
-    /// This is a static method to ensure it can be safely called within a `sled::transaction` closure.
+    ///
+    /// This is a static method designed to be safely called within a `sled::transaction` closure.
+    /// It is used to maintain the `history_{pubkey}` index for wallet transaction lookups.
     pub(crate) fn add_hash_to_history_list(
         tx_db: &sled::transaction::TransactionalTree,
         key: &[u8],
@@ -365,8 +372,9 @@ impl Blockchain {
         Ok(())
     }
     /// Removes a transaction hash from a list stored under a given key in the database.
-    /// This is used to update the `history_` index when reverting blocks.
-    /// This is a static method to ensure it can be safely called within a `sled::transaction` closure.
+    ///
+    /// This is a static method designed to be safely called within a `sled::transaction` closure.
+    /// It is used to update the `history_{pubkey}` index when reverting blocks during a reorg.
     fn remove_hash_from_history_list(
         tx_db: &sled::transaction::TransactionalTree,
         key: &[u8],
@@ -392,7 +400,9 @@ impl Blockchain {
     }
 
     /// A shared helper function to apply all database changes for a single block within a transaction.
-    /// This is used by both `add_direct_extension` and `reorganize_chain` to eliminate code duplication.
+    ///
+    /// This is used by both `add_direct_extension` and `reorganize_chain` to ensure
+    /// consistent and atomic block application to the database.
     pub(crate) fn apply_block_to_db(
         tx_db: &TransactionalTree,
         block_to_apply: &Block,
@@ -484,7 +494,9 @@ impl Blockchain {
     }
 
     /// Calculates the total fees for a block within a reorg's database transaction.
-    /// This is a static method to be used inside `sled::transaction` closures.
+    ///
+    /// This static method is designed to be used inside `sled::transaction` closures,
+    /// as it operates on a transactional view of the database.
     pub(crate) fn calculate_block_fees_for_reorg(
         block: &Block,
         tx_db: &TransactionalTree,
@@ -517,8 +529,10 @@ impl Blockchain {
     }
 
     /// Calculates the fee for a single transaction within a reorg's database transaction.
-    /// It finds spent outputs first within the `new_outputs_in_block` map (for intra-block spends)
-    /// and then falls back to the database via `find_output_for_reorg_static`.
+    ///
+    /// It correctly handles intra-block spends by first checking `new_outputs_in_block`.
+    /// If the output is not found there, it falls back to the database via
+    /// `find_output_for_reorg_static`.
     pub(crate) fn calculate_transaction_fee_for_reorg(
         transaction: &crate::transactions::Transaction,
         tx_db: &TransactionalTree,

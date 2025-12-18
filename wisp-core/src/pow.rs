@@ -9,8 +9,11 @@ use sha2::Digest;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 impl Block {
-    /// A simple, single-threaded mining function for testing purposes.
-    /// It iterates through nonces until a valid proof-of-work is found.
+    /// A simple, single-threaded mining function primarily for testing.
+    ///
+    /// It iterates through a given number of nonces, attempting to find a hash
+    /// that meets the block's target.
+    /// Returns `Ok(true)` if a valid nonce is found, `Ok(false)` otherwise.
     pub fn mine_block(&mut self, steps: usize) -> Result<bool> {
         if self.id()?.matches_target(self.target) {
             println!("Block already matches target before mining.");
@@ -28,13 +31,18 @@ impl Block {
     }
 
     /// Checks if the block's hash meets the proof-of-work requirement defined by its target.
+    ///
+    /// Returns `true` if `block_hash <= block.target`, `false` otherwise.
     pub fn check_proof_of_work(&self) -> bool {
         let hash = self.id().expect("Failed to hash block for PoW check");
         hash.matches_target(self.target)
     }
 }
 
-/// A highly optimized, parallelizable mining function.
+/// An optimized, parallelizable mining function for a single thread.
+///
+/// This function is designed to be called by multiple threads in parallel, each with a
+/// different `start_nonce` and `nonce_step`.
 /// It uses the canonical `Hashable` trait to construct the block hash, ensuring consistency.
 /// To maintain performance, it uses a `hasher.clone()` optimization.
 /// It hashes all the header fields that come before the nonce once, clones the hasher state,
@@ -83,8 +91,10 @@ pub fn mine_block_parallel(
 }
 
 impl Blockchain {
-    /// Calculates the next proof-of-work target based on the time it took to mine the last `DAA_WINDOW` blocks.
-    /// This is the Difficulty Adjustment Algorithm (DAA).
+    /// Calculates the next proof-of-work target using the Difficulty Adjustment Algorithm (DAA).
+    ///
+    /// The calculation is based on the time it took to mine the last `DAA_WINDOW` blocks,
+    /// ending at the current chain tip.
     /// This function is now a wrapper around `calculate_next_target_from_height`.
     pub fn calculate_next_target(&self) -> Result<U256> {
         let current_height = self.block_height()?;
@@ -92,7 +102,6 @@ impl Blockchain {
     }
 
     /// Calculates the next proof-of-work target for a block that would be at `height + 1`.
-    /// The calculation is based on the window of blocks ending at the specified `height`.
     pub fn calculate_next_target_from_height(&self, height: u64) -> Result<U256> {
         // Special case: genesis block (height 0) or early blocks before full DAA window
         let last_block_index = height;
@@ -166,7 +175,10 @@ impl Blockchain {
         Ok(new_target)
     }
 
-    /// A helper function to determine what the target *should have been* for a given block.
+    /// Calculates the expected proof-of-work target for a given block.
+    ///
+    /// This is a helper function used during block validation to ensure a received block's
+    /// target matches what the consensus rules dictate it should be.
     pub fn calculate_expected_target_for_block(&self, block: &Block) -> Result<U256> {
         if block.index == 0 {
             return Ok(crate::MAX_TARGET);

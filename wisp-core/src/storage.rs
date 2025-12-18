@@ -16,8 +16,9 @@ use log::{debug, info, warn};
 use rayon::prelude::*;
 use sled::transaction::TransactionalTree;
 
-/// A centralized definition of all keys used in the Sled database.
-/// This prevents typos and serves as documentation for the DB schema.
+/// A centralized definition of all key prefixes and names used in the `sled` database.
+///
+/// Using this struct prevents typos and serves as a schema reference for the database layout.
 pub struct DBKeys;
 
 impl DBKeys {
@@ -60,7 +61,10 @@ impl DBKeys {
 }
 
 /// Represents the changes a single block makes to the UTXO set.
-/// This is used during the parallel phase of the UTXO rebuild.
+///
+/// This struct is used during the parallel mapping phase of the UTXO rebuild process
+/// to collect all inputs to be removed and outputs to be added for a given block,
+/// before applying them sequentially.
 struct BlockUtxoChanges {
     block_index: u64,
     inputs_to_remove: Vec<OutPoint>,
@@ -68,7 +72,10 @@ struct BlockUtxoChanges {
 }
 impl Blockchain {
     /// Loads the blockchain state from the database.
-    /// If the database is empty, it initializes it with the genesis block.
+    ///
+    /// If the database is not empty, it loads the existing state, including rebuilding the
+    /// in-memory UTXO set and mempool. If the database is empty, it initializes it with
+    /// the genesis block. It also handles recovery from a crashed reorganization.
     pub fn load_from_db(&mut self) -> Result<()> {
         if !self.db.is_empty() {
             // Check for and handle a crashed reorg before loading the rest of the state.
@@ -76,15 +83,6 @@ impl Blockchain {
                 // If recovery fails, it's safer to halt than to run with a corrupt state.
                 log::error!("CRITICAL: Failed to recover from a potential mid-reorg crash. Halting. Error: {}", e);
                 return Err(e);
-            }
-
-            //TODO: Remove this logic
-            // The PENDING_UTXO_SNAPSHOT key is now deprecated, as snapshotting is atomic with block commits.
-            // However, we keep this recovery logic for nodes upgrading from a version that might have crashed
-            // and left a pending snapshot.
-            if self.db.contains_key(DBKeys::PENDING_UTXO_SNAPSHOT)? {
-                warn!("Found a deprecated PENDING_UTXO_SNAPSHOT key. This indicates a crash may have occurred on a previous software version. The key will be removed, and a full UTXO rebuild will ensure consistency.");
-                self.db.remove(DBKeys::PENDING_UTXO_SNAPSHOT)?;
             }
 
             // Populate the tip cache
@@ -136,7 +134,9 @@ impl Blockchain {
     }
 
     /// Gets the current tip block of the main chain.
-    /// It first checks an in-memory cache and falls back to the database if necessary.
+    ///
+    /// It first checks a fast in-memory cache (`tip_cache`) and falls back to the
+    /// database if the cache is empty.
     pub fn get_tip_block(&self) -> Result<Option<Block>> {
         if let Some((_, block)) = &self.tip_cache {
             return Ok(Some(block.clone()));
@@ -185,6 +185,7 @@ impl Blockchain {
     }
 
     /// Retrieves a block from the database by its index within a sled transaction.
+    /// This is used during atomic operations like chain reorganizations.
     pub fn get_block_by_index_from_db_txn(
         &self,
         index: u64,
@@ -209,6 +210,7 @@ impl Blockchain {
     }
 
     /// A static version of `get_block_by_index_from_db_txn` for use where `&self` isn't available.
+    /// This is necessary to work around borrow-checker limitations inside transaction closures.
     pub fn get_block_by_index_from_db_txn_static(
         index: u64,
         tx_db: &TransactionalTree,
@@ -232,6 +234,10 @@ impl Blockchain {
     }
 
     /// Saves a snapshot of the current UTXO set to the database.
+    ///
+    /// The snapshot is compressed using `zstd` to save space. An accompanying checksum
+    /// is also saved to verify data integrity on load. This operation is performed
+    /// atomically using a database transaction.
     pub fn save_utxo_snapshot(&self, height: u64) -> Result<()> {
         info!("Serializing UTXO set for snapshot at height {}...", height);
         let utxo_bytes = bincode::encode_to_vec(&self.utxo_set, bincode_config())?;
@@ -262,6 +268,9 @@ impl Blockchain {
     }
 
     /// Saves a snapshot of the current mempool to the database.
+    ///
+    /// This preserves unconfirmed transactions across node restarts. If the mempool is empty,
+    /// the corresponding key is removed from the database.
     pub fn save_mempool_snapshot(&self) -> Result<()> {
         if self.mempool.is_empty() {
             // If the mempool is empty, just remove the key from the DB.
@@ -279,6 +288,10 @@ impl Blockchain {
     }
 
     /// Loads the mempool from a database snapshot and re-validates each transaction.
+    ///
+    /// Transactions from the snapshot are not trusted blindly; they are re-validated
+    /// against the current blockchain state before being added back to the in-memory
+    /// mempool. This ensures that invalid or already-spent transactions are discarded.
     fn load_mempool_snapshot(&mut self) -> Result<()> {
         if let Some(ivec) = self.db.get(DBKeys::MEMPOOL_SNAPSHOT)? {
             // Decode the full HashMap<Hash, MempoolEntry>
@@ -312,6 +325,7 @@ impl Blockchain {
     }
 
     /// Gets the height at which the last UTXO snapshot was saved.
+    /// Returns `Ok(None)` if no snapshot has been saved yet.
     fn get_last_utxo_snapshot_height(&self) -> Result<Option<u64>> {
         self.db
             .get(DBKeys::LAST_UTXO_SNAPSHOT_HEIGHT)?
@@ -323,7 +337,9 @@ impl Blockchain {
             .transpose() // Option<Result<T>> -> Result<Option<T>>
     }
     /// Gets the current height of the blockchain from the database.
-    /// It prioritizes the in-memory tip cache for immediate consistency.
+    ///
+    /// It prioritizes the in-memory `tip_cache` for immediate consistency, falling
+    /// back to a database query if the cache is empty.
     pub fn block_height(&self) -> Result<u64> {
         if let Some((_, tip_block)) = &self.tip_cache {
             return Ok(tip_block.index);
@@ -352,6 +368,9 @@ impl Blockchain {
     }
 
     /// Gets the hash of the current chain tip from the database.
+    ///
+    /// It prioritizes the in-memory `tip_cache` for immediate consistency, falling
+    /// back to a database query if the cache is empty.
     pub fn get_tip_hash(&self) -> Result<Option<Hash>> {
         // Check the in-memory cache first.
         if let Some((hash, _)) = self.tip_cache {
@@ -369,6 +388,7 @@ impl Blockchain {
     }
 
     /// Gets the total number of confirmed (non-coinbase) transactions from the database.
+    /// This provides a persistent count of all transactions in the blockchain's history.
     pub fn get_total_transaction_count_from_db(&self) -> Result<u64> {
         if let Some(ivec) = self.db.get(DBKeys::TOTAL_TX_COUNT)? {
             // Handle raw 8-byte big-endian format first.
@@ -393,6 +413,7 @@ impl Blockchain {
     }
 
     /// Gets the total circulating supply (in smallest units) from the database.
+    /// This provides a persistent record of the total amount of currency ever created.
     pub fn get_total_supply_from_db(&self) -> Result<u64> {
         if let Some(ivec) = self.db.get(DBKeys::TOTAL_SUPPLY)? {
             // Handle raw 8-byte big-endian format first.
@@ -417,6 +438,7 @@ impl Blockchain {
     }
 
     /// Sets the total circulating supply in the database.
+    /// This is typically only used during initialization or major state corrections.
     pub fn set_total_supply(&self, count: u64) -> Result<()> {
         self.db
             .insert(DBKeys::TOTAL_SUPPLY, count.to_be_bytes().to_vec())?;
@@ -424,6 +446,7 @@ impl Blockchain {
     }
 
     /// Gets a transaction hash by its chronological order index.
+    /// This allows iterating through all transactions in the order they were confirmed.
     pub fn get_transaction_hash_by_chronological_index(&self, index: u64) -> Result<Option<Hash>> {
         self.db
             .get(DBKeys::tx_by_order(index))?
@@ -437,6 +460,8 @@ impl Blockchain {
     }
 
     /// Gets all transaction hashes associated with a public key from the `history_` index.
+    /// This provides a fast way to retrieve a wallet's transaction history without
+    /// scanning the entire blockchain.
     pub fn get_transaction_hashes_by_pubkey_from_db(
         &self,
         pubkey: &PublicKey,
@@ -454,8 +479,12 @@ impl Blockchain {
         Ok(result)
     }
 
-    /// Reconstructs the in-memory UTXO set by iterating through all blocks in the database from genesis.
-    /// This is a crucial step on node startup to ensure the in-memory state is consistent with the on-disk state.
+    /// Reconstructs the in-memory UTXO set.
+    ///
+    /// This is a crucial step on node startup to ensure the in-memory state is consistent
+    /// with the on-disk state. It first attempts to load from a compressed snapshot for speed.
+    /// If the snapshot is invalid or missing, it rebuilds the UTXO set by processing all
+    /// blocks from the last valid state (or genesis). The process is parallelized for performance.
     pub fn rebuild_utxos(&mut self) -> Result<()> {
         // Try to load from a snapshot first.
         let (mut new_utxos, start_height) = if let (Some(snapshot_ivec), Some(checksum_ivec)) = (
@@ -599,7 +628,11 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Checks for and attempts to recover from a failed reorganization that was interrupted.
+    /// Checks for and attempts to recover from an interrupted reorganization.
+    ///
+    /// If the node crashed mid-reorg, special "pending reorg" keys will exist in the
+    /// database. This function detects these keys, reconstructs the state of the intended
+    /// reorg, and re-initiates it to bring the node back to a consistent state.
     fn recover_from_crashed_reorg(&mut self) -> Result<()> {
         let pending_tip_ivec = self.db.get(DBKeys::PENDING_REORG_TIP)?;
         let pending_ancestor_ivec = self.db.get(DBKeys::PENDING_REORG_ANCESTOR)?;
