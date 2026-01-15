@@ -83,7 +83,7 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
     let send_options = vec![
         "Enter specific amount",
         "Sweep all funds (Send Max)",
-        "Send Dust (1 unit)",
+        "Send Dust (Min allowed)",
     ];
     let send_option_selection = Select::new("Amount to send:", send_options).prompt()?;
 
@@ -97,7 +97,10 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
             (false, amount)
         }
         "Sweep all funds (Send Max)" => (true, Amount::zero()),
-        "Send Dust (1 unit)" => (false, Amount::from_smallest_unit(1)),
+        "Send Dust (Min allowed)" => (
+            false,
+            Amount::from_smallest_unit(wisp_core::MIN_OUTPUT_VALUE),
+        ),
         _ => return Err(anyhow!("Invalid selection")),
     };
 

@@ -91,3 +91,7 @@ pub const MAX_MESSAGE_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
 /// The maximum allowed timestamp difference in seconds for a block from the future.
 pub const MAX_BLOCK_FUTURE_TIMESTAMP: u64 = 180; // 3 minutes in seconds
+
+/// The minimum allowed value for a transaction output (dust limit).
+/// Any transaction output below this value will be rejected to prevent UTXO set bloating.
+pub const MIN_OUTPUT_VALUE: u64 = 546;

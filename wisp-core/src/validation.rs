@@ -344,6 +344,13 @@ impl Block {
             }
 
             for output in &transaction.outputs {
+                if output.value.as_smallest_unit() < crate::MIN_OUTPUT_VALUE {
+                    return Err(anyhow!(
+                        "Transaction output value {} is below the dust limit of {}",
+                        output.value,
+                        crate::MIN_OUTPUT_VALUE
+                    ));
+                }
                 output_value = output_value
                     .checked_add(output.value)
                     .context("Output value overflow in block validation")?;

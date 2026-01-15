@@ -59,6 +59,13 @@ impl Blockchain {
 
         let mut output_sum = Amount::zero();
         for output in &transaction.outputs {
+            if output.value.as_smallest_unit() < crate::MIN_OUTPUT_VALUE {
+                return Err(anyhow!(
+                    "Transaction output value {} is below the dust limit of {}",
+                    output.value,
+                    crate::MIN_OUTPUT_VALUE
+                ));
+            }
             output_sum = output_sum
                 .checked_add(output.value)
                 .context("Output sum overflow")?;
