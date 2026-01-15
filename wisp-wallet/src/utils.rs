@@ -83,6 +83,5 @@ pub fn display_seed_phrase(phrase: &str) {
             }
         }
         println!("{}", line);
-        let max_len = words.iter().map(|w| w.len()).max().unwrap_or(0);
     }
 }

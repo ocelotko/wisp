@@ -12,7 +12,7 @@ use crate::{
 
 use anyhow::{anyhow, Context, Result};
 use bincode::config::standard as bincode_config;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use sled::transaction::TransactionalTree;
 
@@ -93,6 +93,15 @@ impl Blockchain {
 
             self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
             self.total_tx_count = self.get_total_transaction_count_from_db()?;
+
+            // Verify supply integrity immediately after loading.
+            if let Err(e) = self.verify_supply_integrity() {
+                error!(
+                    "CRITICAL: Database corrupted. Supply check failed on load: {}",
+                    e
+                );
+                return Err(e);
+            }
 
             // If DB is not empty, rebuild the in-memory UTXO set, starting from the last snapshot if available.
             self.rebuild_utxos()?;
@@ -688,6 +697,34 @@ impl Blockchain {
             self.reorganize_chain(new_chain_segment, common_ancestor_index)?;
 
             info!("✅ Successfully recovered from previous reorg attempt.");
+        }
+
+        Ok(())
+    }
+
+    /// Recalculates the total supply based on the current chain height and updates the database.
+    /// This fixes the database corruption caused by incorrectly adding fees to the total supply.
+    pub fn migrate_total_supply(&mut self) -> Result<()> {
+        if self.db.is_empty() {
+            info!("Database is empty, skipping migration.");
+            return Ok(());
+        }
+
+        let height = self.block_height()?;
+        let expected_supply = crate::utils::calculate_expected_supply(height);
+        let current_db_supply = self.get_total_supply_from_db()?;
+
+        if current_db_supply != expected_supply.as_smallest_unit() {
+            warn!(
+                "Migrating Total Supply: Current DB value ({}) does not match expected value ({}). Updating...",
+                current_db_supply, expected_supply
+            );
+            self.set_total_supply(expected_supply.as_smallest_unit())?;
+            // Update in-memory state as well to ensure consistency immediately.
+            self.total_supply = expected_supply;
+            info!("Total Supply migration completed successfully.");
+        } else {
+            info!("Total Supply is already correct. No migration needed.");
         }
 
         Ok(())

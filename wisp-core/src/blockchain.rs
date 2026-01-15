@@ -662,6 +662,16 @@ impl Blockchain {
         // 4. Update the in-memory tip cache. This is the key fix for the template generation bug.
         self.tip_cache = Some((new_block_hash, new_block.clone()));
 
+        // 5. Sanity Check: Verify that the total supply is within expected bounds.
+        if let Err(e) = self.verify_supply_integrity() {
+            error!(
+                "CRITICAL: Supply integrity check failed after adding block {}: {}",
+                new_block_hash, e
+            );
+            // We return an error here to halt operations, as this indicates a serious consensus bug.
+            return Err(e);
+        }
+
         // This log provides clear, consistent confirmation when a block is added.
         info!(
             "Block {} (index {}) accepted and added to chain. New height: {}",
@@ -794,6 +804,24 @@ impl Blockchain {
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// Verifies that the total supply tracked by the blockchain matches the expected
+    /// theoretical supply based on the block height.
+    pub fn verify_supply_integrity(&self) -> Result<()> {
+        let height = self.block_height()?;
+        let expected_supply = crate::utils::calculate_expected_supply(height);
+
+        if self.total_supply > expected_supply {
+            return Err(anyhow!(
+                "Total supply ({}) exceeds expected maximum ({}) at height {}. Inflation bug detected.",
+                self.total_supply,
+                expected_supply,
+                height
+            ));
+        }
+
         Ok(())
     }
 

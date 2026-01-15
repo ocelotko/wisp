@@ -78,6 +78,26 @@ pub fn calculate_block_reward(block_height: u64) -> Amount {
     }
 }
 
+/// Calculates the expected total supply at a given block height.
+///
+/// This sums up all block rewards from height 0 to `height`.
+pub fn calculate_expected_supply(height: u64) -> Amount {
+    let mut total_supply = 0u64;
+    let mut current_reward = crate::INITIAL_BLOCK_REWARD_SMALLEST_UNITS;
+    let mut remaining_blocks = height + 1; // Include genesis (height 0)
+
+    while remaining_blocks > 0 && current_reward > 0 {
+        let blocks_in_this_era = std::cmp::min(remaining_blocks, crate::HALVING_INTERVAL);
+        let era_supply = current_reward.saturating_mul(blocks_in_this_era);
+        total_supply = total_supply.saturating_add(era_supply);
+
+        remaining_blocks -= blocks_in_this_era;
+        current_reward /= 2;
+    }
+
+    Amount::from_smallest_unit(total_supply)
+}
+
 /// Constructs the genesis block of the blockchain.
 ///
 /// This block is hardcoded with a specific message, timestamp, and other parameters.

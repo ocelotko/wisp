@@ -2,7 +2,7 @@ use crate::utils::{clear_terminal, display_heading_with_wallet, pause, prompt_pa
 use crate::wallet::core::{Core, FeeType};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use inquire::{Select, Text};
+use inquire::{Confirm, Select, Text};
 use log::error;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -71,11 +71,35 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
         .prompt()
         .context("Failed to read recipient's public key")?;
 
-    let amount_str = Text::new("Enter amount to send (e.g., 1 or 0.5 Wisp):")
-        .prompt()
-        .context("Failed to read amount")?;
-    let amount_obj = Amount::from_string_wisp(&amount_str)
-        .context("Invalid amount entered. Please use a number, e.g., 1.23")?;
+    if !Confirm::new("Is this address correct?")
+        .with_default(true)
+        .prompt()?
+    {
+        println!("Operation cancelled.");
+        pause();
+        return Ok(());
+    }
+
+    let send_options = vec![
+        "Enter specific amount",
+        "Sweep all funds (Send Max)",
+        "Send Dust (1 unit)",
+    ];
+    let send_option_selection = Select::new("Amount to send:", send_options).prompt()?;
+
+    let (is_send_max, amount_obj) = match send_option_selection {
+        "Enter specific amount" => {
+            let amount_str = Text::new("Enter amount to send (e.g., 1 or 0.5 Wisp):")
+                .prompt()
+                .context("Failed to read amount")?;
+            let amount = Amount::from_string_wisp(&amount_str)
+                .context("Invalid amount entered. Please use a number, e.g., 1.23")?;
+            (false, amount)
+        }
+        "Sweep all funds (Send Max)" => (true, Amount::zero()),
+        "Send Dust (1 unit)" => (false, Amount::from_smallest_unit(1)),
+        _ => return Err(anyhow!("Invalid selection")),
+    };
 
     let fee_type: FeeType =
         Select::new("Select fee type:", vec![FeeType::Fixed, FeeType::Percent]).prompt()?;
@@ -139,7 +163,7 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
 
     match core
         .send_funds(
-            false, //TODO is_send_max is false for now, as the UI doesn't support it yet.
+            is_send_max,
             recipient_public_key_str,
             amount_obj,
             fee_type,

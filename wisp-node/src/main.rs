@@ -32,6 +32,10 @@ struct Args {
     #[argh(positional)]
     /// addresses of initial nodes
     nodes: Vec<String>,
+
+    #[argh(switch)]
+    /// perform database migration to fix total supply
+    migrate_db: bool,
 }
 
 lazy_static! {
@@ -45,12 +49,17 @@ lazy_static! {
 }
 
 /// The main function that orchestrates the node's lifecycle.
-async fn run_node(port: u16, db_path: String, nodes: Vec<String>) -> Result<()> {
+async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bool) -> Result<()> {
     // Open or create the database for persistent storage.
     let db =
         sled::open(&db_path).with_context(|| format!("Failed to open database at {}", db_path))?;
 
     let mut blockchain_instance = Blockchain::new(db);
+
+    if migrate_db {
+        info!("Starting database migration...");
+        blockchain_instance.migrate_total_supply()?;
+    }
 
     // Load the blockchain state from the database *before* any network activity.
     // This ensures we know our own state before talking to peers.
@@ -186,5 +195,5 @@ async fn main() -> Result<()> {
 
     let args: Args = argh::from_env();
 
-    run_node(args.port, args.db_path, args.nodes).await
+    run_node(args.port, args.db_path, args.nodes, args.migrate_db).await
 }

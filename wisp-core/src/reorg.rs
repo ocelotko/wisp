@@ -75,13 +75,12 @@ impl Blockchain {
                         // Tip-first rollback order ensures dependencies are undone correctly.
                         // For each reverted block, remove it and its associated data from the DB.
                         let hash = block_to_revert.id().map_err(ReorgError::Anyhow)?;
-                        let fees = Self::calculate_block_fees_for_reorg(block_to_revert, tx_db)?
-                            .as_smallest_unit();
 
-                        // Adjust total supply by subtracting the coinbase reward and the fees for this reverted block.
+                        // Adjust total supply by subtracting the coinbase reward.
+                        // Fees are redistribution, not new supply, so they don't affect total supply.
                         let block_reward =
                             crate::utils::calculate_block_reward(block_to_revert.index);
-                        new_supply = new_supply.saturating_sub(block_reward.as_smallest_unit() + fees);
+                        new_supply = new_supply.saturating_sub(block_reward.as_smallest_unit());
 
                         tx_db.remove(DBKeys::block(&hash))?;
                         tx_db.remove(DBKeys::index_to_hash(block_to_revert.index))?;
@@ -439,8 +438,8 @@ impl Blockchain {
 
         // Update total supply with this block's reward and fees.
         let block_reward = crate::utils::calculate_block_reward(block_to_apply.index);
-        let fees = Self::calculate_block_fees_for_reorg(block_to_apply, tx_db)?.as_smallest_unit();
-        supply = supply.saturating_add(block_reward.as_smallest_unit() + fees);
+        // Fees are redistribution, not new supply.
+        supply = supply.saturating_add(block_reward.as_smallest_unit());
 
         // Update total supply and tx count for this block application within the transaction
         tx_db.insert(DBKeys::TOTAL_SUPPLY, supply.to_be_bytes().to_vec())?;
