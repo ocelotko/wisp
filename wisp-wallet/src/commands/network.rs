@@ -85,11 +85,11 @@ async fn get_latest_block_prompt(core: &Core) -> Result<(), anyhow::Error> {
             println!("-------------------------");
         }
         Ok(None) => {
-            println!("⚠️ Could not retrieve the latest block from the node.");
+            println!("Could not retrieve the latest block from the node.");
         }
         Err(e) => {
             error!("Failed to get latest block: {}", e);
-            println!("❌ Failed to get latest block: {}", e);
+            println!("Failed to get latest block: {}", e);
         }
     }
 
@@ -147,7 +147,7 @@ async fn get_block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
         }
         Err(e) => {
             error!("Failed to get block info: {}", e);
-            println!("❌ Failed to get block information: {}", e);
+            println!("Failed to get block information: {}", e);
         }
     }
 
@@ -170,11 +170,11 @@ async fn connect_node(core: &Core) -> Result<(), anyhow::Error> {
     println!("Attempting to connect to default node...");
     match core.get_connected_stream().await {
         Ok(_) => {
-            println!("✅ Successfully connected to the default node.");
+            println!("Successfully connected to the default node.");
         }
         Err(e) => {
             error!("Failed to connect to node: {}", e);
-            println!("❌ Failed to connect to node: {}", e);
+            println!("Failed to connect to node: {}", e);
         }
     }
     pause();

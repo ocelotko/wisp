@@ -21,14 +21,14 @@ use serde_json;
 use crate::wallet::constants::*;
 use wisp_core::signatures::PublicKey;
 
-/// Represents a saved wallet structure.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SavedWallet {
     pub name: String,
     pub encrypted_private_key: String,
     pub public_key: PublicKey,
     pub salt: Vec<u8>,
-    // pub encrypted_seed_phrase: String, // Kept commented as per your original
+    #[serde(default)]
+    pub encrypted_seed_phrase: Option<String>,
 }
 
 impl SavedWallet {
@@ -38,7 +38,6 @@ impl SavedWallet {
         path
     }
 
-    /// Save the wallet to a password-encrypted file.
     pub fn save_to_file(&self, password: &str) -> Result<()> {
         let path = Self::wallet_file_path(&self.name);
         log::info!("Saving wallet '{}' to path: {:?}", self.name, path);
@@ -111,7 +110,6 @@ impl SavedWallet {
         }
     }
 
-    /// Load and decrypt the wallet from a file.
     pub fn load_from_file(name: &str, password: &str) -> Result<Self> {
         let path = Self::wallet_file_path(name);
         log::info!("Attempting to load wallet '{}' from path: {:?}", name, path);
@@ -126,7 +124,7 @@ impl SavedWallet {
         file.read_exact(&mut salt_bytes)?;
         log::debug!("Loaded salt (hex): {}", hex::encode(&salt_bytes));
 
-        let key = Self::derive_key(password, &salt_bytes)?; // This is the call
+        let key = Self::derive_key(password, &salt_bytes)?;
         log::debug!(
             "Derived key for decryption (hex prefix): {}",
             hex::encode(&key[..8])
@@ -139,18 +137,17 @@ impl SavedWallet {
 
         let decrypted_wallet = cipher
             .decrypt(&nonce, ciphertext.as_slice())
-            .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?; // <-- This is the one
+            .map_err(|e| anyhow::anyhow!("Decryption failed: {:?}", e))?;
         log::info!("Wallet '{}' decrypted successfully.", name);
 
         let wallet: SavedWallet = serde_json::from_slice(&decrypted_wallet)?;
         Ok(wallet)
     }
 
-    // Helper function to derive key using Argon2
     pub fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<Vec<u8>> {
         let params = ParamsBuilder::new()
             .t_cost(1)
-            .m_cost(65536) // Memory cost in KiB (64 MiB) - Increases resistance to brute-force attacks.
+            .m_cost(65536)
             .p_cost(1)
             .build()
             .map_err(|_| anyhow::anyhow!("Failed to build Argon2 parameters"))?;

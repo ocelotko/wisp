@@ -91,7 +91,24 @@ pub async fn run_wallet_ui(core: Arc<Core>, config_path: PathBuf) -> Result<(), 
                     }
                 }
             }
-            // Ok("Recover wallet from seed") => recover_wallet(), // Not implemented
+            Ok("Recover wallet from seed") => {
+                info!("Attempting to recover wallet from seed from main menu.");
+                if let Err(e) = self::wallet_ops::prompt_recover_wallet_with_seed(
+                    Arc::clone(&core),
+                    &config_path,
+                )
+                .await
+                {
+                    error!("Failed to recover wallet from seed: {}", e);
+                    println!("\nFailed to recover wallet: {}", e);
+                    pause();
+                } else {
+                    info!("Wallet recovered successfully. Proceeding to wallet management.");
+                    if let Err(e) = wallet_management(Arc::clone(&core), &config_path).await {
+                        error!("Wallet management exited with error: {}", e);
+                    }
+                }
+            }
             Ok("Exit") => exit_program(),
             Err(e) => {
                 error!("Main menu selection error: {}", e);
@@ -128,7 +145,6 @@ async fn wallet_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()>
         let wallet_menu_selection = Select::new("Wallet Management", wallet_options).prompt()?; // Corrected: Added ? to unwrap the Result<String, Error>
 
         match wallet_menu_selection.as_ref() {
-            // Corrected match statement: use .as_ref()
             "Funds management" => {
                 if let Err(e) = funds_management(Arc::clone(&core), config_path).await {
                     error!("Funds management failed: {}", e);
@@ -168,5 +184,3 @@ async fn wallet_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()>
         }
     }
 }
-
-// fn recover_wallet() { /* Not implemented */ } // Kept commented as per your original

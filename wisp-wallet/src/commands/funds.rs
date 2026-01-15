@@ -22,7 +22,7 @@ pub async fn funds_management(core: Arc<Core>, config_path: &PathBuf) -> Result<
                 .map(|w| w.name)
                 .as_deref(),
             balance_value.as_ref().ok().copied(),
-        ); // Pass name here
+        );
 
         let send_receive_options = vec![
             "Send funds",
@@ -33,7 +33,6 @@ pub async fn funds_management(core: Arc<Core>, config_path: &PathBuf) -> Result<
         let send_receive_menu_selection =
             Select::new("Send and Receive Funds", send_receive_options).prompt()?;
 
-        // Corrected match statement: use .as_ref() to get &str from String
         match send_receive_menu_selection.as_ref() {
             "Send funds" => {
                 send_funds_prompt(Arc::clone(&core), config_path).await?;
@@ -48,7 +47,6 @@ pub async fn funds_management(core: Arc<Core>, config_path: &PathBuf) -> Result<
             }
             "Back to wallet menu" => return Ok(()),
             _ => {
-                // This will catch any unexpected selections or errors from prompt()
                 error!("Send/Receive menu selection error: Invalid selection or prompt error.");
                 println!("Invalid selection or prompt error.");
                 pause();
@@ -73,10 +71,10 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
         .prompt()
         .context("Failed to read recipient's public key")?;
 
-    let amount_str = Text::new("Enter amount to send (e.g., 1 or 0.5 Wisp):") // Changed prompt for Wisp units
+    let amount_str = Text::new("Enter amount to send (e.g., 1 or 0.5 Wisp):")
         .prompt()
         .context("Failed to read amount")?;
-    let amount_obj = Amount::from_string_wisp(&amount_str) // Use from_string_wisp
+    let amount_obj = Amount::from_string_wisp(&amount_str)
         .context("Invalid amount entered. Please use a number, e.g., 1.23")?;
 
     let fee_type: FeeType =
@@ -84,7 +82,7 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
 
     let fee_value_str_input = Text::new(
         format!(
-            "Enter fee value (for {}: e.g., 0.01 for Fixed Wisp; 0.0-100.0 for Percentage):", // Changed prompt for fee
+            "Enter fee value (for {}: e.g., 0.01 for Fixed Wisp; 0.0-100.0 for Percentage):",
             fee_type
         )
         .as_str(),
@@ -101,7 +99,6 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
             fee_value_for_core = fixed_fee_amount.as_smallest_unit();
         }
         FeeType::Percent => {
-            // Avoid using f64 for financial calculations to prevent precision loss.
             let parts: Vec<&str> = fee_value_str_input.split('.').collect();
             let integer_part_str = parts[0];
             let fractional_part_str = if parts.len() > 1 { parts[1] } else { "" };
@@ -126,18 +123,15 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
                     .context("Invalid fractional part of percentage")?
             };
 
-            // Scale fractional part to basis points. E.g. "5" -> 50, "55" -> 55
             if fractional_part_str.len() == 1 {
                 fractional_part *= 10;
             }
 
-            // Calculate basis points (1% = 100 basis points).
             fee_value_for_core = integer_part
                 .saturating_mul(100)
                 .saturating_add(fractional_part);
 
             if fee_value_for_core > 10_000 {
-                // Cap at 100%
                 fee_value_for_core = 10_000;
             }
         }
@@ -147,17 +141,17 @@ async fn send_funds_prompt(core: Arc<Core>, _config_path: &PathBuf) -> Result<()
         .send_funds(
             false, //TODO is_send_max is false for now, as the UI doesn't support it yet.
             recipient_public_key_str,
-            amount_obj, // Pass the Amount object directly
+            amount_obj,
             fee_type,
-            fee_value_for_core, // Pass the u64 fee value (smallest units or basis points)
+            fee_value_for_core,
             &prompt_password("Enter your wallet password:", false)?,
             _config_path,
         )
         .await
     {
-        Ok(_) => println!("✅ Funds sent successfully!"),
+        Ok(_) => println!("Funds sent successfully!"),
         Err(e) => {
-            println!("\n❌ Error sending funds: {}", e);
+            println!("\nError sending funds: {}", e);
         }
     };
 
@@ -182,18 +176,18 @@ async fn receive_funds(core: &Core) -> Result<(), anyhow::Error> {
             println!("\nYour public key (share this to receive funds):");
             println!("{}", wallet.public_key.fingerprint());
         }
-        Err(_) => println!("⚠️ No wallet loaded."),
+        Err(_) => println!("No wallet loaded."),
     }
     pause();
     Ok(())
 }
 
 struct TxDisplayItem {
-    timestamp: DateTime<Utc>,  // For sorting
-    display_date_time: String, // Full date and time
-    tx_type: String,           // "Incoming", "Outgoing", "Sent", "Received", "Coinbase Reward"
+    timestamp: DateTime<Utc>,
+    display_date_time: String,
+    tx_type: String,
     amount_str: String,
-    counterparty_info: String, // Address or "Coinbase Reward" or "multiple recipients"
+    counterparty_info: String,
     tx_hash: wisp_core::sha256::Hash,
     is_pending: bool,
 }
@@ -238,14 +232,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         let mut value_from_us = Amount::zero();
         let mut value_to_us = Amount::zero();
 
-        // Calculate value from us (inputs we owned)
-        // To do this, we need to find the source transaction for each input.
         for input in &tx.inputs {
-            // We need to look up the output this input is spending.
-            // The most reliable way is to check all transactions, but this can be slow.
-            // A better approach is to rely on the UTXO set at the time of the transaction,
-            // but for history, we must reconstruct.
-            // Let's find the source transaction in our `all_txs` map.
             if let Some(source_tx) = all_txs.get(&input.outpoint.txid) {
                 if let Some(spent_output) = source_tx
                     .transaction
@@ -261,7 +248,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             }
         }
 
-        // Calculate value to us (outputs we received)
         for output in &tx.outputs {
             if output.pubkey == wallet_public_key {
                 value_to_us = value_to_us
@@ -270,7 +256,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             }
         }
 
-        // If we didn't send or receive anything, it's not our transaction.
         if value_from_us == Amount::zero() && value_to_us == Amount::zero() {
             continue;
         }
@@ -285,8 +270,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 "Coinbase Reward".to_string(),
             )
         } else if net_effect < 0 {
-            // Outgoing transaction
-            // We sent more than we received (net outgoing)
             let recipients: HashSet<_> = tx
                 .outputs
                 .iter()
@@ -294,7 +277,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .map(|o| o.pubkey.fingerprint())
                 .collect();
 
-            // This is the amount sent to others, NOT including the fee.
             let amount_sent_to_others: Amount = tx
                 .outputs
                 .iter()
@@ -302,14 +284,13 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 .map(|o| o.value)
                 .sum();
 
-            // The fee is the total value of the inputs we owned minus the total value of all outputs.
             let total_output_value = amount_sent_to_others
                 .checked_add(value_to_us)
                 .context("Total output value overflowed")?;
             let fee = value_from_us.checked_sub(total_output_value);
 
             let recipient_info = if recipients.is_empty() {
-                "Self (fee only)".to_string() // Sent to ourself
+                "Self (fee only)".to_string()
             } else if recipients.len() == 1 {
                 recipients.iter().next().unwrap().to_string()
             } else {
@@ -329,8 +310,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 recipient_info,
             )
         } else {
-            // Incoming or self-transfer
-            // We received more than we sent (net incoming)
             let amount_received = Amount::from_smallest_unit(net_effect.abs() as u64);
             let senders: HashSet<_> = tx
                 .inputs
@@ -340,9 +319,9 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                     source_tx_info
                         .transaction
                         .outputs
-                        .get(i.outpoint.vout as usize) // `i` is now in scope here
+                        .get(i.outpoint.vout as usize)
                         .into_iter()
-                        .filter(|o| o.pubkey != wallet_public_key) // Don't list ourselves as sender
+                        .filter(|o| o.pubkey != wallet_public_key)
                         .map(|o| o.pubkey.fingerprint())
                 })
                 .collect();
@@ -372,14 +351,13 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         });
     }
 
-    // Sort transactions: pending first, then by timestamp (newest first)
     display_items.sort_by(|a, b| {
         if a.is_pending && !b.is_pending {
-            std::cmp::Ordering::Less // Pending comes before confirmed
+            std::cmp::Ordering::Less
         } else if !a.is_pending && b.is_pending {
-            std::cmp::Ordering::Greater // Confirmed comes after pending
+            std::cmp::Ordering::Greater
         } else {
-            b.timestamp.cmp(&a.timestamp) // Sort by timestamp descending (newest first)
+            b.timestamp.cmp(&a.timestamp)
         }
     });
 
@@ -406,18 +384,16 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         println!(
             "{:<20} {:<10} {:<10} {:>25}  {:<30}",
             "Date/Time", "Status", "Type", "Amount", "Counterparty/Memo"
-        ); // Adjusted header width
-        println!("{}", "-".repeat(105)); // Adjust length based on column widths
+        );
+        println!("{}", "-".repeat(105));
 
         let start_index = current_page * TRANSACTIONS_PER_PAGE;
         let end_index = (start_index + TRANSACTIONS_PER_PAGE).min(display_items.len());
 
         if display_items.is_empty() {
-            // If no items at all
             println!("\nNo transactions found for this wallet.");
         } else if start_index >= display_items.len() && !display_items.is_empty() {
-            // Added !display_items.is_empty() for safety
-            println!("\nNo more transactions on this page."); // Fallback, should generally not be reached with correct paging
+            println!("\nNo more transactions on this page.");
         }
 
         for tx_item in display_items[start_index..end_index].iter() {
@@ -427,17 +403,16 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                 "Confirmed"
             };
             let color_code = if tx_item.is_pending {
-                "\x1B[33m" // Yellow for pending (Outgoing/Incoming Unconfirmed)
+                "\x1B[33m"
             } else if tx_item.amount_str.starts_with('+') {
-                "\x1B[32m" // Green for positive (Received/Coinbase)
+                "\x1B[32m"
             } else {
-                "\x1B[31m" // Red for negative (Sent)
+                "\x1B[31m"
             };
             let reset_color = "\x1B[0m";
 
-            // Print the main transaction line with colors
             println!(
-                "{}{:<20} {:<10} {:<10} {:>25}  {:<30}{}", // Adjusted widths
+                "{}{:<20} {:<10} {:<10} {:>25}  {:<30}{}",
                 color_code,
                 tx_item.display_date_time,
                 status_str,
@@ -459,7 +434,6 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             page_options.push("Previous Page");
         }
         if current_page < total_pages.saturating_sub(1) {
-            // Use saturating_sub to prevent underflow if total_pages is 0 or 1
             page_options.push("Next Page");
         }
         page_options.push("Back to Wallet Menu");
@@ -475,7 +449,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             "Next Page" => current_page += 1,
             "Previous Page" => current_page = current_page.saturating_sub(1),
             "Back to Wallet Menu" => return Ok(()),
-            _ => {} // Should not happen
+            _ => {}
         }
     }
 }

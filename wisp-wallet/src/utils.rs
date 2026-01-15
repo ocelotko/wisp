@@ -49,7 +49,6 @@ pub fn prompt_password(prompt: &str, require_confirmation: bool) -> Result<Strin
 }
 
 pub fn pause() {
-    // A simple and robust way to pause and wait for the user to press Enter.
     print!("\nPress Enter to continue...");
     io::stdout().flush().unwrap();
     let _ = io::stdin().read_line(&mut String::new());
@@ -58,4 +57,32 @@ pub fn pause() {
 pub fn exit_program() -> ! {
     println!("\nExiting Wisp Wallet. Goodbye!");
     std::process::exit(0);
+}
+
+pub fn display_seed_phrase(phrase: &str) {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    let word_count = words.len();
+
+    if ![12, 24].contains(&word_count) {
+        println!("{}", phrase);
+        return;
+    }
+
+    let (num_cols, num_rows) = if word_count == 12 { (3, 4) } else { (4, 6) };
+
+    let max_len = words.iter().map(|w| w.len()).max().unwrap_or(0);
+
+    for r in 0..num_rows {
+        let mut line = String::new();
+        for c in 0..num_cols {
+            let index = c * num_rows + r;
+            if index < word_count {
+                let word = words[index];
+                let entry = format!("{:>2}. {}", index + 1, word);
+                line.push_str(&format!("{:<width$}", entry, width = max_len + 8));
+            }
+        }
+        println!("{}", line);
+        let max_len = words.iter().map(|w| w.len()).max().unwrap_or(0);
+    }
 }

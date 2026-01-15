@@ -1,4 +1,6 @@
-use crate::utils::{clear_terminal, display_heading_with_wallet, pause, prompt_password};
+use crate::utils::{
+    clear_terminal, display_heading_with_wallet, display_seed_phrase, pause, prompt_password,
+};
 use crate::wallet::core::Core;
 use anyhow::{Context, Result};
 use inquire::Select;
@@ -24,6 +26,7 @@ pub async fn security_and_backup(
         let security_options = vec![
             "Backup wallet",
             "Export private key",
+            "View seed phrase",
             "Change wallet password",
             "Back to wallet menu",
         ];
@@ -40,6 +43,15 @@ pub async fn security_and_backup(
                     export_private_key_command(Arc::clone(&core), config_path.clone()).await
                 {
                     error!("Export private key failed: {}", e);
+                    println!("\nError: {}", e);
+                    pause();
+                }
+            }
+            "View seed phrase" => {
+                if let Err(e) =
+                    view_seed_phrase_command(Arc::clone(&core), config_path.clone()).await
+                {
+                    error!("View seed phrase failed: {}", e);
                     println!("\nError: {}", e);
                     pause();
                 }
@@ -91,9 +103,35 @@ async fn export_private_key_command(core: Arc<Core>, _config_path: PathBuf) -> R
             println!("\nCopy this private key carefully. Do not share it!");
         }
         Err(e) => {
-            println!("⚠️ Failed to decrypt private key: {}", e);
+            println!("Failed to decrypt private key: {}", e);
             return Err(e);
         }
+    }
+    pause();
+    Ok(())
+}
+
+async fn view_seed_phrase_command(core: Arc<Core>, _config_path: PathBuf) -> Result<()> {
+    clear_terminal();
+    let current_wallet_name = core.get_current_wallet().await?.name;
+    let balance_value = core.get_total_balance().await;
+    display_heading_with_wallet(Some(&current_wallet_name), balance_value.ok());
+    println!("--- View Seed Phrase ---");
+    println!("WARNING: Your seed phrase grants full control over your funds.");
+    println!("Ensure no one is looking at your screen.");
+
+    let password = prompt_password(
+        &format!("Enter password for wallet '{}':", current_wallet_name),
+        true,
+    )?;
+
+    match core.export_seed_phrase(&password).await {
+        Ok(phrase) => {
+            println!("\n--- YOUR SEED PHRASE ---");
+            display_seed_phrase(&phrase);
+            println!("------------------------");
+        }
+        Err(e) => println!("Warning: {}", e),
     }
     pause();
     Ok(())

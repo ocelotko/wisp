@@ -78,11 +78,8 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
             println!("\n--- Balance & State ---");
             let transactions_guard = core.transactions.read().await;
             let utxos_guard = core.utxos.read().await;
-
-            // Confirmed balance is the sum of all UTXOs currently in the wallet's confirmed set.
             let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
 
-            // Pending balance calculates the net change from all pending transactions.
             let mut pending_net_change: i128 = 0;
             let mut pending_tx_count = 0;
 
@@ -91,15 +88,12 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
                     pending_tx_count += 1;
                     let tx = &tx_info.transaction;
 
-                    // Subtract the value of inputs we owned that are being spent.
                     for input in &tx_info.transaction.inputs {
-                        // An input is ours if it existed in our UTXO set before this tx.
                         if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
                             pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
                         }
                     }
 
-                    // Add the value of new outputs being sent to us (including our own change).
                     for output in &tx.outputs {
                         if output.pubkey == wallet.public_key {
                             pending_net_change += output.value.as_smallest_unit() as i128;
@@ -128,7 +122,7 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
             println!("Pending Txs:         {}", pending_tx_count);
         }
         Err(_) => {
-            println!("⚠️ No wallet loaded.");
+            println!("No wallet loaded.");
             println!("Node information is unavailable until a wallet is loaded.");
         }
     }
@@ -150,7 +144,7 @@ async fn delete_current_wallet_prompt(
             wallet.name
         }
         Err(e) => {
-            println!("⚠️ No wallet is currently loaded. Cannot delete.");
+            println!("No wallet is currently loaded. Cannot delete.");
             error!("Attempted to delete wallet when none loaded: {}", e);
             pause();
             return Ok(false);
@@ -200,14 +194,14 @@ async fn delete_current_wallet_prompt(
                 );
                 match core.delete_wallet(&current_wallet_name, config_path).await {
                     Ok(_) => {
-                        println!("🗑️ Wallet '{}' deleted successfully.", current_wallet_name);
+                        println!("Wallet '{}' deleted successfully.", current_wallet_name);
                         info!("Wallet '{}' deleted successfully.", current_wallet_name);
                         pause();
                         Ok(true)
                     }
                     Err(e) => {
                         error!("Failed to delete wallet '{}': {}", current_wallet_name, e);
-                        println!("❌ Failed to delete wallet: {}", e);
+                        println!("Failed to delete wallet: {}", e);
                         pause();
                         Err(e)
                     }
@@ -228,7 +222,7 @@ async fn delete_current_wallet_prompt(
                 "Incorrect password for wallet '{}' deletion: {}",
                 current_wallet_name, e
             );
-            println!("⚠️ Incorrect password. Deletion cancelled.");
+            println!("Incorrect password. Deletion cancelled.");
             pause();
             Ok(false)
         }

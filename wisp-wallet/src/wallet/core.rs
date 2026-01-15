@@ -9,9 +9,10 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine};
+use bip39::Mnemonic;
 use chrono::Utc;
 use k256::ecdsa::signature::Signer;
-use k256::ecdsa::{self, SigningKey};
+use k256::ecdsa::SigningKey;
 use log::{debug, info, warn};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
@@ -24,14 +25,13 @@ use wisp_core::{
     currency::Amount,
     network::WalletTransactionInfo,
     network::{Message, TransactionStatus},
-    sha256::Hash,
+    sha256::{hash, Hash},
     signatures::{PrivateKey, PublicKey},
     transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
 };
 
 use crate::wallet::{config::Config, constants::*, storage::SavedWallet};
 
-/// Defines the method for calculating transaction fees.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeeType {
     Fixed,
@@ -47,26 +47,17 @@ impl std::fmt::Display for FeeType {
     }
 }
 
-/// The central struct for managing wallet state and operations.
-/// It holds configuration, wallet data, and network connection state.
 pub struct Core {
-    /// Wallet configuration settings.
     pub config: Arc<AsyncMutex<Config>>,
-    /// A list of loaded wallets.
     pub wallets: Arc<AsyncMutex<Vec<SavedWallet>>>,
-    /// A map of discovered network peers and their last seen time.
     pub discovered_nodes: Arc<AsyncMutex<HashMap<String, Option<Duration>>>>,
-    /// The wallet's current set of spendable Unspent Transaction Outputs (UTXOs).
     pub utxos: Arc<RwLock<HashMap<OutPoint, TransactionOutput>>>,
     pub transactions: Arc<RwLock<HashMap<Hash, WalletTransactionInfo>>>,
-    /// The active TCP stream to the connected node.
     connected_node_stream: Arc<AsyncMutex<Option<TcpStream>>>,
 }
 
 impl Core {
-    /// Loads the wallet core, reading configuration from a file or using defaults.
     pub async fn load(config_path: PathBuf) -> Result<Self> {
-        // Try to load config from file, otherwise create a default config.
         let config = match fs::read_to_string(&config_path) {
             Ok(content) => toml::from_str(&content)?,
             Err(_) => {
@@ -75,31 +66,26 @@ impl Core {
             }
         };
 
-        // Initialize the Core struct with empty state.
         Ok(Core {
             config: Arc::new(AsyncMutex::new(config)),
             wallets: Arc::new(AsyncMutex::new(Vec::new())),
             discovered_nodes: Arc::new(AsyncMutex::new(HashMap::new())),
             utxos: Arc::new(RwLock::new(HashMap::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
-            connected_node_stream: Arc::new(AsyncMutex::new(None)), // Initialize as None
+            connected_node_stream: Arc::new(AsyncMutex::new(None)),
         })
     }
 
-    /// Helper to get the currently connected node address from config.
     async fn get_default_node_address(&self) -> String {
         let config_guard = self.config.lock().await;
         config_guard.default_node.clone()
     }
 
-    /// Helper to get the response timeout from config.
     pub async fn get_node_response_timeout(&self) -> Duration {
         let config_guard = self.config.lock().await;
         Duration::from_secs(config_guard.node_response_timeout_secs)
     }
 
-    /// Gets a handle to the connected node stream.
-    /// If not connected, it establishes a new connection to the default node.
     pub async fn get_connected_stream(&self) -> Result<MutexGuard<'_, Option<TcpStream>>> {
         let mut stream_lock = self.connected_node_stream.lock().await;
 
@@ -143,59 +129,67 @@ impl Core {
         Ok(())
     }
 
-    /// Creates a new wallet, encrypts its private key, and saves it to a file.
     pub async fn create_wallet(
         &self,
         name: &str,
         password: &str,
         config_path: &PathBuf,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut wallets_guard = self.wallets.lock().await;
         if wallets_guard.iter().any(|w| w.name == name) {
             return Err(anyhow!("Wallet with name '{}' already exists", name));
         }
 
-        // Generate a new private/public key pair.
-        let private_key =
-            PrivateKey::generate_keypair_with_rng(&mut ecdsa::signature::rand_core::OsRng);
+        // Generate a new mnemonic (24 words)
+        let mut rng = OsRng;
+        let mut entropy = [0u8; 32];
+        rng.try_fill_bytes(&mut entropy)
+            .map_err(|e| anyhow!("Failed to generate entropy: {}", e))?;
+        let mnemonic = Mnemonic::from_entropy(&entropy)
+            .map_err(|e| anyhow!("Failed to generate mnemonic: {}", e))?;
+        let phrase = mnemonic.to_string();
+
+        let seed = mnemonic.to_seed("");
+        let private_key_hash = hash(&seed[..]);
+        let private_key_bytes = private_key_hash.as_bytes();
+
+        let signing_key = SigningKey::from_slice(&private_key_bytes)
+            .map_err(|e| anyhow!("Invalid private key derived from seed: {}", e))?;
+        let private_key = PrivateKey(signing_key);
         let public_key = private_key.public_key();
 
-        // Use a local OsRng for salt generation
         let mut local_rng = OsRng;
         let mut salt = vec![0u8; SALT_SIZE];
         local_rng
             .try_fill_bytes(&mut salt)
             .map_err(|e| anyhow!("Failed to fill bytes for salt: {}", e))?;
 
-        // Encrypt the private key using a key derived from the password and salt.
         let encrypted_private_key = Self::encrypt_private_key(&private_key, password, &salt)?;
+        let encrypted_seed_phrase = Some(Self::encrypt_data(phrase.as_bytes(), password, &salt)?);
 
         let new_wallet = SavedWallet {
             name: name.to_string(),
             encrypted_private_key,
             public_key,
             salt,
+            encrypted_seed_phrase,
         };
 
-        // Save the new wallet to its own file.
         new_wallet.save_to_file(password)?;
 
-        // Set the newly created wallet as the current one in the config.
         {
             let mut config_guard = self.config.lock().await;
             config_guard.current_wallet_name = Some(name.to_string());
             self.save_config(config_path, &*config_guard).await?;
         }
 
-        // Load the newly created wallet into memory
         let loaded_wallet = SavedWallet::load_from_file(name, password)?;
         wallets_guard.push(loaded_wallet);
 
         info!("Wallet '{}' created successfully!", name);
-        Ok(())
+        Ok(phrase)
     }
 
-    /// Recovers a wallet from a raw private key, creating a new encrypted wallet file.
     pub async fn recover_wallet_with_key(
         &self,
         name: &str,
@@ -227,6 +221,7 @@ impl Core {
             encrypted_private_key,
             public_key,
             salt,
+            encrypted_seed_phrase: None,
         };
 
         new_wallet.save_to_file(password)?;
@@ -244,7 +239,62 @@ impl Core {
         Ok(())
     }
 
-    /// Scans the wallet directory and returns a list of available wallet names.
+    pub async fn recover_wallet_with_seed(
+        &self,
+        name: &str,
+        password: &str,
+        seed_phrase: &str,
+        config_path: &PathBuf,
+    ) -> Result<()> {
+        let mut wallets_guard = self.wallets.lock().await;
+        if wallets_guard.iter().any(|w| w.name == name) {
+            return Err(anyhow!("Wallet with name '{}' already exists", name));
+        }
+
+        let mnemonic =
+            Mnemonic::parse(seed_phrase).map_err(|e| anyhow!("Invalid seed phrase: {}", e))?;
+
+        let seed = mnemonic.to_seed("");
+        let private_key_hash = hash(&seed[..]);
+        let private_key_bytes = private_key_hash.as_bytes();
+
+        let signing_key = SigningKey::from_slice(&private_key_bytes)
+            .map_err(|e| anyhow!("Invalid private key derived from seed: {}", e))?;
+        let private_key = PrivateKey(signing_key);
+        let public_key = private_key.public_key();
+
+        let mut rng = OsRng;
+        let mut salt = vec![0u8; SALT_SIZE];
+        rng.try_fill_bytes(&mut salt)
+            .map_err(|e| anyhow!("Failed to fill bytes for salt: {}", e))?;
+
+        let encrypted_private_key = Self::encrypt_private_key(&private_key, password, &salt)?;
+        let encrypted_seed_phrase =
+            Some(Self::encrypt_data(seed_phrase.as_bytes(), password, &salt)?);
+
+        let new_wallet = SavedWallet {
+            name: name.to_string(),
+            encrypted_private_key,
+            public_key,
+            salt,
+            encrypted_seed_phrase,
+        };
+
+        new_wallet.save_to_file(password)?;
+
+        {
+            let mut config_guard = self.config.lock().await;
+            config_guard.current_wallet_name = Some(name.to_string());
+            self.save_config(config_path, &*config_guard).await?;
+        }
+
+        let loaded_wallet = SavedWallet::load_from_file(name, password)?;
+        wallets_guard.push(loaded_wallet);
+
+        info!("Wallet '{}' recovered from seed successfully!", name);
+        Ok(())
+    }
+
     pub async fn load_wallets() -> Result<Vec<String>> {
         let wallet_dir = PathBuf::from(WALLET_DIR);
         fs::create_dir_all(&wallet_dir)?; // Ensure directory exists
@@ -264,7 +314,6 @@ impl Core {
         Ok(wallet_names)
     }
 
-    /// Loads a specific wallet into memory by decrypting its file with the provided password.
     pub async fn load_wallet(
         &self,
         name: &str,
@@ -276,7 +325,6 @@ impl Core {
         let name_clone = name.to_string();
         let password_clone = password.to_string();
 
-        // Decryption is CPU-intensive, so it's done in a blocking thread.
         let loaded_wallet = tokio::task::spawn_blocking(move || {
             SavedWallet::load_from_file(&name_clone, &password_clone)
                 .context("Failed to load wallet file in blocking task")
@@ -293,12 +341,11 @@ impl Core {
         let mut wallets_guard = self.wallets.lock().await;
         debug!("load_wallet: Acquired wallets_guard lock.");
 
-        // Check if wallet is already loaded to avoid duplicates
         if wallets_guard.iter().any(|w| w.name == name) {
             info!("Wallet '{}' is already loaded.", name);
             drop(wallets_guard);
 
-            let mut config_guard = self.config.lock().await; // Acquire lock here
+            let mut config_guard = self.config.lock().await;
             config_guard.current_wallet_name = Some(name.to_string());
             self.save_config(config_path, &*config_guard).await?;
 
@@ -327,7 +374,6 @@ impl Core {
         Ok(())
     }
 
-    /// Returns the currently active wallet.
     pub async fn get_current_wallet(&self) -> Result<SavedWallet> {
         let config_guard = self.config.lock().await;
         match &config_guard.current_wallet_name {
@@ -343,7 +389,6 @@ impl Core {
         }
     }
 
-    /// A convenience method to decrypt the private key of the currently loaded wallet.
     pub async fn decrypt_current_wallet_private_key(&self, password: &str) -> Result<PrivateKey> {
         let current_wallet = self.get_current_wallet().await?;
         Self::decrypt_private_key(
@@ -353,76 +398,69 @@ impl Core {
         )
     }
 
-    /// Encrypts a private key using AES-256-GCM with a key derived from a password and salt.
     pub fn encrypt_private_key(
         private_key: &PrivateKey,
         password: &str,
         salt: &[u8],
     ) -> Result<String> {
-        let mut rng = OsRng;
-        let mut nonce = [0u8; ENCRYPTION_NONCE_SIZE]; // Use a local OsRng for nonce generation
-        rng.try_fill_bytes(&mut nonce)
-            .map_err(|e| anyhow!("Failed to fill bytes for nonce: {}", e))?;
-        let nonce = Nonce::from(nonce);
-
-        // Derive a 256-bit key from the password and salt using Argon2.
-        let key = SavedWallet::derive_key(password, salt)?;
-        let cipher = Aes256Gcm::new_from_slice(&key).expect("key is correct length");
-
-        let private_key_bytes = private_key.0.to_bytes();
-        let ciphertext = cipher
-            .encrypt(&nonce, &private_key_bytes[..])
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-
-        // Prepend the nonce to the ciphertext and Base64-encode the result.
-        let combined = [&nonce[..], &ciphertext[..]].concat();
-
-        Ok(general_purpose::STANDARD_NO_PAD.encode(&combined))
+        Self::encrypt_data(&private_key.0.to_bytes(), password, salt)
     }
 
-    /// Decrypts a private key. This is the reverse of `encrypt_private_key`.
     fn decrypt_private_key(
         encrypted_private_key: &str,
         password: &str,
         salt: &[u8],
     ) -> Result<PrivateKey> {
-        let decoded = general_purpose::STANDARD_NO_PAD.decode(encrypted_private_key)?;
+        let decrypted_bytes = Self::decrypt_data(encrypted_private_key, password, salt)?;
+        SigningKey::from_slice(&decrypted_bytes)
+            .map(PrivateKey)
+            .map_err(|_| anyhow!("Incorrect password or corrupted wallet file."))
+    }
+
+    fn encrypt_data(data: &[u8], password: &str, salt: &[u8]) -> Result<String> {
+        let mut rng = OsRng;
+        let mut nonce = [0u8; ENCRYPTION_NONCE_SIZE];
+        rng.try_fill_bytes(&mut nonce)
+            .map_err(|e| anyhow!("Failed to fill bytes for nonce: {}", e))?;
+        let nonce = Nonce::from(nonce);
+
+        let key = SavedWallet::derive_key(password, salt)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("key is correct length");
+
+        let ciphertext = cipher
+            .encrypt(&nonce, data)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+
+        let combined = [&nonce[..], &ciphertext[..]].concat();
+        Ok(general_purpose::STANDARD_NO_PAD.encode(&combined))
+    }
+
+    fn decrypt_data(encrypted_data: &str, password: &str, salt: &[u8]) -> Result<Vec<u8>> {
+        let decoded = general_purpose::STANDARD_NO_PAD.decode(encrypted_data)?;
         if decoded.len() <= ENCRYPTION_NONCE_SIZE {
-            return Err(anyhow!("Invalid encrypted private key format"));
+            return Err(anyhow!("Invalid encrypted data format"));
         }
         let nonce_array: [u8; ENCRYPTION_NONCE_SIZE] = decoded[..ENCRYPTION_NONCE_SIZE]
             .try_into()
-            .expect("Nonce slice has incorrect length, this should be prevented by earlier check");
+            .expect("Nonce slice has incorrect length");
         let nonce = Nonce::from(nonce_array);
         let ciphertext = &decoded[ENCRYPTION_NONCE_SIZE..];
 
         let key = SavedWallet::derive_key(password, salt)?;
         let cipher = Aes256Gcm::new_from_slice(&key).expect("key is correct length");
 
-        // Decrypt the data. AES-GCM's authenticated encryption means this will fail if the key
-        // (derived from the password) is incorrect, because the authentication tag won't match.
-        let decrypted_bytes = match cipher.decrypt(&nonce, ciphertext) {
-            Ok(bytes) => bytes,
-            Err(_) => return Err(anyhow!("Incorrect password or corrupted wallet file.")),
-        };
-
-        // As a final check, ensure the decrypted bytes can be parsed into a valid private key.
-        // it means the password was wrong.
-        SigningKey::from_slice(&decrypted_bytes)
-            .map(PrivateKey)
-            .map_err(|_| anyhow!("Incorrect password or corrupted wallet file."))
+        cipher
+            .decrypt(&nonce, ciphertext)
+            .map_err(|_| anyhow!("Incorrect password or corrupted data."))
     }
 
-    /// Changes the password for the current wallet.
     pub async fn change_wallet_password(
         &self,
         current_password: &str,
         new_password: &str,
     ) -> Result<()> {
-        // 1. Get the current wallet's data. This acquires and releases the lock.
         let wallet_data = self.get_current_wallet().await?;
 
-        // 2. Decrypt the private key with the current password to validate it.
         let private_key = Core::decrypt_private_key(
             &wallet_data.encrypted_private_key,
             current_password,
@@ -430,14 +468,12 @@ impl Core {
         )
         .context("Incorrect current password or decryption failed")?;
 
-        // 3. Acquire the lock to modify the in-memory wallet data.
         let mut wallets_guard = self.wallets.lock().await;
 
         if let Some(wallet_to_update) = wallets_guard
             .iter_mut()
             .find(|w| w.name == wallet_data.name)
         {
-            // 4. Generate a new salt and re-encrypt the key with the new password.
             let mut rng = OsRng;
             let mut new_salt = vec![0u8; SALT_SIZE];
             rng.try_fill_bytes(&mut new_salt)
@@ -447,7 +483,15 @@ impl Core {
             wallet_to_update.encrypted_private_key =
                 Self::encrypt_private_key(&private_key, new_password, &new_salt)?;
 
-            // 5. Save the updated wallet to its file in a blocking task.
+            if let Some(old_enc_seed) = &wallet_data.encrypted_seed_phrase {
+                let seed_bytes =
+                    Self::decrypt_data(old_enc_seed, current_password, &wallet_data.salt)?;
+                let new_enc_seed = Self::encrypt_data(&seed_bytes, new_password, &new_salt)?;
+                wallet_to_update.encrypted_seed_phrase = Some(new_enc_seed);
+            } else {
+                wallet_to_update.encrypted_seed_phrase = None;
+            }
+
             let wallet_clone = wallet_to_update.clone();
             let new_password_clone = new_password.to_string();
             tokio::task::spawn_blocking(move || wallet_clone.save_to_file(&new_password_clone))
@@ -459,19 +503,27 @@ impl Core {
                 "Wallet password for '{}' changed successfully.",
                 wallet_to_update.name
             );
-            println!("🔑 Wallet password changed successfully.");
+            println!("Wallet password changed successfully.");
         } else {
-            // This case is unlikely if get_current_wallet succeeded, but it's good practice.
             return Err(anyhow!(
-                // This case is unlikely if get_current_wallet succeeded, but it's good practice.
                 "Current wallet disappeared from memory during password change."
             ));
         }
         Ok(())
     }
 
+    pub async fn export_seed_phrase(&self, password: &str) -> Result<String> {
+        let wallet = self.get_current_wallet().await?;
+        if let Some(enc_seed) = &wallet.encrypted_seed_phrase {
+            let seed_bytes = Self::decrypt_data(enc_seed, password, &wallet.salt)?;
+            let seed_str = String::from_utf8(seed_bytes).context("Invalid UTF-8 in seed phrase")?;
+            Ok(seed_str)
+        } else {
+            Err(anyhow!("This wallet does not have a stored seed phrase (it might have been imported from a raw key)."))
+        }
+    }
+
     pub async fn delete_wallet(&self, name: &str, config_path: &PathBuf) -> Result<()> {
-        // Delete the wallet file from disk.
         let path = SavedWallet::wallet_file_path(name);
         if fs::remove_file(&path).is_ok() {
             info!("Wallet file '{}' deleted.", name);
@@ -484,7 +536,6 @@ impl Core {
                     info!("Removed '{}' as the current wallet.", name);
                 }
             }
-            // Remove the wallet from the in-memory list.
             let mut wallets_guard = self.wallets.lock().await;
             wallets_guard.retain(|w| w.name != name);
             Ok(())
@@ -493,8 +544,6 @@ impl Core {
         }
     }
 
-    /// Fetches an atomic snapshot of the wallet's state from the node.
-    /// This includes all UTXOs and the status of pending transactions.
     pub async fn fetch_wallet_state(&self) -> Result<()> {
         let current_wallet = self.get_current_wallet().await?;
         let wallet_public_key = current_wallet.public_key.clone();
@@ -511,7 +560,6 @@ impl Core {
             .expect("Expected an active TCP stream after connection attempt");
         let response_timeout = self.get_node_response_timeout().await;
 
-        // Send the request to the node.
         let fetch_state_msg = Message::FetchWalletState(wallet_public_key.clone());
         fetch_state_msg
             .send_async(stream_ref)
@@ -557,22 +605,17 @@ impl Core {
         Ok(())
     }
 
-    /// Calculates and returns the total spendable balance from the available UTXOs.
     pub async fn get_total_balance(&self) -> Result<Amount> {
         let utxos_guard = self.utxos.read().await;
         let transactions_guard = self.transactions.read().await;
         let wallet_public_key = self.get_current_wallet().await?.public_key;
-
-        // 1. Calculate the confirmed balance from the UTXO set.
         let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
 
-        // 2. Calculate the net change from all pending transactions.
         let mut pending_net_change: i128 = 0;
         for tx_info in transactions_guard.values() {
             if tx_info.status == TransactionStatus::Pending {
                 let tx = &tx_info.transaction;
 
-                // Subtract the value of inputs we owned that are being spent.
                 for input in &tx.inputs {
                     if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
                         if spent_utxo.pubkey == wallet_public_key {
@@ -581,7 +624,6 @@ impl Core {
                     }
                 }
 
-                // Add the value of new outputs being sent to us (including our own change).
                 for output in &tx.outputs {
                     if output.pubkey == wallet_public_key {
                         pending_net_change += output.value.as_smallest_unit() as i128;
@@ -590,22 +632,20 @@ impl Core {
             }
         }
 
-        // 3. The total balance is the confirmed balance plus the net pending change.
         let total_balance_units =
             (confirmed_balance.as_smallest_unit() as i128 + pending_net_change).max(0) as u64;
 
         Ok(Amount::from_smallest_unit(total_balance_units))
     }
 
-    /// Creates, signs, and submits a transaction to send funds.
     #[allow(clippy::too_many_arguments)]
     pub async fn send_funds(
         &self,
         is_send_max: bool,
         recipient_public_key_str: String,
-        amount_to_send: Amount, // This is already in smallest units
+        amount_to_send: Amount,
         fee_type: FeeType,
-        fee_value_raw: u64, // For fixed: in smallest units; for percent: in basis points (e.g., 500 for 5.00%)
+        fee_value_raw: u64,
         password: &str,
         _config_path: &PathBuf,
     ) -> Result<()> {
@@ -619,9 +659,6 @@ impl Core {
             .parse::<PublicKey>()
             .context("Invalid recipient public key format")?;
 
-        // --- Refactored Fee and Amount Logic ---
-        // Calculate the fee based on the user's intent for a regular send.
-        // For send_max, the fee will be recalculated later based on the total input amount.
         let intended_fee = if !is_send_max {
             match fee_type {
                 FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw),
@@ -637,9 +674,6 @@ impl Core {
             .checked_add(intended_fee)
             .context("Total required amount overflow")?;
 
-        // Fetch a fresh snapshot of spendable UTXOs from the node.
-        // We use the locally cached UTXOs. The node will validate them upon submission.
-        // A pre-fetch here is redundant as the node is the final arbiter.
         let spendable_utxos = self.utxos.read().await.clone();
         info!(
             "Creating transaction with {} locally known UTXOs.",
@@ -649,12 +683,10 @@ impl Core {
         let mut selected_inputs: Vec<TransactionInput> = Vec::new();
         let mut current_input_sum = Amount::zero();
 
-        // Select the smallest UTXOs first until the total required amount is met (coin selection).
         let mut all_spendable_utxos: Vec<_> = spendable_utxos.iter().collect();
         all_spendable_utxos.sort_by_key(|(_, output)| output.value.as_smallest_unit());
 
         for (outpoint, utxo_output) in all_spendable_utxos {
-            // For "send max", we take all UTXOs. For regular sends, we stop when we have enough.
             if is_send_max || (current_input_sum < total_required) {
                 selected_inputs.push(TransactionInput {
                     outpoint: *outpoint,
@@ -665,11 +697,10 @@ impl Core {
                     .checked_add(utxo_output.value)
                     .context("Input sum overflow")?;
             } else {
-                break; // Stop once we have enough value
+                break;
             }
         }
 
-        // Now that we have our inputs, verify we have enough funds for a regular send.
         if !is_send_max && current_input_sum < total_required {
             return Err(anyhow!(
                 "Insufficient funds. Available: {}, Required: {}",
@@ -678,9 +709,7 @@ impl Core {
             ));
         }
 
-        // --- Finalize amounts based on whether it's a "send max" or regular transaction ---
         let (final_amount_to_send, transaction_fee) = if is_send_max {
-            // For "send max", the fee is calculated from the total available input value.
             let fee = match fee_type {
                 FeeType::Fixed => Amount::from_smallest_unit(fee_value_raw), // Fee is fixed
                 FeeType::Percent => Amount::from_smallest_unit(
@@ -692,7 +721,6 @@ impl Core {
                 .context("Fee calculation underflow for send max")?;
             (amount, fee)
         } else {
-            // For regular sends, the amounts are what the user entered.
             (amount_to_send, intended_fee)
         };
 
@@ -718,7 +746,6 @@ impl Core {
             });
         }
 
-        // --- Signing and Submission ---
         // Create the transaction with unsigned inputs.
         let mut new_transaction = Transaction {
             inputs: selected_inputs,
@@ -738,7 +765,6 @@ impl Core {
             input.signature = Some(signature.clone());
         }
 
-        // --- FIX ---
         // Recalculate the txid with the signatures included to get the final, canonical hash.
         let final_txid = new_transaction.txid()?;
         let mut stream_guard = self.get_connected_stream().await?;
@@ -759,17 +785,11 @@ impl Core {
                 .await
                 .context("Timeout waiting for SubmitTransaction confirmation")??;
 
-        // Handle the node's response.
         match confirmation_response {
             Message::TransactionAcceptedConfirmation => {
                 info!("Transaction submitted and accepted by node.");
-
-                // The transaction was accepted by the node, so now we can safely
-                // update our local state to reflect this. This prevents the UI from
-                // showing a pending transaction that was actually rejected.
-
                 println!(
-                    "🚀 Transaction submitted, waiting for confirmation. Hash: {}",
+                    "Transaction submitted, waiting for confirmation. Hash: {}",
                     final_txid
                 );
 
@@ -784,9 +804,6 @@ impl Core {
                 transactions_guard.insert(final_txid, tx_info);
                 drop(transactions_guard);
 
-                // --- CRITICAL FIX ---
-                // Proactively update the local UTXO set instead of re-fetching.
-                // This prevents the wallet from trying to double-spend its own pending UTXOs.
                 let mut utxos_guard = self.utxos.write().await;
                 for input in &new_transaction.inputs {
                     utxos_guard.remove(&input.outpoint);
@@ -822,7 +839,6 @@ impl Core {
         Ok(())
     }
 
-    /// Fetches block information from the node.
     pub async fn get_block_info(&self, index: u64) -> Result<Option<Block>> {
         let mut stream_guard = self.get_connected_stream().await?;
         let stream_ref = stream_guard
@@ -848,7 +864,6 @@ impl Core {
         }
     }
 
-    /// Fetches the latest block from the node.
     pub async fn get_latest_block(&self) -> Result<Option<(Block, u64)>> {
         let mut stream_guard = self.get_connected_stream().await?;
         let stream_ref = stream_guard
@@ -877,18 +892,15 @@ impl Core {
     /// Spawns a background task to periodically sync the wallet state with the node.
     pub async fn start_background_sync(self: Arc<Self>) {
         tokio::spawn(async move {
-            // Create an interval that ticks every 30 seconds.
             let mut interval = tokio::time::interval(Duration::from_secs(30));
 
             loop {
-                // Wait for the next tick.
                 interval.tick().await;
 
                 let wallet_loaded = {
                     let config_guard = self.config.lock().await;
                     if let Some(name) = &config_guard.current_wallet_name {
                         let wallets_guard = self.wallets.lock().await;
-                        // Check that the wallet is both set in config and loaded into memory.
                         wallets_guard.iter().any(|w| w.name == *name)
                     } else {
                         false
@@ -898,14 +910,11 @@ impl Core {
                 if wallet_loaded {
                     debug!("Background sync: Fetching wallet state...");
                     if let Err(e) = self.fetch_wallet_state().await {
-                        // Log errors but don't panic. The loop will continue and try again later.
-                        // This handles cases where the node might be temporarily unavailable.
                         warn!("Background sync failed: {}", e);
                     } else {
                         info!("Background sync completed successfully.");
                     }
                 } else {
-                    // If no wallet is loaded, there's nothing to sync.
                     debug!("Background sync: No wallet loaded, skipping fetch.");
                 }
             }
