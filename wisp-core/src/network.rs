@@ -40,7 +40,27 @@ pub struct WalletStateSnapshot {
 
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Message {
-    // --- Wallet & Transaction Messages ---
+    Chain(ChainMessage),
+    Wallet(WalletMessage),
+    Mining(MiningMessage),
+    P2P(P2PMessage),
+}
+
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ChainMessage {
+    NewBlock(Block),
+    FetchBlock(u64),
+    FetchBlockByHash(Hash),
+    FetchBlockInfo(u64),
+    BlockInfo(Option<Block>),
+    FetchLatestBlock,
+    LatestBlock(Option<(Block, u64)>),
+    GetBlockHeaders { from_index: u64, count: u32 },
+    BlockHeaders(Vec<BlockHeader>),
+}
+
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum WalletMessage {
     SubmitTransaction(Transaction),
     NewTransaction(Transaction),
     FetchWalletState(PublicKey),
@@ -52,8 +72,10 @@ pub enum Message {
         hash: Hash,
         status: TransactionStatus,
     },
+}
 
-    // --- Mining Messages ---
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum MiningMessage {
     FetchTemplate(PublicKey, Option<String>),
     Template(Block),
     NewTemplate(Block),
@@ -62,24 +84,10 @@ pub enum Message {
     SubmitTemplate(PublicKey, Block, Option<String>),
     BlockSubmittedConfirmation,
     BlockRejected(String),
+}
 
-    // --- Chain & Block Sync Messages ---
-    NewBlock(Block),
-    FetchBlock(u64),
-    FetchBlockByHash(Hash),
-    FetchBlockInfo(u64),
-    BlockInfo(Option<Block>),
-    FetchLatestBlock,
-    LatestBlock(Option<(Block, u64)>),
-
-    // Headers-first synchronization messages
-    GetBlockHeaders {
-        from_index: u64,
-        count: u32,
-    },
-    BlockHeaders(Vec<BlockHeader>),
-
-    // --- General & Peer Discovery Messages ---
+#[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub enum P2PMessage {
     Hello(String),
     Ping,
     Pong,

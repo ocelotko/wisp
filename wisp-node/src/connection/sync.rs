@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::{net::TcpStream, sync::RwLock};
 use wisp_core::{
     blockchain::{Block, Blockchain},
-    network::Message,
+    network::{ChainMessage, Message},
     sha256::Hash,
 };
 
@@ -22,7 +22,7 @@ pub async fn handle_fetch_block(
     let response = if let Some(b) = block {
         // The convention for a direct block request is to respond with a `NewBlock` message.
         // This is what the `download_blockchain` utility function expects.
-        Message::NewBlock(b)
+        Message::Chain(ChainMessage::NewBlock(b))
     } else {
         // If the block is not found, we respond with `BlockInfo(None)` to explicitly
         // signal that the block is missing, which is better than a timeout.
@@ -30,7 +30,7 @@ pub async fn handle_fetch_block(
             "Block at index {} not found, sending negative response.",
             index
         );
-        Message::BlockInfo(None)
+        Message::Chain(ChainMessage::BlockInfo(None))
     };
 
     response.send_async(stream).await?;
@@ -49,16 +49,33 @@ pub async fn handle_fetch_block_by_hash(
     drop(blockchain_lock);
 
     let response = if let Some(b) = block {
-        Message::NewBlock(b)
+        Message::Chain(ChainMessage::NewBlock(b))
     } else {
         warn!(
             "Block with hash {} not found, sending negative response.",
             hash
         );
-        Message::BlockInfo(None)
+        Message::Chain(ChainMessage::BlockInfo(None))
     };
 
     response.send_async(stream).await?;
+    Ok(())
+}
+
+/// Handles a `FetchBlockInfo` request from a peer by sending back the requested block wrapped in `BlockInfo`.
+pub async fn handle_fetch_block_info(
+    stream: &mut TcpStream,
+    index: u64,
+    blockchain: Arc<RwLock<Blockchain>>,
+) -> Result<()> {
+    debug!("Handling FetchBlockInfo request for index {}", index);
+    let blockchain_lock = blockchain.read().await;
+    let block = blockchain_lock.get_block_by_index(index)?;
+    drop(blockchain_lock);
+
+    Message::Chain(ChainMessage::BlockInfo(block))
+        .send_async(stream)
+        .await?;
     Ok(())
 }
 
@@ -74,9 +91,9 @@ pub async fn handle_fetch_latest_block(
     drop(blockchain_lock);
 
     let response = if let Some(block) = tip_block {
-        Message::LatestBlock(Some((block, height)))
+        Message::Chain(ChainMessage::LatestBlock(Some((block, height))))
     } else {
-        Message::LatestBlock(None)
+        Message::Chain(ChainMessage::LatestBlock(None))
     };
 
     response.send_async(stream).await?;
@@ -107,6 +124,8 @@ pub async fn handle_get_block_headers(
     }
     drop(blockchain_lock);
 
-    Message::BlockHeaders(headers).send_async(stream).await?;
+    Message::Chain(ChainMessage::BlockHeaders(headers))
+        .send_async(stream)
+        .await?;
     Ok(())
 }

@@ -154,7 +154,7 @@ async fn wallet_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()>
             }
 
             "Network and blockchain" => {
-                if let Err(e) = network_and_blockchain(Arc::clone(&core)).await {
+                if let Err(e) = network_and_blockchain(Arc::clone(&core), config_path).await {
                     error!("Network and blockchain failed: {}", e);
                     println!("\nError: {}", e);
                     pause();

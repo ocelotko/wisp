@@ -1,7 +1,7 @@
 use anyhow::Result;
 use log::debug;
 use tokio::net::TcpStream;
-use wisp_core::network::Message;
+use wisp_core::network::{Message, P2PMessage};
 
 /// Handles a `DiscoverNodes` request from a peer.
 ///
@@ -10,14 +10,13 @@ use wisp_core::network::Message;
 pub async fn handle_discover_nodes(stream: &mut TcpStream) -> Result<()> {
     debug!("Handling DiscoverNodes request.");
 
-    // Collect the addresses (keys) of all nodes in the global NODES map.
-    // Unlike `std::collections::HashMap`, `DashMap` doesn't have a `keys()` method.
-    // We get an iterator over the map and extract the key from each item.
     let nodes: Vec<String> = crate::NODES
         .iter()
         .map(|peer_ref| peer_ref.key().clone())
         .collect();
-    Message::NodeList(nodes).send_async(stream).await?;
+    Message::P2P(P2PMessage::NodeList(nodes))
+        .send_async(stream)
+        .await?;
 
     Ok(())
 }
@@ -28,6 +27,6 @@ pub async fn handle_discover_nodes(stream: &mut TcpStream) -> Result<()> {
 /// keep-alive and latency check mechanism.
 pub async fn handle_ping(stream: &mut TcpStream) -> Result<()> {
     debug!("Received Ping, sending Pong.");
-    Message::Pong.send_async(stream).await?;
+    Message::P2P(P2PMessage::Pong).send_async(stream).await?;
     Ok(())
 }

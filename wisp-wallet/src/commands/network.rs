@@ -3,9 +3,12 @@ use crate::wallet::core::Core;
 use anyhow::{Context, Result};
 use inquire::{Select, Text};
 use log::error;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-pub async fn network_and_blockchain(core: Arc<Core>) -> Result<(), anyhow::Error> {
+pub async fn network_and_blockchain(
+    core: Arc<Core>,
+    config_path: &PathBuf,
+) -> Result<(), anyhow::Error> {
     loop {
         clear_terminal();
         let balance_value = core.get_total_balance().await;
@@ -30,8 +33,8 @@ pub async fn network_and_blockchain(core: Arc<Core>) -> Result<(), anyhow::Error
         match blockchain_menu_selection.as_ref() {
             "Get latest block information" => get_latest_block_prompt(&core).await?,
             "Get specific block information" => get_block_info_prompt(&core).await?,
-            "Connect to node" => connect_node(&core).await?,
-            "List connected peers" => list_peers(&core).await,
+            "Connect to node" => connect_node(&core, config_path).await?,
+            "List connected peers" => list_peers(&core).await?,
             "Back to wallet menu" => return Ok(()),
             _ => {
                 error!("Blockchain interaction menu selection error: Invalid selection or prompt error.");
@@ -155,7 +158,7 @@ async fn get_block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn connect_node(core: &Core) -> Result<(), anyhow::Error> {
+async fn connect_node(core: &Core, config_path: &PathBuf) -> Result<(), anyhow::Error> {
     clear_terminal();
     let balance_value = core.get_total_balance().await;
     display_heading_with_wallet(
@@ -167,21 +170,54 @@ async fn connect_node(core: &Core) -> Result<(), anyhow::Error> {
         balance_value.ok(),
     );
 
-    println!("Attempting to connect to default node...");
-    match core.get_connected_stream().await {
-        Ok(_) => {
-            println!("Successfully connected to the default node.");
+    let current_node = {
+        let config = core.config.lock().await;
+        config.default_node.clone()
+    };
+    println!("Current default node: {}", current_node);
+
+    let change_node = inquire::Confirm::new("Do you want to change the default node?")
+        .with_default(false)
+        .prompt()?;
+
+    if change_node {
+        let new_node_addr =
+            inquire::Text::new("Enter new node address (e.g., 127.0.0.1:9000):").prompt()?;
+
+        println!("Attempting to connect to new node: {}", new_node_addr);
+        core.set_default_node(&new_node_addr, config_path).await?;
+
+        match core.get_connected_stream().await {
+            Ok(_) => {
+                println!("Successfully connected to new node and set it as default.");
+            }
+            Err(e) => {
+                error!("Failed to connect to new node: {}", e);
+                println!(
+                    "\nFailed to connect to new node: {}. Reverting to previous default.",
+                    e
+                );
+                core.set_default_node(&current_node, config_path).await?;
+            }
         }
-        Err(e) => {
-            error!("Failed to connect to node: {}", e);
-            println!("Failed to connect to node: {}", e);
+    } else {
+        println!("\nAttempting to connect to default node...");
+        match core.get_connected_stream().await {
+            Ok(_) => {
+                println!("Successfully connected to the default node.");
+            }
+            Err(e) => {
+                error!("Failed to connect to node: {}", e);
+                println!("Failed to connect to node: {}", e);
+            }
         }
     }
+
     pause();
     Ok(())
 }
 
-async fn list_peers(core: &Core) {
+async fn list_peers(core: &Core) -> Result<()> {
     clear_terminal();
     let balance_value = core.get_total_balance().await;
     display_heading_with_wallet(
@@ -192,25 +228,27 @@ async fn list_peers(core: &Core) {
             .as_deref(),
         balance_value.ok(),
     );
-    println!("Discovered Peers:");
+    println!("Fetching peer list from connected node...");
     println!("------------------");
 
-    let discovered_nodes_guard = core.discovered_nodes.lock().await;
-    if discovered_nodes_guard.is_empty() {
-        println!("No peers have been discovered yet.");
-    } else {
-        for (address, last_seen) in discovered_nodes_guard.iter() {
-            match last_seen {
-                Some(duration) => {
-                    let total_secs = duration.as_secs();
-                    let mins = total_secs / 60;
-                    let secs = total_secs % 60;
-                    println!("Address: {}, Last Seen: {}m {}s ago", address, mins, secs);
+    match core.fetch_peers_from_node().await {
+        Ok(peers) => {
+            if peers.is_empty() {
+                println!("Node reported no other connected peers.");
+            } else {
+                println!("Node is connected to the following peers:");
+                for peer_addr in peers {
+                    println!("- {}", peer_addr);
                 }
-                None => println!("Address: {}, Status: Unknown/Inactive", address),
             }
         }
+        Err(e) => {
+            error!("Failed to list peers: {}", e);
+            println!("\nError fetching peer list: {}", e);
+        }
     }
+
     println!("------------------");
     pause();
+    Ok(())
 }

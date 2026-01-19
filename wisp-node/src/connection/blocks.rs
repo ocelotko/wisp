@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::{sync::RwLock, time};
 use wisp_core::{
     blockchain::{AddBlockResult, Block, Blockchain},
-    network::Message,
+    network::{ChainMessage, Message},
     sha256::Hash,
 };
 
@@ -65,7 +65,9 @@ pub async fn handle_new_block(block: Block, blockchain: Arc<RwLock<Blockchain>>)
                 "Received orphan block {} (index {}), parent {} is unknown. It has been stored.",
                 block_hash_for_log, block_index_for_log, block.previous_hash
             );
-            broadcast_request_for_block(block.previous_hash).await;
+            tokio::spawn(async move {
+                broadcast_request_for_block(block.previous_hash).await;
+            });
         }
         AddBlockResult::Rejected(reason) => {
             warn!(
@@ -104,6 +106,9 @@ async fn fetch_chain_segment(
         start_hash, stop_at_index
     );
 
+    // Snapshot the list of peers to avoid holding locks or iterating the map directly.
+    let peers: Vec<String> = crate::NODES.iter().map(|p| p.key().clone()).collect();
+
     // We need to fetch blocks until we have the full segment down to the common ancestor.
     loop {
         // First, check if we already have the block locally (it might be an orphan or already on disk).
@@ -121,24 +126,29 @@ async fn fetch_chain_segment(
                 "Requesting block {} from network for reorg segment.",
                 current_hash
             );
-            let message = Message::FetchBlockByHash(current_hash);
+            let message = Message::Chain(ChainMessage::FetchBlockByHash(current_hash));
             let mut found_block = None;
 
-            // Iterate over peers to find one that has the block.
-            for mut peer in crate::NODES.iter_mut() {
-                let mut stream_lock = peer.value_mut().lock().await;
-                if let Ok(_) = message.send_async(&mut *stream_lock).await {
+            // Try to fetch from peers. We open a NEW connection to avoid deadlocks,
+            // as existing connections are likely locked by their receive loops.
+            for peer_addr in &peers {
+                if let Ok(mut stream) = tokio::net::TcpStream::connect(peer_addr).await {
+                    if let Err(e) = message.send_async(&mut stream).await {
+                        debug!("Failed to send request to {}: {}", peer_addr, e);
+                        continue;
+                    }
+
                     match time::timeout(
                         time::Duration::from_secs(5),
-                        Message::receive_async(&mut *stream_lock),
+                        Message::receive_async(&mut stream),
                     )
                     .await
                     {
-                        Ok(Ok(Message::NewBlock(b))) => {
+                        Ok(Ok(Message::Chain(ChainMessage::NewBlock(b)))) => {
                             found_block = Some(b);
                             break; // Found it, no need to ask other peers.
                         }
-                        _ => continue, // Timeout or wrong message, try next peer.
+                        _ => continue,
                     }
                 }
             }
@@ -165,7 +175,7 @@ async fn fetch_chain_segment(
 /// Broadcasts a `FetchBlockByHash` message to all connected peers.
 async fn broadcast_request_for_block(hash: Hash) {
     info!("Broadcasting request for missing block: {}", hash);
-    let message = Message::FetchBlockByHash(hash);
+    let message = Message::Chain(ChainMessage::FetchBlockByHash(hash));
 
     for mut peer in crate::NODES.iter_mut() {
         let addr = peer.key().clone();

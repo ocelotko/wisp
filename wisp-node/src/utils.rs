@@ -5,7 +5,7 @@ use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
 use tokio::time;
 use wisp_core::blockchain::AddBlockResult;
-use wisp_core::network::Message;
+use wisp_core::network::{ChainMessage, Message, P2PMessage};
 
 /// Connects to a list of initial seed nodes.
 pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()> {
@@ -43,13 +43,17 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     // --- Step 1: Announce ourselves ---
     // We assume our IP is the one the peer sees. We tell them our listening port.
     let self_addr = format!("{}:{}", stream.local_addr()?.ip(), self_port);
-    Message::Hello(self_addr).send_async(&mut stream).await?;
+    Message::P2P(P2PMessage::Hello(self_addr))
+        .send_async(&mut stream)
+        .await?;
 
     // --- Step 2: Two-Way Height Exchange ---
-    Message::FetchLatestBlock.send_async(&mut stream).await?;
+    Message::Chain(ChainMessage::FetchLatestBlock)
+        .send_async(&mut stream)
+        .await?;
 
     // Wait for their response and send our height
-    if let Ok(Ok(Message::LatestBlock(Some((_, height))))) =
+    if let Ok(Ok(Message::Chain(ChainMessage::LatestBlock(Some((_, height)))))) =
         time::timeout(Duration::from_secs(5), Message::receive_async(&mut stream)).await
     {
         let blockchain = crate::BLOCKCHAIN.get().unwrap().read().await;
@@ -64,11 +68,13 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
 
         // Send our height so they can decide if they need to sync from us.
         if let Some(tip) = blockchain.get_tip_block()? {
-            Message::LatestBlock(Some((tip, our_height)))
+            Message::Chain(ChainMessage::LatestBlock(Some((tip, our_height))))
                 .send_async(&mut stream)
                 .await?;
         } else {
-            Message::LatestBlock(None).send_async(&mut stream).await?;
+            Message::Chain(ChainMessage::LatestBlock(None))
+                .send_async(&mut stream)
+                .await?;
         }
     } else {
         return Err(anyhow!(
@@ -78,11 +84,13 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     };
 
     // --- Step 3: Node Discovery ---
-    Message::DiscoverNodes.send_async(&mut stream).await?;
+    Message::P2P(P2PMessage::DiscoverNodes)
+        .send_async(&mut stream)
+        .await?;
     info!("Sent DiscoverNodes to {}", node_addr);
 
     match time::timeout(Duration::from_secs(5), Message::receive_async(&mut stream)).await {
-        Ok(Ok(Message::NodeList(child_nodes))) => {
+        Ok(Ok(Message::P2P(P2PMessage::NodeList(child_nodes)))) => {
             info!("Received NodeList from {}: {:?}", node_addr, child_nodes);
             // In a real-world scenario, you might want to connect to these child nodes here.
             // For now, we just log them.
@@ -107,6 +115,16 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
         let stream_arc = Arc::new(AsyncMutex::new(stream));
         crate::NODES.insert(node_addr.to_string(), stream_arc);
         info!("Handshake successful. Added initial node: {}", node_addr);
+
+        // Spawn the connection handler for this outgoing connection so we can receive messages.
+        let stream_clone = crate::NODES.get(node_addr).unwrap().clone();
+        let addr_clone = node_addr.to_string();
+        let socket_addr = stream_clone.lock().await.peer_addr()?;
+        tokio::spawn(async move {
+            let _ =
+                crate::connection::handle_connection(stream_clone, socket_addr, Some(addr_clone))
+                    .await;
+        });
     }
 
     Ok(())
@@ -134,7 +152,7 @@ pub async fn find_longest_chain_node(
             let mut stream_lock = peer.value_mut().lock().await;
 
             debug!("Querying {} for blockchain length", node_addr);
-            let message = Message::FetchLatestBlock;
+            let message = Message::Chain(ChainMessage::FetchLatestBlock);
 
             // Send a message asking for the peer's chain height.
             if let Err(e) = message.send_async(&mut *stream_lock).await {
@@ -154,7 +172,7 @@ pub async fn find_longest_chain_node(
             )
             .await
             {
-                Ok(Ok(Message::LatestBlock(Some((_, remote_height))))) => {
+                Ok(Ok(Message::Chain(ChainMessage::LatestBlock(Some((_, remote_height)))))) => {
                     let remote_block_count = remote_height + 1;
                     debug!(
                         "Received LatestBlock with height {} from {}",
@@ -169,7 +187,7 @@ pub async fn find_longest_chain_node(
                         longest_name = node_addr.clone();
                     }
                 }
-                Ok(Ok(Message::LatestBlock(None))) => {
+                Ok(Ok(Message::Chain(ChainMessage::LatestBlock(None)))) => {
                     debug!("Peer {} reported an empty chain.", node_addr);
                 }
                 Ok(Ok(message)) => {
@@ -253,7 +271,7 @@ pub async fn download_blockchain_with_existing_stream(
     for i in (local_chain_height + 1)..=(target_block_count - 1) {
         debug!("Attempting to fetch block index {} from {}", i, node_addr);
 
-        let message = Message::FetchBlock(i as u64);
+        let message = Message::Chain(ChainMessage::FetchBlock(i as u64));
 
         // Request the block.
         if let Err(e) = message.send_async(stream).await {
@@ -268,7 +286,7 @@ pub async fn download_blockchain_with_existing_stream(
 
         // Wait for the block to be sent back.
         match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
-            Ok(Ok(Message::NewBlock(block))) => {
+            Ok(Ok(Message::Chain(ChainMessage::NewBlock(block)))) => {
                 debug!(
                     "Received NewBlock for index {} from {}",
                     block.index, node_addr
@@ -362,5 +380,9 @@ pub async fn cleanup() {
         debug!("Cleaning the mempool from old transactions");
         let mut blockchain = crate::BLOCKCHAIN.get().unwrap().write().await;
         blockchain.clear_mempool();
+        // Explicitly save snapshot to ensure persistence even if no txs were removed
+        if let Err(e) = blockchain.save_mempool_snapshot() {
+            warn!("Failed to save mempool snapshot during cleanup: {}", e);
+        }
     }
 }

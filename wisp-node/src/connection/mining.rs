@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::{net::TcpStream, sync::RwLock};
 use wisp_core::{
     blockchain::{AddBlockResult, Block, Blockchain},
-    network::Message,
+    network::{ChainMessage, Message, MiningMessage},
     signatures::PublicKey,
 };
 
@@ -25,7 +25,9 @@ pub async fn handle_fetch_template(
         template.index,
         pubkey.fingerprint()
     );
-    Message::Template(template).send_async(stream).await?;
+    Message::Mining(MiningMessage::Template(template))
+        .send_async(stream)
+        .await?;
     Ok(())
 }
 
@@ -70,7 +72,9 @@ pub async fn handle_submit_template(
             );
 
             // Send the new template back to the miner. This also serves as confirmation.
-            Message::Template(next_template).send_async(stream).await?;
+            Message::Mining(MiningMessage::Template(next_template))
+                .send_async(stream)
+                .await?;
             drop(blockchain_lock); // Now we can drop the lock
 
             // Broadcast the newly mined block to all other peers. This can be a fire-and-forget task.
@@ -83,7 +87,9 @@ pub async fn handle_submit_template(
         | Ok(AddBlockResult::OrphanRejected(reason)) => {
             warn!("Mined block {} rejected: {}", block_hash_for_log, reason);
             drop(blockchain_lock);
-            Message::BlockRejected(reason).send_async(stream).await?;
+            Message::Mining(MiningMessage::BlockRejected(reason))
+                .send_async(stream)
+                .await?;
         }
         // A miner submitting a block should ideally not cause a reorg or an orphan situation,
         // as they should be building on the latest tip. However, due to network latency,
@@ -99,7 +105,9 @@ pub async fn handle_submit_template(
             // In this case, we also generate a new template based on the new state.
             let next_template =
                 blockchain_lock.get_block_template(&miner_pubkey, coinbase_message.as_deref())?;
-            Message::Template(next_template).send_async(stream).await?;
+            Message::Mining(MiningMessage::Template(next_template))
+                .send_async(stream)
+                .await?;
             drop(blockchain_lock);
 
             // Also broadcast the block in this case. It's valid work.
@@ -115,13 +123,17 @@ pub async fn handle_submit_template(
             );
             warn!("{}", reason);
             drop(blockchain_lock);
-            Message::BlockRejected(reason).send_async(stream).await?;
+            Message::Mining(MiningMessage::BlockRejected(reason))
+                .send_async(stream)
+                .await?;
         }
         Err(e) => {
             let reason = format!("Error processing submitted block: {}", e);
             warn!("{}", reason);
             drop(blockchain_lock);
-            Message::BlockRejected(reason).send_async(stream).await?;
+            Message::Mining(MiningMessage::BlockRejected(reason))
+                .send_async(stream)
+                .await?;
         }
     }
 
@@ -134,7 +146,7 @@ pub async fn handle_submit_template(
 /// message to each peer. It's a "fire-and-forget" broadcast; it logs errors
 /// but doesn't halt on individual send failures.
 pub async fn broadcast_block(block: Block) {
-    let message = Message::NewBlock(block);
+    let message = Message::Chain(ChainMessage::NewBlock(block));
     let mut peers_to_remove = Vec::new();
 
     for mut peer in crate::NODES.iter_mut() {

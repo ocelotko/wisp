@@ -278,8 +278,18 @@ async fn get_network_vitals(
 
             // Sum the work done over the window. Work is MAX_TARGET / target.
             let total_work: wisp_core::U256 = (window_start_index..=current_height)
-                .filter_map(|i| blockchain.get_block_by_index(i).ok().flatten())
-                .map(|b| wisp_core::MAX_TARGET / b.target.max(wisp_core::MIN_TARGET))
+                .filter_map(|i| {
+                    if let Some((_, target)) = blockchain.daa_cache.get(&i) {
+                        Some(*target)
+                    } else {
+                        blockchain
+                            .get_block_by_index(i)
+                            .ok()
+                            .flatten()
+                            .map(|b| b.target)
+                    }
+                })
+                .map(|target| wisp_core::MAX_TARGET / target.max(wisp_core::MIN_TARGET))
                 .fold(wisp_core::U256::zero(), |acc, work| acc + work);
 
             // Hashrate = (Total Hashes) / (Time). Total Hashes = Total Work * 2^32 (approx)

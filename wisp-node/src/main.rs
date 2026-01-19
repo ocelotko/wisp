@@ -19,7 +19,6 @@ extern crate lazy_static;
 
 #[derive(FromArgs)]
 /// A toy blockchain node
-/// Defines the command-line arguments for the node application.
 struct Args {
     #[argh(option, default = "9000")]
     /// port number
@@ -65,6 +64,21 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
     // This ensures we know our own state before talking to peers.
     blockchain_instance.load_from_db()?;
 
+    // Pre-warm DAA cache to speed up target calculation and API responses
+    let height = blockchain_instance.block_height()?;
+    let start = height.saturating_sub(wisp_core::DAA_WINDOW as u64);
+    info!(
+        "Pre-warming DAA cache from block {} to {}...",
+        start, height
+    );
+    for i in start..=height {
+        if let Some(block) = blockchain_instance.get_block_by_index(i)? {
+            blockchain_instance
+                .daa_cache
+                .insert(i, (block.timestamp, block.target));
+        }
+    }
+
     // Set the global BLOCKCHAIN static *before* calling functions that might access it.
     BLOCKCHAIN
         .set(Arc::new(RwLock::new(blockchain_instance)))
@@ -106,22 +120,39 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
     tokio::spawn(utils::cleanup());
 
     // The main server loop for accepting new peer connections.
-    loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                info!("Accepted new connection from {}", addr);
-                tokio::spawn(async move {
-                    let stream_arc = Arc::new(AsyncMutex::new(socket));
-                    if let Err(e) = connection::handle_connection(stream_arc, addr).await {
-                        error!("Error in connection handler from {}: {:?}", addr, e);
+    tokio::select! {
+        _ = async {
+            loop {
+                match listener.accept().await {
+                    Ok((socket, addr)) => {
+                        info!("Accepted new connection from {}", addr);
+                        tokio::spawn(async move {
+                            let stream_arc = Arc::new(AsyncMutex::new(socket));
+                            if let Err(e) = connection::handle_connection(stream_arc, addr, None).await {
+                                error!("Error in connection handler from {}: {:?}", addr, e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("Error accepting connection: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                error!("Error accepting connection: {}", e);
-            }
+        } => {},
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown signal received. Stopping node...");
         }
     }
+
+    if let Some(bc) = BLOCKCHAIN.get() {
+        info!("Saving mempool snapshot...");
+        let blockchain = bc.read().await;
+        if let Err(e) = blockchain.save_mempool_snapshot() {
+            error!("Failed to save mempool snapshot: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 /// A separate async function to handle the initial connection and sync logic.

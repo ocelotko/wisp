@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["wisp-core", "wisp-node", "wisp-wallet", "wisp-flame"]
+members = [
+    "wisp-core",
+    "wisp-node",
+    "wisp-wallet",
+    "wisp-flame",
+    "wisp-gui/src-tauri",
+]
 default-members = ["wisp-wallet"]
 
 [workspace.package]

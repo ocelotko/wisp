@@ -4,7 +4,7 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::TcpStream, sync::RwLock};
 use wisp_core::{
     blockchain::Blockchain,
-    network::{Message, WalletStateSnapshot},
+    network::{Message, WalletMessage, WalletStateSnapshot},
     signatures::PublicKey,
     transactions::Transaction,
 };
@@ -34,17 +34,19 @@ pub async fn handle_submit_transaction(
             drop(blockchain_lock);
 
             // Send confirmation back to the original sender.
-            Message::TransactionAcceptedConfirmation
+            Message::Wallet(WalletMessage::TransactionAcceptedConfirmation)
                 .send_async(stream)
                 .await?;
 
             // Broadcast the new transaction to all other peers.
-            broadcast_transaction(tx, sender_addr).await;
+            tokio::spawn(async move {
+                broadcast_transaction(tx, sender_addr).await;
+            });
         }
         Err(e) => {
             warn!("Transaction {} rejected: {}", tx_hash, e);
             // Send a rejection message back to the original sender.
-            Message::TransactionRejected(tx_hash, e.to_string())
+            Message::Wallet(WalletMessage::TransactionRejected(tx_hash, e.to_string()))
                 .send_async(stream)
                 .await?;
         }
@@ -78,13 +80,15 @@ pub async fn handle_fetch_wallet_state(
         utxos,
     };
 
-    Message::WalletState(snapshot).send_async(stream).await?;
+    Message::Wallet(WalletMessage::WalletState(snapshot))
+        .send_async(stream)
+        .await?;
     Ok(())
 }
 
 /// Broadcasts a new, valid transaction to all connected peers except the one it came from.
 async fn broadcast_transaction(tx: Transaction, original_sender: SocketAddr) {
-    let message = Message::NewTransaction(tx);
+    let message = Message::Wallet(WalletMessage::NewTransaction(tx));
     let mut peers_to_remove = Vec::new();
 
     for mut peer in crate::NODES.iter_mut() {

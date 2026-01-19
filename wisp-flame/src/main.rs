@@ -15,7 +15,7 @@ use std::{
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
-use wisp_core::network::Message;
+use wisp_core::network::{Message, MiningMessage, P2PMessage};
 use wisp_core::{
     blockchain::Block, pow::mine_block_parallel, signatures::PublicKey, MAX_BLOCK_FUTURE_TIMESTAMP,
 };
@@ -119,7 +119,7 @@ impl Miner {
                 // Branch 2: Listen for messages from the node, like a new template.
                 msg_res = async { let mut stream = self.stream.lock().await; Message::receive_async(&mut *stream).await } => {
                     match msg_res {
-                        Ok(Message::NewTemplate(template)) => {
+                        Ok(Message::Mining(MiningMessage::NewTemplate(template))) => {
                             info!("Received new template from node for block #{}. Updating...", template.index);
                             let mut current_template_guard = self.current_template.lock().unwrap();
                             *current_template_guard = Some(template.clone());
@@ -140,7 +140,7 @@ impl Miner {
                 _ = ping_interval.tick() => {
                     debug!("Sending Ping to node to keep connection alive.");
                     let mut stream_lock = self.stream.lock().await;
-                    if let Err(e) = Message::Ping.send_async(&mut *stream_lock).await {
+                    if let Err(e) = Message::P2P(P2PMessage::Ping).send_async(&mut *stream_lock).await {
                         warn!("Failed to send Ping to node: {}. Connection may be lost.", e);
                     }
                 }
@@ -228,7 +228,10 @@ impl Miner {
     async fn fetch_and_validate_template(&self) -> Result<()> {
         self.mining.store(false, Ordering::Relaxed);
         info!("Requesting new block template from node...");
-        let message = Message::FetchTemplate(self.public_key, self.coinbase_message.clone());
+        let message = Message::Mining(MiningMessage::FetchTemplate(
+            self.public_key,
+            self.coinbase_message.clone(),
+        ));
         let mut stream_lock = self.stream.lock().await;
         message.send_async(&mut *stream_lock).await?;
 
@@ -238,7 +241,7 @@ impl Miner {
         )
         .await
         {
-            Ok(Ok(Message::Template(mut template))) => {
+            Ok(Ok(Message::Mining(MiningMessage::Template(mut template)))) => {
                 let now = Utc::now();
                 if template.timestamp
                     > now + ChronoDuration::seconds(MAX_BLOCK_FUTURE_TIMESTAMP as i64)
@@ -272,8 +275,11 @@ impl Miner {
             "Submitting mined block: {}",
             block.id().expect("Failed to hash mined block for logging")
         );
-        let message =
-            Message::SubmitTemplate(self.public_key, block, self.coinbase_message.clone());
+        let message = Message::Mining(MiningMessage::SubmitTemplate(
+            self.public_key,
+            block,
+            self.coinbase_message.clone(),
+        ));
 
         let mut stream_lock = self.stream.lock().await;
         message
@@ -291,7 +297,7 @@ impl Miner {
         .await
         {
             // The node now responds with a new template directly as confirmation.
-            Ok(Ok(Message::Template(new_template))) => {
+            Ok(Ok(Message::Mining(MiningMessage::Template(new_template)))) => {
                 // This is the primary success path
                 info!("Submission successful: Block accepted by node.");
                 info!(
@@ -305,12 +311,12 @@ impl Miner {
                 Ok(())
             }
             // Legacy confirmation for compatibility, though our new node won't send this.
-            Ok(Ok(Message::BlockSubmittedConfirmation)) => {
+            Ok(Ok(Message::Mining(MiningMessage::BlockSubmittedConfirmation))) => {
                 // Fallback path
                 info!("Submission successful: Block accepted by node (legacy confirmation).");
                 Ok(())
             }
-            Ok(Ok(Message::BlockRejected(reason))) => {
+            Ok(Ok(Message::Mining(MiningMessage::BlockRejected(reason)))) => {
                 warn!("Block submission rejected by node: {}", reason);
                 Err(anyhow!("Block submission rejected by node: {}", reason))
             }
