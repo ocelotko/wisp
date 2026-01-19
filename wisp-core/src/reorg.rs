@@ -9,10 +9,6 @@ use bincode::config::standard as bincode_config;
 use log::{info, warn};
 use sled::transaction::{ConflictableTransactionError, TransactionalTree};
 
-/// A custom error type for reorganization operations.
-///
-/// This is designed to work with `sled::transaction` by allowing `anyhow::Error`
-/// to be wrapped and used within a transactional context.
 #[derive(Debug)]
 pub enum ReorgError {
     Anyhow(anyhow::Error),
@@ -24,17 +20,6 @@ impl From<ReorgError> for ConflictableTransactionError<ReorgError> {
 }
 
 impl Blockchain {
-    /// Handles a blockchain reorganization. This is a complex, atomic operation that switches the main chain to a new, longer fork.
-    /// # Process
-    ///
-    /// 1.  **Rollback:** Blocks from the current main chain are reverted down to the common ancestor.
-    /// 2.  **Atomic Update:** In a single database transaction, the old block data is removed,
-    ///     and the new chain segment is validated and applied. This includes updating all
-    ///     metadata like chain height, total supply, and transaction indices. A temporary
-    ///     UTXO set is built within the transaction to validate the new blocks.
-    /// 3.  **State Commit:** After the database transaction succeeds, the in-memory state (UTXO set,
-    ///     mempool, DAA cache) is updated to reflect the new chain. Transactions from the reverted
-    ///     blocks are re-added to the mempool if they are still valid.
     pub fn reorganize_chain(
         &mut self,
         new_chain_segment: Vec<Block>,
@@ -46,9 +31,9 @@ impl Blockchain {
             new_chain_segment.len()
         );
         let mut rolled_back_blocks: Vec<Block> = Vec::new();
-        // 1. Determine which blocks from our current chain need to be reverted.
         let mut current_height = self.block_height()?;
 
+        // 1. Rollback: Revert blocks from current tip down to the common ancestor
         while current_height > common_ancestor_index {
             if let Some(block_to_revert) = self.get_block_by_index(current_height)? {
                 rolled_back_blocks.push(block_to_revert);
@@ -65,19 +50,15 @@ impl Blockchain {
             return Err(anyhow!("Cannot reorganize with an empty new chain segment"));
         }
 
-        // 2. Perform the entire reorg, including validation, inside a single atomic database transaction.
         self.db
             .transaction(
                 |tx_db| -> Result<(), ConflictableTransactionError<ReorgError>> {
                     let mut new_supply = self.total_supply.as_smallest_unit();
                     let mut new_tx_count = self.total_tx_count;
+                    // Remove rolled back blocks from DB and update indices
                     for block_to_revert in &rolled_back_blocks {
-                        // Tip-first rollback order ensures dependencies are undone correctly.
-                        // For each reverted block, remove it and its associated data from the DB.
                         let hash = block_to_revert.id().map_err(ReorgError::Anyhow)?;
 
-                        // Adjust total supply by subtracting the coinbase reward.
-                        // Fees are redistribution, not new supply, so they don't affect total supply.
                         let block_reward =
                             crate::utils::calculate_block_reward(block_to_revert.index);
                         new_supply = new_supply.saturating_sub(block_reward.as_smallest_unit());
@@ -90,13 +71,11 @@ impl Blockchain {
                         for tx in block_to_revert.transactions.iter().rev() {
                             let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
 
-                            // For regular (non-coinbase) transactions, revert their metadata.
                             if !tx.is_coinbase() {
-                                new_tx_count = new_tx_count.saturating_sub(1); // Decrement before using as key
+                                new_tx_count = new_tx_count.saturating_sub(1);
                                 tx_db.remove(DBKeys::tx_by_order(new_tx_count))?;
                                 tx_db.remove(DBKeys::tx_location(&tx_hash))?;
 
-                                // Remove the transaction from each output's public key history index.
                                 for output in &tx.outputs {
                                     let key = DBKeys::history(&output.pubkey.fingerprint());
                                     Self::remove_hash_from_history_list(tx_db, &key, &tx_hash)?;
@@ -123,12 +102,8 @@ impl Blockchain {
                         }
                     }
 
-                    // --- Build a temporary, transaction-consistent UTXO set for validation ---
-                    // This is the most critical part for ensuring atomicity. We must not use
-                    // the live `self.utxo_set`. Instead, we rebuild the UTXO state as it was
-                    // at the common ancestor, using only data from the transactional DB view.
-
-                    // 1. Load the last UTXO snapshot from the DB.
+                    // 2. Rebuild UTXO set state at the common ancestor
+                    // We load the last snapshot and apply blocks up to the ancestor
                     let (mut temp_utxos, last_snapshot_height) =
                         if let Some(snapshot_ivec) = tx_db.get(DBKeys::UTXO_SNAPSHOT)? {
                             let decompressed_bytes = zstd::decode_all(&snapshot_ivec[..])
@@ -149,11 +124,9 @@ impl Blockchain {
                                     .map_err(|e| ReorgError::Anyhow(e.into()))?;
                             (snapshot, height)
                         } else {
-                            // No snapshot, start with an empty set from before genesis.
                             (crate::utxo::UtxoSet::new(), 0)
                         };
 
-                    // 2. Apply blocks from the snapshot up to the common ancestor.
                     for height in (last_snapshot_height + 1)..=common_ancestor_index {
                         let block = self
                             .get_block_by_index_from_db_txn(height, tx_db)
@@ -167,13 +140,13 @@ impl Blockchain {
                         temp_utxos.apply_block(&block).map_err(ReorgError::Anyhow)?;
                     }
 
-                    // For each new block, add it and its associated data to the DB.
+                    // 3. Apply new chain segment
                     for block_to_apply in &new_chain_segment {
-                        // Validate the new block against the temporary state.
+                        // Validate block in the context of the reorg (using temp_utxos)
                         let expected_target = self.calculate_next_target_from_height(block_to_apply.index - 1).map_err(ReorgError::Anyhow)?;
                         block_to_apply.validate_block_for_reorg(&temp_utxos.utxos, &expected_target, tx_db).map_err(ReorgError::Anyhow)?;
 
-                        // Apply the block to the database using the shared helper.
+                        // Update DB with new block data
                         Self::apply_block_to_db(
                             tx_db,
                             block_to_apply,
@@ -182,12 +155,11 @@ impl Blockchain {
                             new_tx_count,
                         )?;
 
-                        // Apply the block to our temporary UTXO set for the next iteration's validation.
+                        // Update temp UTXO set
                         temp_utxos.apply_block(block_to_apply)
                             .map_err(ReorgError::Anyhow)?;
                     }
 
-                    // Update the final chain state metadata.
                     let new_tip_block = new_chain_segment
                         .last()
                         .ok_or_else(|| ReorgError::Anyhow(anyhow!("New chain segment is empty")))?;
@@ -199,12 +171,10 @@ impl Blockchain {
                     tx_db.insert(DBKeys::TOTAL_TX_COUNT, new_tx_count.to_be_bytes().to_vec())?;
                     tx_db.insert(DBKeys::TOTAL_SUPPLY, new_supply.to_be_bytes().to_vec())?;
 
-                    // Atomically commit the final state of the UTXO set for the new chain.
                     let final_utxo_bytes = bincode::encode_to_vec(&temp_utxos, bincode_config())
                         .map_err(|e| ReorgError::Anyhow(e.into()))?;
                     tx_db.insert(DBKeys::PENDING_UTXO_SNAPSHOT, final_utxo_bytes)?;
 
-                    // Clear the pending reorg keys to mark the reorg as complete.
                     tx_db.remove(DBKeys::PENDING_REORG_TIP)?;
                     tx_db.remove(DBKeys::PENDING_REORG_ANCESTOR)?;
                     tx_db.remove(DBKeys::PENDING_REORG_ANCESTOR_HASH)?;
@@ -216,13 +186,10 @@ impl Blockchain {
                 sled::transaction::TransactionError::Storage(err) => anyhow::Error::from(err),
             })?;
 
-        // 3. Atomically update in-memory state, which is now safe post-DB-commit.
-        // Load the UTXO set from the pending snapshot we just committed.
         if let Some(bytes) = self.db.get(DBKeys::PENDING_UTXO_SNAPSHOT)? {
             let (snapshot, _): (crate::utxo::UtxoSet, _) =
                 bincode::decode_from_slice(&bytes, bincode_config())?;
             self.utxo_set = snapshot.clone();
-            // Promote the pending snapshot to the main snapshot atomically.
             self.db
                 .transaction(|tx_db| {
                     tx_db.insert(DBKeys::UTXO_SNAPSHOT, bytes.to_vec())?;
@@ -233,14 +200,12 @@ impl Blockchain {
                     anyhow!("Failed to promote UTXO snapshot after reorg: {:?}", e)
                 })?;
         } else {
-            // This should not happen if the transaction succeeded.
-            // As a fallback, rebuild from scratch to ensure consistency.
             warn!("[REORG] Pending UTXO snapshot not found after reorg commit. Forcing full UTXO rebuild.");
             self.rebuild_utxos()?;
         }
 
-        // Re-add transactions from the old, reverted fork back to the mempool.
-        // Some may fail if they are now invalid (e.g., spent by the new fork).
+        // 4. Re-add transactions from rolled back blocks to mempool
+        // This ensures valid txs from the old chain aren't lost
         let mut txs_to_readd_to_mempool = Vec::new();
         for block_to_revert in rolled_back_blocks.iter().rev() {
             for tx in &block_to_revert.transactions {
@@ -250,7 +215,6 @@ impl Blockchain {
             }
         }
 
-        // Update DAA cache: clear old fork entries and add new ones.
         self.daa_cache
             .retain(|&index, _| index <= common_ancestor_index);
         for block in &new_chain_segment {
@@ -260,7 +224,7 @@ impl Blockchain {
 
         for tx in txs_to_readd_to_mempool {
             let tx_hash_for_logging = tx.txid()?;
-            if let Err(e) = self.add_to_mempool(tx) {
+            if let Err(e) = self.add_transaction_to_mempool(tx, false) {
                 warn!(
                     "Could not re-add transaction {} to mempool after reorg (it may be invalid in the new chain context): {}",
                     tx_hash_for_logging, e
@@ -268,12 +232,14 @@ impl Blockchain {
             }
         }
 
-        // Finally, clear any transactions from the mempool that were included in the new fork.
         for block in &new_chain_segment {
-            self.clear_mempool_of_block_transactions(block, block.id()?);
+            self.clear_mempool_of_block_transactions_internal(block, block.id()?, false);
         }
 
-        // Recalculate the PoW target for the new chain tip.
+        if let Err(e) = self.save_mempool_snapshot() {
+            warn!("[REORG] Failed to save mempool snapshot after reorg: {}", e);
+        }
+
         self.target = self.calculate_next_target()?;
         self.prune_daa_cache(self.block_height()?);
         self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
@@ -289,10 +255,7 @@ impl Blockchain {
         );
         Ok(())
     }
-    /// A static helper function to find a transaction output during a reorg.
-    ///
-    /// It first checks if the output was created in the new chain segment being applied.
-    /// If not, it falls back to searching the database via the transactional view (`tx_db`).
+
     pub fn find_output_for_reorg_static(
         tx_db: &sled::transaction::TransactionalTree,
         outpoint: &crate::transactions::OutPoint,
@@ -301,7 +264,6 @@ impl Blockchain {
         Option<crate::transactions::TransactionOutput>,
         ConflictableTransactionError<ReorgError>,
     > {
-        // First, check if the output was created in one of the new blocks being applied.
         for block in new_chain_segment {
             for tx in &block.transactions {
                 if tx.txid().ok() == Some(outpoint.txid) {
@@ -311,7 +273,6 @@ impl Blockchain {
                 }
             }
         }
-        // If not, search the database for the transaction that created the output.
         if let Some(ivec) = tx_db.get(DBKeys::tx_location(&outpoint.txid))? {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ivec);
@@ -342,10 +303,6 @@ impl Blockchain {
         Ok(None)
     }
 
-    /// Adds a transaction hash to a list stored under a given key in the database.
-    ///
-    /// This is a static method designed to be safely called within a `sled::transaction` closure.
-    /// It is used to maintain the `history_{pubkey}` index for wallet transaction lookups.
     pub(crate) fn add_hash_to_history_list(
         tx_db: &sled::transaction::TransactionalTree,
         key: &[u8],
@@ -370,10 +327,7 @@ impl Blockchain {
         }
         Ok(())
     }
-    /// Removes a transaction hash from a list stored under a given key in the database.
-    ///
-    /// This is a static method designed to be safely called within a `sled::transaction` closure.
-    /// It is used to update the `history_{pubkey}` index when reverting blocks during a reorg.
+
     fn remove_hash_from_history_list(
         tx_db: &sled::transaction::TransactionalTree,
         key: &[u8],
@@ -398,14 +352,10 @@ impl Blockchain {
         Ok(())
     }
 
-    /// A shared helper function to apply all database changes for a single block within a transaction.
-    ///
-    /// This is used by both `add_direct_extension` and `reorganize_chain` to ensure
-    /// consistent and atomic block application to the database.
     pub(crate) fn apply_block_to_db(
         tx_db: &TransactionalTree,
         block_to_apply: &Block,
-        new_chain_segment_for_reorg: &[Block], // Empty for direct extension, used for finding UTXOs
+        new_chain_segment_for_reorg: &[Block],
         initial_supply: u64,
         initial_tx_count: u64,
     ) -> Result<(u64, u64), ConflictableTransactionError<ReorgError>> {
@@ -421,7 +371,6 @@ impl Blockchain {
         let hash_bytes = bincode::encode_to_vec(&block_hash, bincode_config())
             .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
-        // Store the block itself and its index mappings.
         tx_db.insert(DBKeys::block(&block_hash), checked_block_bytes)?;
         tx_db.insert(
             DBKeys::index_to_hash(block_to_apply.index),
@@ -436,30 +385,23 @@ impl Blockchain {
             hash_bytes,
         )?;
 
-        // Update total supply with this block's reward and fees.
         let block_reward = crate::utils::calculate_block_reward(block_to_apply.index);
-        // Fees are redistribution, not new supply.
         supply = supply.saturating_add(block_reward.as_smallest_unit());
 
-        // Update total supply and tx count for this block application within the transaction
         tx_db.insert(DBKeys::TOTAL_SUPPLY, supply.to_be_bytes().to_vec())?;
 
-        // Process each transaction in the block.
         for tx in &block_to_apply.transactions {
             let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
             let tx_hash_bytes = bincode::encode_to_vec(&tx_hash, bincode_config())
                 .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
-            // Update history index for all outputs.
             for output in &tx.outputs {
                 let key = DBKeys::history(&output.pubkey.fingerprint());
                 Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
             }
 
-            // For non-coinbase transactions, update history for inputs and other metadata.
             if !tx.is_coinbase() {
                 for input in &tx.inputs {
-                    // Find the original output being spent to get its public key for history indexing.
                     let spent_output = Blockchain::find_output_for_reorg_static(
                         tx_db,
                         &input.outpoint,
@@ -476,12 +418,10 @@ impl Blockchain {
                     Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
                 }
 
-                // Store chronological transaction index.
                 tx_db.insert(DBKeys::tx_by_order(tx_count), tx_hash_bytes.clone())?;
                 tx_count += 1;
             }
 
-            // Store transaction location for all transactions.
             tx_db.insert(
                 DBKeys::tx_location(&tx_hash),
                 block_to_apply.index.to_be_bytes().to_vec(),
@@ -492,17 +432,12 @@ impl Blockchain {
         Ok((supply, tx_count))
     }
 
-    /// Calculates the total fees for a block within a reorg's database transaction.
-    ///
-    /// This static method is designed to be used inside `sled::transaction` closures,
-    /// as it operates on a transactional view of the database.
     pub(crate) fn calculate_block_fees_for_reorg(
         block: &Block,
         tx_db: &TransactionalTree,
     ) -> Result<Amount, ConflictableTransactionError<ReorgError>> {
         let mut total_fees = Amount::zero();
 
-        // Create a map of outputs created within this block to handle intra-block spends.
         let mut new_outputs_in_block = std::collections::HashMap::new();
         for tx in block.transactions.iter().skip(1) {
             let txid = tx.txid().map_err(ReorgError::Anyhow)?;
@@ -517,7 +452,6 @@ impl Blockchain {
             }
         }
 
-        // Iterate over non-coinbase transactions to calculate their fees.
         for tx in block.transactions.iter().skip(1) {
             let fee = Self::calculate_transaction_fee_for_reorg(tx, tx_db, &new_outputs_in_block)?;
             total_fees = (total_fees.checked_add(fee))
@@ -527,11 +461,6 @@ impl Blockchain {
         Ok(total_fees)
     }
 
-    /// Calculates the fee for a single transaction within a reorg's database transaction.
-    ///
-    /// It correctly handles intra-block spends by first checking `new_outputs_in_block`.
-    /// If the output is not found there, it falls back to the database via
-    /// `find_output_for_reorg_static`.
     pub(crate) fn calculate_transaction_fee_for_reorg(
         transaction: &crate::transactions::Transaction,
         tx_db: &TransactionalTree,
@@ -546,11 +475,9 @@ impl Blockchain {
 
         let mut input_total = Amount::zero();
         for input in &transaction.inputs {
-            // First, check for outputs created in this same block (intra-block spend).
             let prev_output = if let Some(output) = new_outputs_in_block.get(&input.outpoint) {
                 Some(output.clone())
             } else {
-                // If not an intra-block spend, look it up in the database transaction.
                 Self::find_output_for_reorg_static(tx_db, &input.outpoint, &[])?
             };
 

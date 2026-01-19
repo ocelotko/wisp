@@ -20,12 +20,10 @@ use std::{
 
 use crate::sha256::{Hash, Hashable};
 
-/// A wrapper around a `k256::ecdsa::Signature` to provide serialization and domain-specific methods.
 #[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Signature(#[bincode(with_serde)] pub EcdsaSignature<Secp256k1>);
 
 impl Signature {
-    /// Creates a new signature from a DER-encoded hex string.
     pub fn from_hex(s: &str) -> anyhow::Result<Self> {
         let bytes = hex::decode(s)?;
         EcdsaSignature::from_der(&bytes)
@@ -33,22 +31,16 @@ impl Signature {
             .map_err(|e| anyhow!("Failed to create Signature from DER bytes: {}", e))
     }
 
-    /// Returns the signature as a DER-encoded hex string.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0.to_der().as_bytes())
     }
 
-    /// Creates a new signature for a given transaction hash using a private key.
-    ///
-    /// All signatures are generated using deterministic ECDSA per RFC 6979;
-    /// no external randomness is required for the signing operation itself.
     pub fn sign_transaction_hash(transaction_hash: &Hash, private_key: &PrivateKey) -> Self {
         let signing_key = &private_key.0;
         let signature = signing_key.sign(&transaction_hash.as_bytes()[..]);
         Signature(signature)
     }
 
-    /// Verifies that the signature is valid for a given transaction hash and public key.
     pub fn verify_transaction_hash(&self, transaction_hash: &Hash, public_key: &PublicKey) -> bool {
         public_key
             .0
@@ -57,7 +49,6 @@ impl Signature {
     }
 }
 
-/// A wrapper around a `k256::ecdsa::VerifyingKey` representing a secp256k1 public key.
 #[derive(
     Encode, Decode, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Copy,
 )]
@@ -79,7 +70,6 @@ impl Default for PublicKey {
 }
 
 use sha2::Digest;
-/// Implements `Hashable` for `PublicKey` to allow it to be included in hashed data structures.
 impl Hashable for PublicKey {
     fn update_hasher(&self, hasher: &mut sha2::Sha256) {
         hasher.update(self.0.to_encoded_point(true).as_bytes());
@@ -98,14 +88,11 @@ impl FromStr for PublicKey {
 }
 
 impl PublicKey {
-    /// Returns the compressed SEC1-encoded public key as a hex string.
-    /// This is commonly used as the wallet address.
     pub fn fingerprint(&self) -> String {
         let encoded_point = self.0.to_encoded_point(true);
         hex::encode(encoded_point.as_bytes())
     }
 
-    /// Returns the compressed SEC1-encoded public key as a 33-byte array.
     pub fn to_bytes(&self) -> [u8; 33] {
         self.0
             .to_encoded_point(true)
@@ -122,7 +109,6 @@ impl StdHash for PublicKey {
     }
 }
 
-/// A wrapper around a `k256::ecdsa::SigningKey` representing a secp256k1 private key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateKey(pub SigningKey<Secp256k1>);
 
@@ -155,8 +141,6 @@ impl Encode for PrivateKey {
 
 impl Decode<()> for PrivateKey {
     fn decode<D: Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
-        // The private key is 32 bytes.
-        // We need to read into a fixed-size array.
         let mut bytes = [0u8; 32];
         decoder.reader().read(&mut bytes)?;
         SigningKey::from_slice(&bytes)

@@ -9,7 +9,6 @@
 pub mod blockchain;
 /// Defines the currency `Amount` type and handles currency-related arithmetic.
 pub mod currency;
-
 /// Implements the transaction memory pool for unconfirmed transactions.
 pub mod mempool;
 /// Defines network messages for peer-to-peer communication.
@@ -58,7 +57,8 @@ pub const INITIAL_BLOCK_REWARD_SMALLEST_UNITS: u64 =
 pub const HALVING_INTERVAL: u64 = 525_600;
 
 /// The ideal time between blocks in seconds. Used for difficulty adjustment.
-pub const IDEAL_BLOCK_TIME: u64 = 120; // 2 minutes in seconds
+/// 2 minutes in seconds
+pub const IDEAL_BLOCK_TIME: u64 = 120;
 
 /// The window of blocks used for difficulty adjustment. 720 blocks represents 1 day.
 pub const DAA_WINDOW: usize = 720;
@@ -95,3 +95,6 @@ pub const MAX_BLOCK_FUTURE_TIMESTAMP: u64 = 180; // 3 minutes in seconds
 /// The minimum allowed value for a transaction output (dust limit).
 /// Any transaction output below this value will be rejected to prevent UTXO set bloating.
 pub const MIN_OUTPUT_VALUE: u64 = 546;
+
+/// The maximum size of the coinbase data field in bytes.
+pub const MAX_COINBASE_DATA_SIZE: usize = 100;

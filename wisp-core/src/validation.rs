@@ -16,9 +16,6 @@ use sled::transaction::TransactionalTree;
 use std::collections::{HashMap, HashSet};
 
 /// Represents the context in which block validation is occurring.
-///
-/// This allows the validation logic to be shared between normal block addition (`Live`)
-/// and chain reorganizations (`Reorg`), which have different sources for state data.
 pub enum ValidationState<'a> {
     Live(&'a Blockchain),
     Reorg {
@@ -28,12 +25,7 @@ pub enum ValidationState<'a> {
 }
 
 impl Block {
-    /// Performs a lightweight, context-free validation of the block's header and proof-of-work.
-    ///
-    /// This is a fast check used for incoming fork or orphan blocks before persisting them,
-    /// which helps to avoid storing obviously invalid or spam blocks.
     pub fn validate_header_and_pow(&self) -> Result<()> {
-        // 1. Check if the block's hash meets its own declared PoW target.
         let block_hash = self
             .id()
             .context("Failed to get block hash for PoW validation")?;
@@ -45,7 +37,6 @@ impl Block {
             ));
         }
 
-        // 2. Check if the timestamp is not too far in the future.
         let now = Utc::now();
         if self.timestamp > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
         {
@@ -55,15 +46,10 @@ impl Block {
         Ok(())
     }
     /// Performs a comprehensive, context-aware validation of a block's contents and consensus rules.
-    ///
-    /// This is a critical function for ensuring the integrity of the blockchain. It is called
-    /// when adding a new block to the main chain.
     pub fn validate_block(&self, blockchain: &Blockchain, expected_target: &U256) -> Result<()> {
         self.validate_block_with_state(ValidationState::Live(blockchain), expected_target)
     }
 
-    /// A unified block validation function that works for both live chain and reorg contexts,
-    /// using the `ValidationState` enum to abstract the data source.
     fn validate_block_with_state(
         &self,
         state: ValidationState,
@@ -75,7 +61,6 @@ impl Block {
             self.id().unwrap_or_default()
         );
 
-        // 0. Check block size. This is a cheap check to perform first to prevent DoS.
         let encoded_block = bincode::encode_to_vec(self, bincode_config())?;
         if encoded_block.len() > crate::MAX_BLOCK_SIZE_BYTES {
             return Err(anyhow!(
@@ -88,7 +73,7 @@ impl Block {
             .id()
             .context("Failed to get block hash for validation")?;
 
-        // 1. Check if the block's hash meets its own declared PoW target.
+        // 1. Validate Proof of Work
         if !block_hash.matches_target(self.target) {
             return Err(anyhow!(
                 "Block hash ({}) does not meet its own target ({}) (PoW failed)",
@@ -98,9 +83,8 @@ impl Block {
         }
         debug!("PoW valid against block's own target.");
 
-        // 2. Check if the block's declared target matches the one calculated by our DAA.
+        // 2. Validate Target Difficulty
         if self.target != *expected_target {
-            // `expected_target` is calculated by the node before calling this function.
             return Err(anyhow!(
                 "Block's declared target ({}) does not match expected target ({}) for index {}",
                 self.target,
@@ -110,7 +94,7 @@ impl Block {
         }
         debug!("Block's target matches expected target.");
 
-        // 3. Verify the Merkle root.
+        // 3. Validate Merkle Root
         let calculated_merkle_root = MerkleRoot::calculate(&self.transactions)
             .context("Failed to calculate Merkle root during block validation")?;
         if calculated_merkle_root != self.merkle_root {
@@ -122,7 +106,7 @@ impl Block {
         }
         debug!("Merkle root validation passed.");
 
-        // 4. Check if the timestamp is not too far in the future.
+        // 4. Validate Timestamp (Future Limit)
         let now = Utc::now();
         if self.timestamp > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
         {
@@ -130,7 +114,7 @@ impl Block {
         }
         debug!("Timestamp validation passed.");
 
-        // 5. Check if the timestamp is greater than the median time of the past 11 blocks.
+        // 5. Validate Timestamp (Median Time Past)
         if self.index > 0 {
             let mtp = match state {
                 ValidationState::Live(blockchain) => {
@@ -149,14 +133,13 @@ impl Block {
             }
         }
 
-        // 6. Ensure the block is not empty.
         if self.transactions.is_empty() {
             return Err(anyhow!(
                 "Block must contain at least a coinbase transaction."
             ));
         }
 
-        // 7. Verify the coinbase transaction.
+        // 6. Validate Coinbase Transaction
         info!("DEBUG: About to verify coinbase transaction and calculate total fees.");
         let coinbase_tx = self
             .transactions
@@ -168,22 +151,31 @@ impl Block {
             ));
         }
 
-        // Use the block's own fee calculation method, which correctly handles intra-block spends
-        // by passing it the blockchain's current UTXO set.
         let total_fees_in_block = match state {
             ValidationState::Live(blockchain) => {
                 let mut fees = Amount::zero();
-                // Skip the coinbase transaction itself when summing fees.
+                let mut outputs_created_in_block = HashMap::new();
                 for tx in self.transactions.iter().skip(1) {
-                    let fee = blockchain.calculate_transaction_fee(tx)?;
+                    let fee = blockchain
+                        .calculate_transaction_fee_with_overlay(tx, &outputs_created_in_block)?;
                     fees = fees
                         .checked_add(fee)
                         .context("Fee sum overflow during block validation")?;
+
+                    let txid = tx.txid()?;
+                    for (i, output) in tx.outputs.iter().enumerate() {
+                        outputs_created_in_block.insert(
+                            OutPoint {
+                                txid,
+                                vout: i as u32,
+                            },
+                            output.clone(),
+                        );
+                    }
                 }
                 fees
             }
             ValidationState::Reorg { tx_db, .. } => {
-                // During a reorg, we must use the special fee calculation function that operates on the DB transaction.
                 Blockchain::calculate_block_fees_for_reorg(self, tx_db)
                     .map_err(|e| anyhow::anyhow!("Reorg fee calculation failed: {:?}", e))?
             }
@@ -192,7 +184,7 @@ impl Block {
             .context("Coinbase transaction verification failed")?;
         info!("DEBUG: Coinbase transaction validation passed.");
 
-        // 8. Verify all other (regular) transactions in the block.
+        // 7. Validate Regular Transactions
         let utxos_for_validation = match state {
             ValidationState::Live(blockchain) => blockchain.utxos(),
             ValidationState::Reorg { temp_utxos, .. } => temp_utxos,
@@ -205,9 +197,6 @@ impl Block {
     }
 
     /// A specialized version of `validate_block` for use within a database transaction during a reorg.
-    ///
-    /// It uses a temporary UTXO set and a transactional database view (`tx_db`) instead of
-    /// a live `Blockchain` instance to ensure atomicity and avoid deadlocks.
     pub fn validate_block_for_reorg(
         &self,
         temp_utxos: &HashMap<OutPoint, TransactionOutput>,
@@ -220,16 +209,10 @@ impl Block {
         )
     }
 
-    /// Verifies all non-coinbase transactions within the block.
-    ///
-    /// This includes checking for transaction size, duplicate transactions, double-spends
-    /// (both within the block and against the chain's UTXO set), signature validity,
-    /// and ensuring that input values are sufficient to cover output values (plus fees).
     pub fn verify_transactions(
         &self,
         chain_utxos: &HashMap<OutPoint, TransactionOutput>,
     ) -> Result<()> {
-        // Check transaction count against the consensus limit.
         if self.transactions.len() > crate::MAX_BLOCK_TRANSACTIONS {
             return Err(anyhow!(
                 "Block contains too many transactions: {}, max is {}",
@@ -238,7 +221,6 @@ impl Block {
             ));
         }
 
-        // Keep track of inputs spent within this block to prevent intra-block double spends.
         let mut inputs_in_block: HashSet<OutPoint> = HashSet::new();
         let mut new_outputs_in_block: HashMap<OutPoint, TransactionOutput> = HashMap::new();
         let mut tx_hashes_in_block: HashSet<crate::sha256::Hash> = HashSet::new();
@@ -259,12 +241,10 @@ impl Block {
             let mut output_value = Amount::zero();
             let mut inputs_checked_in_tx: HashSet<OutPoint> = HashSet::new();
 
-            // Check for duplicate transactions within the block.
             if !tx_hashes_in_block.insert(txid) {
                 return Err(anyhow!("Duplicate transaction {} found in block", txid));
             }
 
-            // Check transaction size.
             let encoded_tx = bincode::encode_to_vec(transaction, bincode_config())?;
             if encoded_tx.len() > crate::MAX_TRANSACTION_SIZE_BYTES {
                 return Err(anyhow!(
@@ -285,7 +265,6 @@ impl Block {
             for input in &transaction.inputs {
                 let outpoint = &input.outpoint;
 
-                // Check for double spend within the same block.
                 if inputs_in_block.contains(outpoint) {
                     return Err(anyhow!("Double spend within block: input {}", outpoint));
                 }
@@ -297,8 +276,6 @@ impl Block {
                     ));
                 }
 
-                // Find the output being spent. It could be from a previous block (in `chain_utxos`)
-                // or from an earlier transaction in this same block (in `new_outputs_in_block`).
                 let prev_output = if let Some(output) = new_outputs_in_block.get(outpoint) {
                     output.clone()
                 } else if let Some(output) = chain_utxos.get(outpoint) {
@@ -310,11 +287,8 @@ impl Block {
                     ));
                 };
 
-                // After confirming the UTXO exists, mark it as spent for this block's context.
-                // This must be done *after* finding the UTXO but *before* signature verification.
                 inputs_in_block.insert(*outpoint);
 
-                // Verify the signature.
                 let is_signature_valid = match input.signature.as_ref() {
                     Some(sig) => prev_output
                         .pubkey
@@ -356,7 +330,6 @@ impl Block {
                     .context("Output value overflow in block validation")?;
             }
 
-            // Add the newly created outputs to a temporary map for subsequent transactions in this block to use.
             for (vout, output) in transaction.outputs.iter().enumerate() {
                 new_outputs_in_block.insert(
                     OutPoint {
@@ -367,7 +340,6 @@ impl Block {
                 );
             }
 
-            // Ensure inputs >= outputs.
             if input_value < output_value {
                 return Err(anyhow!(
                     "Insufficient funds in transaction {}: inputs ({}) < outputs ({})",
@@ -385,19 +357,12 @@ impl Block {
         Ok(())
     }
 
-    /// Verifies the coinbase transaction (the first transaction in a block).
-    ///
-    /// This function checks that the coinbase transaction follows all consensus rules:
-    /// - It must be the first transaction.
-    /// - Its `coinbase_data` must start with the block height (BIP 34).
-    /// - Its output value must equal the block reward plus the sum of all transaction fees in the block.
     pub fn verify_coinbase_transaction(&self, total_fees_in_block: Amount) -> Result<()> {
         if self.transactions.is_empty() {
             // This check is technically redundant if verify_transactions is called, but good for defense-in-depth.
             return Err(anyhow!("Block has no transactions (missing coinbase)"));
         }
 
-        // BIP 34: Coinbase script must start with the block height.
         let coinbase_input = self.transactions[0]
             .inputs
             .get(0)
@@ -408,18 +373,16 @@ impl Block {
             .ok_or_else(|| anyhow!("Coinbase input is missing coinbase_data (scriptSig)"))?;
 
         const MIN_COINBASE_DATA_SIZE: usize = std::mem::size_of::<u64>();
-        const MAX_COINBASE_DATA_SIZE: usize = 100; // As per BIP34
         if coinbase_data.len() < MIN_COINBASE_DATA_SIZE
-            || coinbase_data.len() > MAX_COINBASE_DATA_SIZE
+            || coinbase_data.len() > crate::MAX_COINBASE_DATA_SIZE
         {
             return Err(anyhow!(
                 "Coinbase data size ({}) is outside the allowed range of {}-{} bytes",
                 coinbase_data.len(),
                 MIN_COINBASE_DATA_SIZE,
-                MAX_COINBASE_DATA_SIZE
+                crate::MAX_COINBASE_DATA_SIZE
             ));
         }
-        // Safely get the first 8 bytes for the height to avoid panicking on a short slice.
         let height_bytes = coinbase_data
             .get(0..std::mem::size_of::<u64>())
             .ok_or_else(|| anyhow!("Coinbase data is too short to contain block height"))?;
@@ -467,11 +430,6 @@ impl Block {
         Ok(())
     }
 
-    /// Calculates the median timestamp of the last 11 blocks.
-    ///
-    /// This is used to enforce the Median Time Past (MTP) rule, which prevents miners
-    /// from arbitrarily setting block timestamps far in the future. A block's timestamp
-    /// must be greater than the MTP of the 11 preceding blocks.
     fn calculate_median_time_past(
         block_index: u64,
         blockchain: Option<&Blockchain>,
@@ -483,13 +441,9 @@ impl Block {
         let end_index = start_index.saturating_sub(10);
 
         for i in end_index..=start_index {
-            // Use the transactional DB view if provided, otherwise use the main blockchain instance.
             let block_opt = match (blockchain, tx_db) {
                 (Some(bc), None) => bc.get_block_by_index(i)?,
-                (None, Some(db)) => {
-                    // This path is now self-contained for reorgs.
-                    Blockchain::get_block_by_index_from_db_txn_static(i, db)?
-                }
+                (None, Some(db)) => Blockchain::get_block_by_index_from_db_txn_static(i, db)?,
                 _ => {
                     return Err(anyhow!(
                         "Invalid state for MTP calculation: must provide either blockchain or tx_db"

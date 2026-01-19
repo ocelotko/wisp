@@ -15,7 +15,6 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Represents the confirmation status of a transaction.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum TransactionStatus {
     Pending,
@@ -24,7 +23,6 @@ pub enum TransactionStatus {
     NotFound,
 }
 
-/// Contains detailed information about a transaction relevant to a wallet.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletTransactionInfo {
     pub transaction: Transaction,
@@ -34,14 +32,12 @@ pub struct WalletTransactionInfo {
     pub block_index: Option<u64>,
 }
 
-/// A snapshot of a wallet's state, including its transactions and UTXOs.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WalletStateSnapshot {
     pub transactions: Vec<WalletTransactionInfo>,
     pub utxos: Vec<(OutPoint, TransactionOutput)>,
 }
 
-/// Defines the set of messages that can be exchanged between nodes on the network.
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Message {
     // --- Wallet & Transaction Messages ---
@@ -80,7 +76,7 @@ pub enum Message {
     GetBlockHeaders {
         from_index: u64,
         count: u32,
-    }, // Request a sequence of block headers.
+    },
     BlockHeaders(Vec<BlockHeader>),
 
     // --- General & Peer Discovery Messages ---
@@ -94,7 +90,6 @@ pub enum Message {
 }
 
 impl Message {
-    /// Serializes the message into a byte vector using bincode.
     pub fn encode(&self) -> Result<Vec<u8>, IoError> {
         bincode::encode_to_vec(self, bincode_config()).map_err(|e| {
             IoError::new(
@@ -104,7 +99,6 @@ impl Message {
         })
     }
 
-    /// Deserializes a byte slice into a `Message`.
     pub fn decode(data: &[u8]) -> Result<Self, IoError> {
         bincode::decode_from_slice(data, bincode_config())
             .map(|(msg, _)| msg)
@@ -116,7 +110,6 @@ impl Message {
             })
     }
 
-    /// Sends the message over a synchronous stream, prepending its length.
     pub fn send(&self, stream: &mut impl Write) -> Result<(), IoError> {
         let bytes = self.encode()?;
         let len = bytes.len() as u64;
@@ -142,7 +135,6 @@ impl Message {
         Ok(())
     }
 
-    /// Receives a message from a synchronous stream, first reading the length.
     pub fn receive(stream: &mut impl Read) -> Result<Self, IoError> {
         let mut len_bytes = [0u8; 8];
         stream.read_exact(&mut len_bytes)?;
@@ -178,7 +170,6 @@ impl Message {
         Self::decode(&data)
     }
 
-    /// Sends the message over an asynchronous stream, prepending its length.
     pub async fn send_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> Result<(), IoError> {
         let bytes = self.encode()?;
         let len = bytes.len() as u64;
@@ -204,7 +195,6 @@ impl Message {
         Ok(())
     }
 
-    /// Receives a message from an asynchronous stream, first reading the length.
     pub async fn receive_async(stream: &mut (impl AsyncRead + Unpin)) -> Result<Self, IoError> {
         let mut len_bytes = [0u8; 8];
         stream.read_exact(&mut len_bytes).await?;
@@ -234,9 +224,6 @@ impl Message {
             ));
         }
 
-        // Allocate the exact buffer size and read the exact number of bytes.
-        // `read_exact` will return an `UnexpectedEof` error if the stream ends
-        // before the buffer is filled, which is the desired behavior.
         let mut data = vec![0u8; len];
         stream.read_exact(&mut data).await?;
 

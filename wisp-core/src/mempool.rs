@@ -6,7 +6,7 @@ use crate::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use bincode::{Decode, Encode};
+use bincode::{config::standard as bincode_config, Decode, Encode};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ecdsa::signature::Verifier;
 use log::{debug, info, warn};
@@ -14,37 +14,46 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Represents a transaction entry in the mempool.
-///
-/// Each entry contains the transaction itself, the time it was added,
-/// and its pre-calculated fee to facilitate sorting and prioritization.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct MempoolEntry {
-    /// The time the transaction was added to the mempool.
     #[bincode(with_serde)]
     pub timestamp: DateTime<Utc>,
-    /// The transaction itself.
     pub transaction: Transaction,
-    /// The pre-calculated fee for the transaction.
     pub fee: Amount,
+    pub serialized_size: usize,
 }
 
-/// The maximum age in seconds for a transaction to remain in the mempool before being evicted.
 pub const MAX_MEMPOOL_TRANSACTION_AGE: u64 = 172800; // Two days in seconds
 
 impl Blockchain {
-    /// Adds a transaction to the mempool after performing a series of validation checks.
-    ///
-    /// The validation includes checks for coinbase transactions, double-spends against
-    /// both the UTXO set and other mempool transactions, signature validity, and fund sufficiency.
     pub fn add_to_mempool(&mut self, transaction: Transaction) -> Result<()> {
-        // Use the canonical check for a coinbase transaction.
+        // Do not persist on every transaction addition to prevent DoS via disk I/O.
+        // Persistence should be handled periodically or on shutdown.
+        self.add_transaction_to_mempool(transaction, false)
+    }
+
+    pub(crate) fn add_transaction_to_mempool(
+        &mut self,
+        transaction: Transaction,
+        persist: bool,
+    ) -> Result<()> {
         if transaction.is_coinbase() {
             return Err(anyhow!("Coinbase transaction cannot be added to mempool"));
         }
 
         let tx_hash = transaction.txid()?;
 
-        // Check if the transaction is already in the mempool.
+        // 0. Validate transaction size
+        let serialized_size = bincode::encode_to_vec(&transaction, bincode_config())?.len();
+        if serialized_size > crate::MAX_TRANSACTION_SIZE_BYTES {
+            return Err(anyhow!(
+                "Transaction size ({} bytes) exceeds maximum allowed size ({} bytes)",
+                serialized_size,
+                crate::MAX_TRANSACTION_SIZE_BYTES
+            ));
+        }
+
+        // 1. Check if transaction is already in mempool
         if self.mempool.contains_key(&tx_hash) {
             debug!(
                 "Transaction {} already exists in mempool. Ignoring.",
@@ -53,11 +62,11 @@ impl Blockchain {
             return Ok(());
         }
 
-        // --- Begin Transaction Validation ---
         let mut input_sum = Amount::zero();
         let mut inputs_checked_in_tx: HashSet<OutPoint> = HashSet::new();
 
         let mut output_sum = Amount::zero();
+        // 2. Validate outputs (dust limit)
         for output in &transaction.outputs {
             if output.value.as_smallest_unit() < crate::MIN_OUTPUT_VALUE {
                 return Err(anyhow!(
@@ -72,15 +81,16 @@ impl Blockchain {
         }
 
         let transaction_hash_for_verification = transaction.txid()?;
+        // 3. Validate inputs
         for input in &transaction.inputs {
             let outpoint = &input.outpoint;
 
-            // Check for duplicate inputs within the same transaction.
+            // Check for duplicate inputs within the transaction
             if !inputs_checked_in_tx.insert(*outpoint) {
                 return Err(anyhow!("Transaction has duplicate inputs: {}", outpoint));
             }
 
-            // Check if the input UTXO exists and is not already spent by another mempool transaction.
+            // Check for double spend against other mempool transactions
             if self.mempool_spent_utxos.contains(outpoint) {
                 return Err(anyhow!(
                     "Double spend: input {} already spent by a transaction in mempool",
@@ -88,17 +98,27 @@ impl Blockchain {
                 ));
             }
 
-            let prev_output = match self.utxo_set.utxos.get(outpoint) {
-                Some(output) => output,
-                None => {
+            // Check if UTXO exists in the main chain or mempool (chained tx)
+            let prev_output = if let Some(output) = self.utxo_set.utxos.get(outpoint) {
+                output.clone()
+            } else if let Some(parent_entry) = self.mempool.get(&outpoint.txid) {
+                if let Some(output) = parent_entry.transaction.outputs.get(outpoint.vout as usize) {
+                    output.clone()
+                } else {
                     return Err(anyhow!(
-                        "Transaction input UTXO {} not found or already spent on chain",
-                        outpoint
+                        "Transaction input {} references non-existent output in mempool tx {}",
+                        outpoint,
+                        outpoint.txid
                     ));
                 }
+            } else {
+                return Err(anyhow!(
+                    "Transaction input UTXO {} not found or already spent on chain",
+                    outpoint
+                ));
             };
 
-            // Verify the signature for the input.
+            // Verify signature
             let is_signature_valid = match input.signature.as_ref() {
                 Some(sig) => prev_output
                     .pubkey
@@ -127,7 +147,6 @@ impl Blockchain {
                 .context("Input sum overflow")?;
         }
 
-        // Ensure that the total input value is not less than the total output value.
         if input_sum < output_sum {
             return Err(anyhow!(
                 "Invalid transaction {}: inputs ({}) < outputs ({}) (insufficient funds)",
@@ -137,7 +156,6 @@ impl Blockchain {
             ));
         }
 
-        // Mark the UTXOs used by this transaction as "spent" in the mempool.
         let outpoints_to_mark: Vec<OutPoint> =
             transaction.inputs.iter().map(|i| i.outpoint).collect();
 
@@ -145,7 +163,6 @@ impl Blockchain {
             self.mempool_spent_utxos.insert(outpoint);
         }
 
-        // Add the validated transaction to the mempool.
         let fee = input_sum
             .checked_sub(output_sum)
             .context("Fee calculation underflow")?;
@@ -156,29 +173,29 @@ impl Blockchain {
                 timestamp: now,
                 transaction: transaction.clone(),
                 fee,
+                serialized_size,
             },
         );
 
-        println!(
+        info!(
             "Transaction {} added to mempool with fee {}. Mempool size: {}",
             tx_hash,
             fee,
             self.mempool.len()
         );
 
-        // Persist the updated mempool to disk.
-        if let Err(e) = self.save_mempool_snapshot() {
-            warn!("[MEMPOOL] Failed to save mempool snapshot: {}", e);
+        if persist {
+            if let Err(e) = self.save_mempool_snapshot() {
+                warn!("[MEMPOOL] Failed to save mempool snapshot: {}", e);
+            }
         }
         Ok(())
     }
 
-    /// Evicts transactions from the mempool that have exceeded the maximum age.
     pub fn clear_mempool(&mut self) {
         let now = Utc::now();
         let mut outpoints_to_unmark: Vec<OutPoint> = vec![];
 
-        // Retain only transactions that are not too old.
         self.mempool.retain(|_, entry| {
             let is_too_old = now.signed_duration_since(entry.timestamp)
                 > ChronoDuration::seconds(
@@ -191,7 +208,6 @@ impl Blockchain {
             !is_too_old
         });
 
-        // Unmark the UTXOs that were spent by the expired transactions.
         for outpoint in &outpoints_to_unmark {
             self.mempool_spent_utxos.remove(outpoint);
         }
@@ -206,8 +222,16 @@ impl Blockchain {
         }
     }
 
-    /// Removes transactions from the mempool that have been included in a new block.
     pub fn clear_mempool_of_block_transactions(&mut self, block: &Block, block_hash: Hash) {
+        self.clear_mempool_of_block_transactions_internal(block, block_hash, true);
+    }
+
+    pub(crate) fn clear_mempool_of_block_transactions_internal(
+        &mut self,
+        block: &Block,
+        block_hash: Hash,
+        persist: bool,
+    ) {
         let txids_in_block: HashSet<Hash> = block
             .transactions
             .iter()
@@ -223,7 +247,6 @@ impl Blockchain {
             }
         }
 
-        // Retain only the transactions that are NOT in the new block.
         self.mempool
             .retain(|txid, _| !txids_in_block.contains(txid));
 
@@ -232,8 +255,7 @@ impl Blockchain {
         }
         let removed_count = initial_mempool_size - self.mempool.len();
 
-        // Persist the change if any transactions were removed.
-        if removed_count > 0 {
+        if removed_count > 0 && persist {
             if let Err(e) = self.save_mempool_snapshot() {
                 warn!("[MEMPOOL] Failed to save mempool snapshot after clearing block transactions: {}", e);
             }

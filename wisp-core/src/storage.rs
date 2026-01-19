@@ -5,7 +5,7 @@ use crate::{
     currency::Amount,
     mempool::MempoolEntry,
     sha256::Hash,
-    signatures::PublicKey, // Keep this for other functions
+    signatures::PublicKey,
     transactions::{OutPoint, TransactionOutput},
     utils,
 };
@@ -16,18 +16,21 @@ use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use sled::transaction::TransactionalTree;
 
-/// A centralized definition of all key prefixes and names used in the `sled` database.
-///
-/// Using this struct prevents typos and serves as a schema reference for the database layout.
 pub struct DBKeys;
 
 impl DBKeys {
     // --- Singleton Keys ---
+    /// Stores the current height of the blockchain (u64)
     pub const CHAIN_HEIGHT: &'static [u8] = b"chain_height";
+    /// Stores the hash of the current tip block
     pub const TIP_HASH: &'static [u8] = b"tip_hash";
+    /// Stores the total number of transactions in the chain (u64)
     pub const TOTAL_TX_COUNT: &'static [u8] = b"total_tx_count";
+    /// Stores the total supply of currency (u64)
     pub const TOTAL_SUPPLY: &'static [u8] = b"total_supply";
+    /// Stores the compressed UTXO set snapshot
     pub const UTXO_SNAPSHOT: &'static [u8] = b"utxo_snapshot";
+    /// Stores the height at which the last UTXO snapshot was taken
     pub const LAST_UTXO_SNAPSHOT_HEIGHT: &'static [u8] = b"last_utxo_snapshot_height";
     pub const UTXO_SNAPSHOT_CHECKSUM: &'static [u8] = b"utxo_snapshot_checksum";
     pub const MEMPOOL_SNAPSHOT: &'static [u8] = b"mempool_snapshot";
@@ -60,32 +63,19 @@ impl DBKeys {
     }
 }
 
-/// Represents the changes a single block makes to the UTXO set.
-///
-/// This struct is used during the parallel mapping phase of the UTXO rebuild process
-/// to collect all inputs to be removed and outputs to be added for a given block,
-/// before applying them sequentially.
 struct BlockUtxoChanges {
     block_index: u64,
     inputs_to_remove: Vec<OutPoint>,
     outputs_to_add: Vec<(OutPoint, TransactionOutput)>,
 }
 impl Blockchain {
-    /// Loads the blockchain state from the database.
-    ///
-    /// If the database is not empty, it loads the existing state, including rebuilding the
-    /// in-memory UTXO set and mempool. If the database is empty, it initializes it with
-    /// the genesis block. It also handles recovery from a crashed reorganization.
     pub fn load_from_db(&mut self) -> Result<()> {
         if !self.db.is_empty() {
-            // Check for and handle a crashed reorg before loading the rest of the state.
             if let Err(e) = self.recover_from_crashed_reorg() {
-                // If recovery fails, it's safer to halt than to run with a corrupt state.
                 log::error!("CRITICAL: Failed to recover from a potential mid-reorg crash. Halting. Error: {}", e);
                 return Err(e);
             }
 
-            // Populate the tip cache
             if let Some(tip_block) = self.get_tip_block()? {
                 let tip_hash = tip_block.id()?;
                 self.tip_cache = Some((tip_hash, tip_block));
@@ -94,7 +84,6 @@ impl Blockchain {
             self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
             self.total_tx_count = self.get_total_transaction_count_from_db()?;
 
-            // Verify supply integrity immediately after loading.
             if let Err(e) = self.verify_supply_integrity() {
                 error!(
                     "CRITICAL: Database corrupted. Supply check failed on load: {}",
@@ -103,9 +92,7 @@ impl Blockchain {
                 return Err(e);
             }
 
-            // If DB is not empty, rebuild the in-memory UTXO set, starting from the last snapshot if available.
             self.rebuild_utxos()?;
-            // After rebuilding UTXOs, load and re-validate the mempool.
             if let Err(e) = self.load_mempool_snapshot() {
                 warn!(
                     "Could not load mempool from snapshot, starting with an empty one. Error: {}",
@@ -118,23 +105,17 @@ impl Blockchain {
             return Ok(());
         }
 
-        // Database is empty, so create and store the genesis block.
         info!("Database is empty. Creating genesis block...");
         let genesis_block = utils::genesis_block()?;
         let genesis_hash = genesis_block.id()?;
 
-        // For the genesis block, we use `add_direct_extension` to ensure all
-        // state (DB and in-memory) is initialized consistently, just like any other block.
-        // This avoids logic duplication and potential inconsistencies.
         self.add_direct_extension(genesis_block.clone(), genesis_hash)?;
-
-        // Manually populate the tip cache after adding the genesis block.
         self.tip_cache = Some((genesis_hash, genesis_block));
 
         info!("Genesis Block created and added.");
         info!("Genesis Block Hash: {}", genesis_hash);
+
         self.save_utxo_snapshot(0)?;
-        // And recalculate the target based on the new state.
         self.target = self.calculate_next_target()?;
         self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
         self.total_tx_count = self.get_total_transaction_count_from_db()?;
@@ -142,10 +123,6 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Gets the current tip block of the main chain.
-    ///
-    /// It first checks a fast in-memory cache (`tip_cache`) and falls back to the
-    /// database if the cache is empty.
     pub fn get_tip_block(&self) -> Result<Option<Block>> {
         if let Some((_, block)) = &self.tip_cache {
             return Ok(Some(block.clone()));
@@ -167,7 +144,6 @@ impl Blockchain {
         }
     }
 
-    /// Retrieves a block from the database by its hash.
     pub fn get_block_by_hash(&self, hash: &Hash) -> Result<Option<Block>> {
         self.db
             .get(DBKeys::block(hash))?
@@ -182,7 +158,6 @@ impl Blockchain {
             .transpose()
     }
 
-    /// Retrieves a block from the database by its index (height).
     pub fn get_block_by_index(&self, index: u64) -> Result<Option<Block>> {
         if let Some(hash_ivec) = self.db.get(DBKeys::index_to_hash(index))? {
             let (hash, _): (Hash, _) = bincode::decode_from_slice(&hash_ivec, bincode_config())
@@ -193,8 +168,6 @@ impl Blockchain {
         }
     }
 
-    /// Retrieves a block from the database by its index within a sled transaction.
-    /// This is used during atomic operations like chain reorganizations.
     pub fn get_block_by_index_from_db_txn(
         &self,
         index: u64,
@@ -218,8 +191,6 @@ impl Blockchain {
         }
     }
 
-    /// A static version of `get_block_by_index_from_db_txn` for use where `&self` isn't available.
-    /// This is necessary to work around borrow-checker limitations inside transaction closures.
     pub fn get_block_by_index_from_db_txn_static(
         index: u64,
         tx_db: &TransactionalTree,
@@ -242,25 +213,17 @@ impl Blockchain {
         }
     }
 
-    /// Saves a snapshot of the current UTXO set to the database.
-    ///
-    /// The snapshot is compressed using `zstd` to save space. An accompanying checksum
-    /// is also saved to verify data integrity on load. This operation is performed
-    /// atomically using a database transaction.
     pub fn save_utxo_snapshot(&self, height: u64) -> Result<()> {
         info!("Serializing UTXO set for snapshot at height {}...", height);
         let utxo_bytes = bincode::encode_to_vec(&self.utxo_set, bincode_config())?;
-        // Compress the serialized data. The compression level can be adjusted (0 is default).
         let compressed_utxo_bytes =
             zstd::encode_all(&utxo_bytes[..], 0).context("Failed to compress UTXO snapshot")?;
         let compressed_size = compressed_utxo_bytes.len();
 
-        // Calculate a checksum of the compressed data to verify integrity on load.
         let checksum = crate::sha256::hash(&compressed_utxo_bytes[..]);
         let checksum_bytes = bincode::encode_to_vec(&checksum, bincode_config())?;
         let height_bytes = bincode::encode_to_vec(&height, bincode_config())?;
 
-        // Atomically insert the snapshot, its height, and its checksum.
         self.db
             .transaction(|tx_db| {
                 tx_db.insert(DBKeys::UTXO_SNAPSHOT, compressed_utxo_bytes.clone())?;
@@ -276,16 +239,10 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Saves a snapshot of the current mempool to the database.
-    ///
-    /// This preserves unconfirmed transactions across node restarts. If the mempool is empty,
-    /// the corresponding key is removed from the database.
     pub fn save_mempool_snapshot(&self) -> Result<()> {
         if self.mempool.is_empty() {
-            // If the mempool is empty, just remove the key from the DB.
             self.db.remove(DBKeys::MEMPOOL_SNAPSHOT)?;
         } else {
-            // Serialize the entire mempool HashMap to preserve timestamps and pre-calculated fees.
             let bytes = bincode::encode_to_vec(&self.mempool, bincode_config())?;
             self.db.insert(DBKeys::MEMPOOL_SNAPSHOT, bytes)?;
         }
@@ -296,11 +253,6 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Loads the mempool from a database snapshot and re-validates each transaction.
-    ///
-    /// Transactions from the snapshot are not trusted blindly; they are re-validated
-    /// against the current blockchain state before being added back to the in-memory
-    /// mempool. This ensures that invalid or already-spent transactions are discarded.
     fn load_mempool_snapshot(&mut self) -> Result<()> {
         if let Some(ivec) = self.db.get(DBKeys::MEMPOOL_SNAPSHOT)? {
             // Decode the full HashMap<Hash, MempoolEntry>
@@ -314,12 +266,10 @@ impl Blockchain {
             );
             let mut successfully_loaded = 0;
             for (tx_hash, entry) in snapshot_mempool {
-                // Re-validate each transaction against the current state.
-                // This is a crucial safety check.
-                // We can skip the full `add_to_mempool` which recalculates fees,
-                // and do a quicker validation before inserting directly.
-                // For simplicity here, we'll just re-add, but a more optimized path is possible.
-                if self.add_to_mempool(entry.transaction.clone()).is_ok() {
+                if self
+                    .add_transaction_to_mempool(entry.transaction.clone(), false)
+                    .is_ok()
+                {
                     successfully_loaded += 1;
                 } else {
                     warn!("Could not re-validate transaction {} from mempool snapshot. It may now be invalid.", tx_hash);
@@ -333,8 +283,6 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Gets the height at which the last UTXO snapshot was saved.
-    /// Returns `Ok(None)` if no snapshot has been saved yet.
     fn get_last_utxo_snapshot_height(&self) -> Result<Option<u64>> {
         self.db
             .get(DBKeys::LAST_UTXO_SNAPSHOT_HEIGHT)?
@@ -343,24 +291,19 @@ impl Blockchain {
                     .map(|(h, _)| h)
                     .context("Failed to deserialize last_utxo_snapshot_height with bincode")
             })
-            .transpose() // Option<Result<T>> -> Result<Option<T>>
+            .transpose()
     }
-    /// Gets the current height of the blockchain from the database.
-    ///
-    /// It prioritizes the in-memory `tip_cache` for immediate consistency, falling
-    /// back to a database query if the cache is empty.
+
     pub fn block_height(&self) -> Result<u64> {
         if let Some((_, tip_block)) = &self.tip_cache {
             return Ok(tip_block.index);
         }
         if let Some(ivec) = self.db.get(DBKeys::CHAIN_HEIGHT)? {
-            // Handle raw 8-byte big-endian format first, which is the canonical format.
             if ivec.len() == 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&ivec);
                 Ok(u64::from_be_bytes(arr))
             } else {
-                // Fallback for backward compatibility with old bincode-encoded values.
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .map(|(v, _)| v)
                     .with_context(|| {
@@ -371,17 +314,11 @@ impl Blockchain {
                     })
             }
         } else {
-            // If the key doesn't exist, the height is 0 (e.g., before genesis).
             Ok(0)
         }
     }
 
-    /// Gets the hash of the current chain tip from the database.
-    ///
-    /// It prioritizes the in-memory `tip_cache` for immediate consistency, falling
-    /// back to a database query if the cache is empty.
     pub fn get_tip_hash(&self) -> Result<Option<Hash>> {
-        // Check the in-memory cache first.
         if let Some((hash, _)) = self.tip_cache {
             return Ok(Some(hash));
         }
@@ -393,20 +330,16 @@ impl Blockchain {
                     .map(|(h, _)| h)
                     .context("Failed to deserialize tip hash with bincode")
             })
-            .transpose() // Option<Result<T>> -> Result<Option<T>>
+            .transpose()
     }
 
-    /// Gets the total number of confirmed (non-coinbase) transactions from the database.
-    /// This provides a persistent count of all transactions in the blockchain's history.
     pub fn get_total_transaction_count_from_db(&self) -> Result<u64> {
         if let Some(ivec) = self.db.get(DBKeys::TOTAL_TX_COUNT)? {
-            // Handle raw 8-byte big-endian format first.
             if ivec.len() == 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&ivec);
                 Ok(u64::from_be_bytes(arr))
             } else {
-                // Fallback for backward compatibility.
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .map(|(v, _)| v)
                     .with_context(|| {
@@ -421,17 +354,13 @@ impl Blockchain {
         }
     }
 
-    /// Gets the total circulating supply (in smallest units) from the database.
-    /// This provides a persistent record of the total amount of currency ever created.
     pub fn get_total_supply_from_db(&self) -> Result<u64> {
         if let Some(ivec) = self.db.get(DBKeys::TOTAL_SUPPLY)? {
-            // Handle raw 8-byte big-endian format first.
             if ivec.len() == 8 {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&ivec);
                 Ok(u64::from_be_bytes(arr))
             } else {
-                // Fallback for backward compatibility.
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .map(|(v, _)| v)
                     .with_context(|| {
@@ -446,21 +375,16 @@ impl Blockchain {
         }
     }
 
-    /// Sets the total circulating supply in the database.
-    /// This is typically only used during initialization or major state corrections.
     pub fn set_total_supply(&self, count: u64) -> Result<()> {
         self.db
             .insert(DBKeys::TOTAL_SUPPLY, count.to_be_bytes().to_vec())?;
         Ok(())
     }
 
-    /// Gets a transaction hash by its chronological order index.
-    /// This allows iterating through all transactions in the order they were confirmed.
     pub fn get_transaction_hash_by_chronological_index(&self, index: u64) -> Result<Option<Hash>> {
         self.db
             .get(DBKeys::tx_by_order(index))?
             .map(|ivec| {
-                // This function seems unused, but let's fix it anyway.
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .map(|(h, _)| h)
                     .context("Failed to deserialize tx hash from chronological index with bincode")
@@ -468,9 +392,6 @@ impl Blockchain {
             .transpose()
     }
 
-    /// Gets all transaction hashes associated with a public key from the `history_` index.
-    /// This provides a fast way to retrieve a wallet's transaction history without
-    /// scanning the entire blockchain.
     pub fn get_transaction_hashes_by_pubkey_from_db(
         &self,
         pubkey: &PublicKey,
@@ -488,14 +409,8 @@ impl Blockchain {
         Ok(result)
     }
 
-    /// Reconstructs the in-memory UTXO set.
-    ///
-    /// This is a crucial step on node startup to ensure the in-memory state is consistent
-    /// with the on-disk state. It first attempts to load from a compressed snapshot for speed.
-    /// If the snapshot is invalid or missing, it rebuilds the UTXO set by processing all
-    /// blocks from the last valid state (or genesis). The process is parallelized for performance.
     pub fn rebuild_utxos(&mut self) -> Result<()> {
-        // Try to load from a snapshot first.
+        // Check if a valid snapshot exists
         let (mut new_utxos, start_height) = if let (Some(snapshot_ivec), Some(checksum_ivec)) = (
             self.db.get(DBKeys::UTXO_SNAPSHOT)?,
             self.db.get(DBKeys::UTXO_SNAPSHOT_CHECKSUM)?,
@@ -520,11 +435,9 @@ impl Blockchain {
                         "UTXO snapshot checksum mismatch! Expected: {}, Actual: {}. Discarding snapshot and rebuilding from genesis.",
                         expected_checksum, actual_checksum
                     );
-                // Checksum failed, discard the snapshot and start from scratch.
                 (std::collections::HashMap::new(), 0)
             }
         } else {
-            // If no snapshot or checksum is found, start from genesis.
             if self.db.get(DBKeys::UTXO_SNAPSHOT)?.is_some() {
                 warn!("Found a UTXO snapshot but no checksum. Discarding snapshot and rebuilding from genesis.");
             } else {
@@ -542,20 +455,20 @@ impl Blockchain {
             ));
         }
 
+        // Replay blocks from snapshot height (or genesis) to current tip
         if height >= start_height {
             info!(
                 "Rebuilding UTXOs from block {} to {}...",
                 start_height, height
             );
 
-            // Process blocks in chunks to avoid loading the entire chain into memory.
+            // Process in chunks to manage memory usage
             const CHUNK_SIZE: u64 = 1000;
             let mut i = start_height;
             while i <= height {
                 let end = std::cmp::min(i + CHUNK_SIZE - 1, height);
                 info!("Processing block chunk {} to {}...", i, end);
 
-                // 1. Collect a chunk of blocks to separate I/O from CPU-bound work.
                 let blocks_to_process: Vec<Block> = (i..=end)
                     .map(|idx| self.get_block_by_index(idx))
                     .collect::<Result<Vec<Option<Block>>>>()?
@@ -563,8 +476,6 @@ impl Blockchain {
                     .flatten()
                     .collect();
 
-                // 2. Map Phase (Parallel): Process blocks in the chunk to compute UTXO changes.
-                // This logic remains the same, but now operates on a smaller `blocks_to_process` Vec.
                 let mut block_changes: Vec<BlockUtxoChanges> = blocks_to_process
                     .into_par_iter()
                     .map(|block| {
@@ -578,7 +489,6 @@ impl Blockchain {
                                 }
                             }
 
-                            // This can fail if hashing fails, but it's highly unlikely for valid block data.
                             if let Ok(txid) = tx.txid() {
                                 for (vout, output) in tx.outputs.iter().enumerate() {
                                     let outpoint = OutPoint {
@@ -598,10 +508,8 @@ impl Blockchain {
                     })
                     .collect();
 
-                // Sort the changes by block index to ensure sequential application.
                 block_changes.sort_by_key(|c| c.block_index);
 
-                // 3. Reduce Phase (Sequential): Apply the collected changes for the chunk.
                 for changes in block_changes {
                     for outpoint in changes.inputs_to_remove {
                         new_utxos.remove(&outpoint);
@@ -615,21 +523,16 @@ impl Blockchain {
         }
         info!("UTXO rebuild complete. Finalizing state...");
 
-        // After rebuilding the UTXO set, iterate through the mempool and mark spent UTXOs.
-        // This ensures the in-memory UTXO state is consistent with pending transactions.
         for entry in self.mempool.values() {
             for input in &entry.transaction.inputs {
                 if new_utxos.contains_key(&input.outpoint) {
-                    self.mempool_spent_utxos.insert(input.outpoint); // Mark as spent in mempool
+                    self.mempool_spent_utxos.insert(input.outpoint);
                 }
             }
         }
 
-        // Replace the old in-memory UTXO set with the newly built one.
         self.utxo_set.utxos = new_utxos;
 
-        // Save a final snapshot at the current tip, but throttle it to avoid
-        // expensive re-compression on every startup for large chains.
         const REBUILD_SNAPSHOT_INTERVAL: u64 = 10_000;
         if height > 0 && height % REBUILD_SNAPSHOT_INTERVAL == 0 {
             self.save_utxo_snapshot(height)?;
@@ -637,11 +540,6 @@ impl Blockchain {
         Ok(())
     }
 
-    /// Checks for and attempts to recover from an interrupted reorganization.
-    ///
-    /// If the node crashed mid-reorg, special "pending reorg" keys will exist in the
-    /// database. This function detects these keys, reconstructs the state of the intended
-    /// reorg, and re-initiates it to bring the node back to a consistent state.
     fn recover_from_crashed_reorg(&mut self) -> Result<()> {
         let pending_tip_ivec = self.db.get(DBKeys::PENDING_REORG_TIP)?;
         let pending_ancestor_ivec = self.db.get(DBKeys::PENDING_REORG_ANCESTOR)?;
@@ -659,7 +557,6 @@ impl Blockchain {
                 pending_tip_hash, common_ancestor_index
             );
 
-            // Reconstruct the new chain segment by walking backwards from the pending tip.
             let mut new_chain_segment = Vec::new();
             let mut current_hash = pending_tip_hash;
 
@@ -671,7 +568,6 @@ impl Blockchain {
                     )
                 })?;
 
-                // Stop when we reach the block just after the common ancestor.
                 if block.index <= common_ancestor_index {
                     break;
                 }
@@ -679,7 +575,6 @@ impl Blockchain {
                 new_chain_segment.push(block.clone());
                 current_hash = block.previous_hash;
 
-                // Safety break if we walk back too far without finding the ancestor.
                 if current_hash == Hash::zero() && common_ancestor_index > 0 {
                     return Err(anyhow!(
                         "Recovery failed: Fork chain does not connect to known ancestor."
@@ -687,7 +582,6 @@ impl Blockchain {
                 }
             }
 
-            // The blocks were pushed in reverse order, so we need to reverse the list.
             new_chain_segment.reverse();
 
             info!(
@@ -696,14 +590,12 @@ impl Blockchain {
             );
             self.reorganize_chain(new_chain_segment, common_ancestor_index)?;
 
-            info!("✅ Successfully recovered from previous reorg attempt.");
+            info!("Successfully recovered from previous reorg attempt.");
         }
 
         Ok(())
     }
 
-    /// Recalculates the total supply based on the current chain height and updates the database.
-    /// This fixes the database corruption caused by incorrectly adding fees to the total supply.
     pub fn migrate_total_supply(&mut self) -> Result<()> {
         if self.db.is_empty() {
             info!("Database is empty, skipping migration.");
@@ -720,7 +612,6 @@ impl Blockchain {
                 current_db_supply, expected_supply
             );
             self.set_total_supply(expected_supply.as_smallest_unit())?;
-            // Update in-memory state as well to ensure consistency immediately.
             self.total_supply = expected_supply;
             info!("Total Supply migration completed successfully.");
         } else {

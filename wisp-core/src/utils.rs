@@ -20,17 +20,10 @@ use std::{
 pub struct MerkleRoot(pub Hash);
 
 impl MerkleRoot {
-    /// Calculates the Merkle root for a list of transactions.
-    ///
-    /// The tree is constructed using the witness transaction IDs (`wtxid`) to prevent
-    /// transaction malleability. It uses a binary tree structure with double-SHA256 hashing.
-    /// It repeatedly hashes pairs of hashes in a layer until only one root hash remains.
     pub fn calculate(transactions: &[Transaction]) -> Result<MerkleRoot, anyhow::Error> {
         let mut layer: Vec<Hash> = vec![];
 
         for transaction in transactions {
-            // Use the witness transaction ID (wtxid) for the Merkle root.
-            // This prevents transaction malleability attacks.
             layer.push(transaction.wtxid()?);
         }
 
@@ -38,19 +31,13 @@ impl MerkleRoot {
             return Ok(MerkleRoot(Hash::zero()));
         }
 
-        // Continue hashing until only one hash (the root) is left.
         while layer.len() > 1 {
-            // Pre-allocate with capacity to avoid reallocations in the loop.
             let mut new_layer = Vec::with_capacity(layer.len() / 2 + 1);
-            // Process hashes in pairs.
             for pair in layer.chunks(2) {
                 let left = pair[0];
-                // If there's an odd number of hashes, duplicate the last one.
                 let right = pair.get(1).unwrap_or(&pair[0]);
-
-                // Use the canonical hash function, which correctly handles double-SHA256.
-                // We explicitly create a slice `&[Hash]` to satisfy the `Hashable` trait bound.
                 let hashes_to_combine: &[Hash] = &[left, *right];
+
                 new_layer.push(crate::sha256::hash(hashes_to_combine));
             }
             layer = new_layer;
@@ -60,10 +47,6 @@ impl MerkleRoot {
     }
 }
 
-/// Calculates the block reward for a given block height.
-///
-/// The reward starts at `INITIAL_BLOCK_REWARD_SMALLEST_UNITS` and is halved
-/// every `HALVING_INTERVAL` blocks.
 pub fn calculate_block_reward(block_height: u64) -> Amount {
     let halvings = block_height / crate::HALVING_INTERVAL;
 
@@ -78,13 +61,10 @@ pub fn calculate_block_reward(block_height: u64) -> Amount {
     }
 }
 
-/// Calculates the expected total supply at a given block height.
-///
-/// This sums up all block rewards from height 0 to `height`.
 pub fn calculate_expected_supply(height: u64) -> Amount {
     let mut total_supply = 0u64;
     let mut current_reward = crate::INITIAL_BLOCK_REWARD_SMALLEST_UNITS;
-    let mut remaining_blocks = height + 1; // Include genesis (height 0)
+    let mut remaining_blocks = height + 1;
 
     while remaining_blocks > 0 && current_reward > 0 {
         let blocks_in_this_era = std::cmp::min(remaining_blocks, crate::HALVING_INTERVAL);
@@ -111,7 +91,7 @@ pub fn genesis_block() -> AnyhowResult<Block> {
 
     let genesis_message = "Sic Mundus Creatus Est // 5.11.2025 //";
     let mut coinbase_data = Vec::new();
-    coinbase_data.extend_from_slice(&0u64.to_le_bytes()); // Block height 0
+    coinbase_data.extend_from_slice(&0u64.to_le_bytes());
     coinbase_data.extend_from_slice(genesis_message.as_bytes());
 
     let coinbase_tx = Transaction::new(
@@ -153,20 +133,16 @@ pub trait Saveable
 where
     Self: Sized,
 {
-    /// Serializes and saves the object to a writer.
     fn save<O: Write>(&self, writer: O) -> IoResult<()>;
-    /// Deserializes and loads the object from a reader.
     fn load<I: Read>(reader: I) -> IoResult<Self>;
 
     fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> IoResult<()> {
-        /// Saves the object to a file at the given path.
         use std::io::BufWriter;
         let file = File::create(&path)?;
         self.save(BufWriter::new(file))
     }
 
     fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> IoResult<Self> {
-        // Open the file and wrap it in a BufReader for efficiency,
         use std::io::BufReader;
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
