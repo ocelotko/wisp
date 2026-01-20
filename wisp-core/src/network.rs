@@ -72,6 +72,11 @@ pub enum WalletMessage {
         hash: Hash,
         status: TransactionStatus,
     },
+    FetchWalletUpdates {
+        public_key: PublicKey,
+        since_height: u64,
+    },
+    WalletUpdates(WalletStateSnapshot),
 }
 
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

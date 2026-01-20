@@ -6,6 +6,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { CreateWalletModal } from "./components/CreateWalletModal";
 import { RecoverWalletModal } from "./components/RecoverWalletModal";
 import { UnlockWalletModal } from "./components/UnlockWalletModal";
+import WalletButton from "./components/WalletButton";
+import BalanceChart from "./components/BalanceChart";
 
 type View = "home" | "settings";
 
@@ -16,19 +18,50 @@ const App = () => {
   const [activeModal, setActiveModal] = useState<"create" | "recover" | null>(
     null,
   );
+
   const [wallets, setWallets] = useState<string[]>([]);
   const [activeWallet, setActiveWallet] = useState<string | null>(null);
   const [pendingWallet, setPendingWallet] = useState<string | null>(null);
   const [unlockedWallet, setUnlockedWallet] = useState<string | null>(null);
+
+  const [unlockedWalletPk, setUnlockedWalletPk] = useState<string | null>(null);
   const [balance, setBalance] = useState<number>(0);
+  const [transactions, setTransactions] = useState<any[]>([]);
+  const [history, setHistory] = useState<any[]>([]);
+
+  const formattedBalance = (balance / 100_000_000).toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 8,
+  });
 
   const loadWallets = async () => {
     try {
       const list = await invoke<string[]>("list_wallets");
       setWallets(list);
-      if (!activeWallet && list.length > 0) setActiveWallet(list[0]);
     } catch (err) {
       console.error("Failed to load wallets:", err);
+    }
+  };
+
+  const syncUI = async () => {
+    if (!unlockedWallet) return;
+    try {
+      const [balance, walletInfo, historyData, enrichedTxs] = await Promise.all(
+        [
+          invoke<number>("get_wallet_balance"),
+          invoke<any>("get_current_wallet_info"),
+          invoke<any[]>("get_balance_history"),
+          invoke<any[]>("get_recent_transactions"),
+        ],
+      );
+
+      setBalance(balance);
+      setUnlockedWalletPk(walletInfo.public_key);
+      setHistory(historyData);
+      setTransactions(enrichedTxs);
+    } catch (e) {
+      console.error("Sync failed:", e);
+      setUnlockedWallet(null);
     }
   };
 
@@ -46,21 +79,13 @@ const App = () => {
 
   useEffect(() => {
     loadWallets();
+  }, []);
 
-    if (activeWallet) {
-      const fetchBalance = async () => {
-        try {
-          const b = await invoke<number>("get_wallet_balance", {
-            name: activeWallet,
-          });
-          setBalance(b);
-        } catch (e) {
-          console.error("Balance fetch failed", e);
-        }
-      };
-      fetchBalance();
-    }
-  }, [activeWallet]);
+  useEffect(() => {
+    syncUI();
+    const timer = setInterval(syncUI, 10000);
+    return () => clearInterval(timer);
+  }, [unlockedWallet]);
 
   const SendIcon = (
     <svg
@@ -164,35 +189,30 @@ const App = () => {
           className="absolute top-0 left-0 w-full h-8 z-50 cursor-default select-none"
         />
 
-        <aside className="w-70 bg-dark-surfaceContainerLow flex flex-col p-6 border-r border-dark-outlineVariant pt-10">
+        <aside className="w-72 bg-dark-surfaceContainerLow flex flex-col p-6 border-r border-dark-outlineVariant pt-10">
           <header className="text-dark-primary text-2xl font-black uppercase mb-8 tracking-tighter">
             Wisp wallet
           </header>
 
           <nav className="flex-1">
-            <ul className="space-y-2">
-              <li
-                onClick={() => setCurrentView("home")}
-                className={`px-4 py-2 rounded-full cursor-pointer transition-colors font-medium ${
-                  currentView === "home"
-                    ? "bg-dark-secondaryContainer text-dark-onSecondaryContainer"
-                    : "hover:bg-dark-surfaceVariant text-dark-onSurfaceVariant"
-                }`}
-              >
-                Home
-              </li>
-              <li
-                onClick={() => setCurrentView("settings")}
-                className={`px-4 py-2 rounded-full cursor-pointer transition-colors font-medium ${
-                  currentView === "settings"
-                    ? "bg-dark-secondaryContainer text-dark-onSecondaryContainer"
-                    : "hover:bg-dark-surfaceVariant text-dark-onSurfaceVariant"
-                }`}
-              >
-                Settings
-              </li>
+            {/* Main Nav Items */}
+            <ul className="space-y-2 mb-10">
+              {["home", "settings"].map((view) => (
+                <li
+                  key={view}
+                  onClick={() => setCurrentView(view as View)}
+                  className={`px-4 py-2 rounded-full cursor-pointer transition-all font-bold capitalize ${
+                    currentView === view
+                      ? "bg-dark-secondaryContainer text-dark-onSecondaryContainer shadow-lg"
+                      : "hover:bg-dark-surfaceVariant text-dark-onSurfaceVariant"
+                  }`}
+                >
+                  {view}
+                </li>
+              ))}
             </ul>
-            <section className="mt-10 relative">
+
+            <section className="relative">
               <div className="flex items-center justify-between px-4 mb-4">
                 <h4 className="text-[10px] uppercase tracking-widest text-dark-outline font-bold">
                   Accounts
@@ -200,48 +220,16 @@ const App = () => {
                 <IconButton
                   icon={PlusIcon}
                   onClick={() => setShowAddMenu(!showAddMenu)}
-                  className={`size-8 ${showAddMenu ? "bg-dark-primary/20 text-dark-primary" : ""}`}
                 />
               </div>
 
-              {showAddMenu && (
-                <div className="absolute right-0 top-10 w-64 bg-dark-surfaceContainerHigh border border-dark-outlineVariant rounded-2xl shadow-2xl z-50 p-2 animate-in fade-in zoom-in duration-200">
-                  <button
-                    onClick={() => {
-                      setActiveModal("create");
-                      setShowAddMenu(false); // Close menu when modal opens
-                    }}
-                    className="w-full text-left px-4 py-3 rounded-xl hover:bg-dark-surfaceVariant flex flex-col transition-colors"
-                  >
-                    <span className="text-sm font-bold text-dark-onSurface">
-                      Create a new wallet
-                    </span>
-                    <span className="text-[10px] text-dark-outline">
-                      Generates a new 24-word seed
-                    </span>
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveModal("recover");
-                      setShowAddMenu(false); // Close menu when modal opens
-                    }}
-                    className="w-full text-left px-4 py-3 rounded-xl hover:bg-dark-surfaceVariant flex flex-col mt-1 transition-colors"
-                  >
-                    <span className="text-sm font-bold text-dark-onSurface">
-                      Recover wallet
-                    </span>
-                    <span className="text-[10px] text-dark-outline">
-                      Use a seed phrase or private key
-                    </span>
-                  </button>
-                </div>
-              )}
-
               <div className="space-y-1">
                 {wallets.map((walletName) => (
-                  <button
+                  <WalletButton
                     key={walletName}
+                    name={walletName}
+                    isActive={activeWallet === walletName}
+                    isUnlocked={unlockedWallet === walletName}
                     onClick={() => {
                       if (unlockedWallet === walletName) {
                         setActiveWallet(walletName);
@@ -249,23 +237,13 @@ const App = () => {
                         setPendingWallet(walletName);
                       }
                     }}
-                    className={`...`}
-                  >
-                    {walletName}
-                  </button>
+                  />
                 ))}
-
-                {wallets.length === 0 && (
-                  <p className="px-4 text-xs text-dark-outline italic">
-                    No wallets found
-                  </p>
-                )}
               </div>
             </section>
           </nav>
-
-          <footer className="px-4 text-xs text-dark-outline opacity-50">
-            balls
+          <footer className="px-4 text-[10px] text-dark-outline font-mono opacity-50 uppercase tracking-widest">
+            v0.1.0-alpha
           </footer>
         </aside>
 
@@ -274,10 +252,10 @@ const App = () => {
             <>
               <header className="flex justify-between items-start mb-12">
                 <div>
-                  <h2 className="text-4xl font-medium mb-1">Wallet 1</h2>
-                  <p className="text-dark-onSurfaceVariant">
-                    Legacy address format
-                  </p>
+                  <h2 className="text-4xl font-medium mb-1">
+                    {activeWallet || "No Wallet Selected"}
+                  </h2>
+                  <p className="text-dark-onSurfaceVariant">Standard Account</p>
                 </div>
 
                 <div className="flex items-center gap-2">
@@ -313,35 +291,37 @@ const App = () => {
                   Current balance:
                 </p>
                 <div className="text-6xl font-light tracking-tight">
-                  0.00{" "}
+                  {formattedBalance}{" "}
                   <span className="text-dark-outline text-3xl ml-1">WISP</span>
                 </div>
-                <div className="mt-10 h-72 w-full bg-dark-surfaceContainer rounded-3xl border border-dark-outlineVariant flex items-center justify-center relative overflow-hidden">
-                  <div className="absolute inset-0 bg-linear-to-b from-dark-primary/5 to-transparent" />
-                  <span className="text-dark-outline font-medium">
-                    Chart visualization area
-                  </span>
+                <div className="mt-10 h-72 w-full bg-dark-surfaceContainer rounded-4xl border border-dark-outlineVariant p-4">
+                  {history.length > 1 ? (
+                    <BalanceChart data={history} />
+                  ) : (
+                    <div className="flex items-center justify-center h-full text-dark-outline italic">
+                      Not enough transaction data for a timeline
+                    </div>
+                  )}
                 </div>
               </section>
 
               <section>
                 <h3 className="text-xl font-medium mb-6">Recent Activity</h3>
-                <div className="flex flex-col">
-                  <p className="text-xs font-bold text-dark-outline uppercase tracking-widest mb-4">
-                    August 05, 2020
-                  </p>
-                  <ActivityItem
-                    type="Sent"
-                    time="10:54 PM"
-                    address="Kokot"
-                    amount="0.001"
-                  />
-                  <ActivityItem
-                    type="Received"
-                    time="09:12 AM"
-                    address="Pica"
-                    amount="0.052"
-                  />
+                <div className="space-y-2">
+                  {transactions.length > 0 ? (
+                    transactions.map((txInfo, i) => (
+                      <ActivityItem
+                        key={txInfo.transaction.id || i}
+                        tx={txInfo}
+                      />
+                    ))
+                  ) : (
+                    <div className="py-20 flex flex-col items-center justify-center border-2 border-dashed border-dark-outlineVariant rounded-4xl opacity-50">
+                      <p className="text-sm font-medium">
+                        No activity recorded yet
+                      </p>
+                    </div>
+                  )}
                 </div>
               </section>
             </>
