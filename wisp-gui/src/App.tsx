@@ -1,340 +1,424 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
+import ActivityItem from "./components/ActivityItem";
+import Button from "./components/Button";
+import IconButton from "./components/IconButton";
 import { invoke } from "@tauri-apps/api/core";
-import Button from "./components/Button.tsx";
-import "./App.css";
+import { CreateWalletModal } from "./components/CreateWalletModal";
+import { RecoverWalletModal } from "./components/RecoverWalletModal";
+import { UnlockWalletModal } from "./components/UnlockWalletModal";
 
-// --- Helper Components ---
+type View = "home" | "settings";
 
-const Input = ({ value, onChange, placeholder, type = "text", label, className = "" }: any) => (
-  <div className={`flex flex-col gap-2 ${className}`}>
-    {label && <label className="text-xs font-bold uppercase tracking-wider text-dark-onSurfaceVariant ml-1">{label}</label>}
-    <input
-      type={type}
-      value={value}
-      onChange={onChange}
-      placeholder={placeholder}
-      className="w-full bg-dark-surfaceContainerHigh text-dark-onSurface px-4 py-4 rounded-2xl border-2 border-transparent focus:border-dark-primary focus:outline-none transition-colors placeholder:text-dark-onSurfaceVariant/50 font-medium"
-    />
-  </div>
-);
-
-const Modal = ({ title, onClose, children }: any) => (
-  <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4 sm:p-6">
-    <div className="absolute inset-0 bg-dark-scrim/80 backdrop-blur-sm transition-opacity" onClick={onClose} />
-    <div className="relative w-full max-w-md bg-dark-surfaceContainer rounded-3xl p-6 shadow-2xl animate-in slide-in-from-bottom-10 fade-in duration-200">
-      <div className="flex justify-between items-center mb-6">
-        <h2 className="text-xl font-bold text-dark-onSurface">{title}</h2>
-        <button onClick={onClose} className="p-2 rounded-full hover:bg-dark-surfaceContainerHighest text-dark-onSurfaceVariant hover:text-dark-onSurface transition-colors">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
-      </div>
-      {children}
-    </div>
-  </div>
-);
-
-interface Transaction {
-  id: string;
-  kind: "Sent" | "Received" | "Coinbase";
-  amount: string;
-  timestamp: string;
-  status: "Pending" | "Confirmed";
-}
-
-// --- Main App ---
-
-function App() {
-  const [view, setView] = useState<"loading" | "auth" | "dashboard">("loading");
+const App = () => {
+  const [currentView, setCurrentView] = useState<View>("home");
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [showAddMenu, setShowAddMenu] = useState(false);
+  const [activeModal, setActiveModal] = useState<"create" | "recover" | null>(
+    null,
+  );
   const [wallets, setWallets] = useState<string[]>([]);
-  const [walletName, setWalletName] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [isCreating, setIsCreating] = useState(false);
+  const [activeWallet, setActiveWallet] = useState<string | null>(null);
+  const [pendingWallet, setPendingWallet] = useState<string | null>(null);
+  const [unlockedWallet, setUnlockedWallet] = useState<string | null>(null);
+  const [balance, setBalance] = useState<number>(0);
 
-  // Dashboard State
-  const [balance, setBalance] = useState("0.00");
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [address, setAddress] = useState("");
-  const [showSend, setShowSend] = useState(false);
-  const [showReceive, setShowReceive] = useState(false);
-
-  // Send Form State
-  const [recipient, setRecipient] = useState("");
-  const [amount, setAmount] = useState("");
-  const [isSendMax, setIsSendMax] = useState(false);
-  const [fee, setFee] = useState("100"); // Default fixed fee
-  const [sendPassword, setSendPassword] = useState("");
-
-  useEffect(() => {
-    checkWallets();
-  }, []);
-
-  async function checkWallets() {
+  const loadWallets = async () => {
     try {
-      const list: string[] = await invoke("list_wallets");
+      const list = await invoke<string[]>("list_wallets");
       setWallets(list);
-      if (list.length > 0) {
-        setWalletName(list[0]);
-        setIsCreating(false);
-      } else {
-        setIsCreating(true);
-      }
-      setView("auth");
-    } catch (e) {
-      setError(String(e));
+      if (!activeWallet && list.length > 0) setActiveWallet(list[0]);
+    } catch (err) {
+      console.error("Failed to load wallets:", err);
     }
-  }
-
-  async function handleAuth() {
-    setError("");
-    try {
-      if (isCreating) {
-        await invoke("create_wallet", { name: walletName, password });
-      } else {
-        await invoke("load_wallet", { name: walletName, password });
-      }
-      await refreshWalletData();
-      setView("dashboard");
-      setPassword(""); // Clear auth password
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function refreshWalletData() {
-    try {
-      const bal: string = await invoke("get_balance");
-      const addr: string = await invoke("get_address");
-      const txs: Transaction[] = await invoke("get_transactions");
-      setBalance(bal);
-      setTransactions(txs);
-      setAddress(addr);
-    } catch (e) {
-      console.error("Failed to fetch wallet data", e);
-    }
-  }
-
-  async function handleSend() {
-    setError("");
-    try {
-      await invoke("send_funds", {
-        recipient,
-        amountWisp: amount,
-        feeFixed: parseInt(fee),
-        password: sendPassword,
-        isSendMax
-      });
-      setShowSend(false);
-      setRecipient("");
-      setAmount("");
-      setSendPassword("");
-      // Refresh balance after a short delay to allow propagation
-      setTimeout(refreshWalletData, 1000);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
-    // Optional: Add toast here
   };
 
-  if (view === "loading") {
-    return <div className="min-h-screen flex items-center justify-center text-dark-primary animate-pulse">Loading Wisp...</div>;
-  }
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      await invoke("refresh_wallet");
+      console.log("Wallet state updated!");
+    } catch (err) {
+      console.error("Failed to sync:", err);
+    } finally {
+      setTimeout(() => setIsRefreshing(false), 600);
+    }
+  };
 
-  if (view === "auth") {
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center p-6 max-w-md mx-auto w-full">
-        <div className="mb-12 text-center">
-          <h1 className="text-4xl font-bold text-dark-onBackground mb-2">Wisp</h1>
-          <p className="text-dark-onSurfaceVariant">Minimalist Privacy Wallet</p>
-        </div>
+  useEffect(() => {
+    loadWallets();
 
-        <div className="w-full space-y-4">
-          {isCreating ? (
-            <Input 
-              label="Wallet Name" 
-              value={walletName} 
-              onChange={(e: any) => setWalletName(e.target.value)} 
-              placeholder="e.g. Main Wallet" 
-            />
-          ) : (
-            <div className="flex flex-col gap-2">
-              <label className="text-xs font-bold uppercase tracking-wider text-dark-onSurfaceVariant ml-1">Select Wallet</label>
-              <select 
-                value={walletName} 
-                onChange={(e) => setWalletName(e.target.value)}
-                className="w-full bg-dark-surfaceContainerHigh text-dark-onSurface px-4 py-4 rounded-2xl border-2 border-transparent focus:border-dark-primary focus:outline-none appearance-none font-medium"
-              >
-                {wallets.map(w => <option key={w} value={w}>{w}</option>)}
-              </select>
-            </div>
-          )}
+    if (activeWallet) {
+      const fetchBalance = async () => {
+        try {
+          const b = await invoke<number>("get_wallet_balance", {
+            name: activeWallet,
+          });
+          setBalance(b);
+        } catch (e) {
+          console.error("Balance fetch failed", e);
+        }
+      };
+      fetchBalance();
+    }
+  }, [activeWallet]);
 
-          <Input 
-            label="Password" 
-            type="password" 
-            value={password} 
-            onChange={(e: any) => setPassword(e.target.value)} 
-            placeholder="Enter your password" 
-          />
+  const SendIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+      className="size-5"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25"
+      />
+    </svg>
+  );
 
-          {error && <div className="p-4 rounded-xl bg-dark-errorContainer text-dark-onError text-sm font-medium">{error}</div>}
+  const ReceiveIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+      className="size-5"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="m19.5 4.5-15 15m0 0h11.25m-11.25 0V8.25"
+      />
+    </svg>
+  );
 
-          <Button onClick={handleAuth} className="w-full mt-4">
-            {isCreating ? "Create Wallet" : "Unlock Wallet"}
-          </Button>
+  const RefreshIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0 3.181 3.183a8.25 8.25 0 0 0 13.803-3.7M4.031 9.865a8.25 8.25 0 0 1 13.803-3.7l3.181 3.182m0-4.991v4.99"
+      />
+    </svg>
+  );
 
-          <button 
-            onClick={() => { setIsCreating(!isCreating); setError(""); }}
-            className="w-full text-center text-sm text-dark-primary font-bold py-2 hover:underline"
-          >
-            {isCreating ? "I already have a wallet" : "Create a new wallet"}
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const SettingsIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.281Z"
+      />
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"
+      />
+    </svg>
+  );
+
+  const PlusIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M12 4.5v15m7.5-7.5h-15"
+      />
+    </svg>
+  );
 
   return (
-    <div className="min-h-screen flex flex-col p-6 max-w-md mx-auto w-full relative">
-      {/* Header / Status */}
-      <div className="flex justify-between items-center py-4">
-        <div className="flex items-center gap-2 px-3 py-1.5 bg-dark-surfaceContainer rounded-full">
-          <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(52,211,153,0.6)]"></div>
-          <span className="text-xs font-bold text-dark-onSurfaceVariant uppercase tracking-wide">Synced</span>
-        </div>
-        <button onClick={() => setView("auth")} className="text-dark-onSurfaceVariant hover:text-dark-onSurface">
-          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-6 h-6"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75" /></svg>
-        </button>
-      </div>
-
-      {/* Balance Display */}
-      <div className="flex-1 flex flex-col items-center justify-center min-h-[40vh]">
-        <div className="text-dark-onSurfaceVariant font-medium mb-2">Total Balance</div>
-        <div className="text-6xl font-bold text-dark-onBackground tracking-tight mb-1">
-          {balance}
-        </div>
-        <div className="text-xl text-dark-primary font-medium">WISP</div>
-      </div>
-
-      {/* Action Buttons */}
-      <div className="grid grid-cols-2 gap-4 mb-8">
-        <Button variant="secondary" onClick={() => setShowSend(true)} className="flex-col py-6 gap-3" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-8 h-8"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 19.5l15-15m0 0H8.25m11.25 0v11.25" /></svg>}>
-          Send
-        </Button>
-        <Button variant="primary" onClick={() => setShowReceive(true)} className="flex-col py-6 gap-3" icon={<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-8 h-8"><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 19.5l-15-15m0 0v11.25m0-11.25h11.25" /></svg>}>
-          Receive
-        </Button>
-      </div>
-
-      {/* Recent Activity Placeholder */}
-      <div className="flex-1">
-        <h3 className="text-sm font-bold text-dark-onSurfaceVariant uppercase tracking-wider mb-4">Recent Activity</h3>
-        
-        {transactions.length === 0 ? (
-          <div className="p-8 text-center border-2 border-dashed border-dark-outlineVariant rounded-3xl text-dark-onSurfaceVariant">
-            No recent transactions
-          </div>
-        ) : (
-          <div className="space-y-3 pb-4">
-            {transactions.map((tx) => (
-              <div key={tx.id} className="flex justify-between items-center p-4 bg-dark-surfaceContainerHigh/50 rounded-2xl border border-transparent hover:border-dark-outlineVariant transition-colors">
-                <div className="flex items-center gap-4">
-                  <div className={`w-10 h-10 rounded-full flex items-center justify-center ${tx.kind === 'Received' || tx.kind === 'Coinbase' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-dark-surfaceContainerHighest text-dark-onSurface'}`}>
-                    {tx.kind === 'Received' || tx.kind === 'Coinbase' ? (
-                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M19.5 13.5L12 21m0 0l-7.5-7.5M12 21V3" /></svg>
-                    ) : (
-                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 10.5L12 3m0 0l7.5 7.5M12 3v18" /></svg>
-                    )}
-                  </div>
-                  <div>
-                    <p className="font-bold text-dark-onSurface">{tx.kind}</p>
-                    <p className="text-xs text-dark-onSurfaceVariant">{new Date(tx.timestamp).toLocaleDateString()} • {new Date(tx.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <p className={`font-bold ${tx.kind === 'Received' || tx.kind === 'Coinbase' ? 'text-emerald-400' : 'text-dark-onSurface'}`}>{tx.amount} WISP</p>
-                  <p className={`text-xs font-medium ${tx.status === 'Pending' ? 'text-amber-400' : 'text-dark-onSurfaceVariant'}`}>{tx.status}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Send Modal */}
-      {showSend && (
-        <Modal title="Send Wisp" onClose={() => setShowSend(false)}>
-          <div className="space-y-4">
-            <Input 
-              label="Recipient Address" 
-              placeholder="Public Key (Hex)" 
-              value={recipient} 
-              onChange={(e: any) => setRecipient(e.target.value)} 
-            />
-            <div className="flex gap-4 items-end">
-              <div className="flex-1 relative">
-                <Input 
-                  label="Amount" 
-                  placeholder="0.00" 
-                  value={amount} 
-                  onChange={(e: any) => { setAmount(e.target.value); setIsSendMax(false); }} 
-                  className="w-full"
-                />
-                <button 
-                  onClick={() => { setIsSendMax(true); setAmount("MAX"); }}
-                  className="absolute right-3 top-[38px] text-xs font-bold text-dark-primary hover:text-dark-onPrimary bg-dark-surfaceContainer px-2 py-1 rounded-md transition-colors"
-                >
-                  MAX
-                </button>
-              </div>
-              <div className="w-1/3">
-                 <label className="text-xs font-bold uppercase tracking-wider text-dark-onSurfaceVariant ml-1">Asset</label>
-                 <div className="w-full bg-dark-surfaceContainerHigh text-dark-onSurface px-4 py-4 rounded-2xl border-2 border-transparent font-bold text-center mt-2">WISP</div>
-              </div>
-            </div>
-            <Input 
-              label="Wallet Password" 
-              type="password" 
-              placeholder="Required to sign" 
-              value={sendPassword} 
-              onChange={(e: any) => setSendPassword(e.target.value)} 
-            />
-            
-            {error && <div className="p-3 rounded-xl bg-dark-errorContainer text-dark-onError text-sm">{error}</div>}
-            
-            <Button onClick={handleSend} className="w-full mt-4">Confirm Send</Button>
-          </div>
-        </Modal>
+    <>
+      {showAddMenu && (
+        <div
+          className="fixed inset-0 z-40 bg-transparent"
+          onClick={() => setShowAddMenu(false)}
+        />
       )}
 
-      {/* Receive Modal */}
-      {showReceive && (
-        <Modal title="Receive Wisp" onClose={() => setShowReceive(false)}>
-          <div className="flex flex-col items-center gap-6 py-4">
-            <div className="w-48 h-48 bg-white rounded-2xl flex items-center justify-center">
-              {/* Placeholder for QR Code */}
-              <div className="text-black font-bold opacity-20">QR CODE</div>
-            </div>
-            <div className="w-full">
-              <label className="text-xs font-bold uppercase tracking-wider text-dark-onSurfaceVariant ml-1 mb-2 block">Your Address</label>
-              <div 
-                onClick={() => copyToClipboard(address)}
-                className="bg-dark-surfaceContainerHigh p-4 rounded-2xl break-all font-mono text-sm text-dark-onSurface border-2 border-transparent hover:border-dark-primary cursor-pointer transition-colors flex gap-2"
+      <div className="flex w-full h-screen overflow-hidden bg-dark-background font-dmsans text-dark-onSurface relative">
+        <div
+          data-tauri-drag-region
+          className="absolute top-0 left-0 w-full h-8 z-50 cursor-default select-none"
+        />
+
+        <aside className="w-70 bg-dark-surfaceContainerLow flex flex-col p-6 border-r border-dark-outlineVariant pt-10">
+          <header className="text-dark-primary text-2xl font-black uppercase mb-8 tracking-tighter">
+            Wisp wallet
+          </header>
+
+          <nav className="flex-1">
+            <ul className="space-y-2">
+              <li
+                onClick={() => setCurrentView("home")}
+                className={`px-4 py-2 rounded-full cursor-pointer transition-colors font-medium ${
+                  currentView === "home"
+                    ? "bg-dark-secondaryContainer text-dark-onSecondaryContainer"
+                    : "hover:bg-dark-surfaceVariant text-dark-onSurfaceVariant"
+                }`}
               >
-                {address}
-                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5 shrink-0"><path strokeLinecap="round" strokeLinejoin="round" d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 01-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 011.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 00-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 01-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 00-3.375-3.375h-1.5" /></svg>
+                Home
+              </li>
+              <li
+                onClick={() => setCurrentView("settings")}
+                className={`px-4 py-2 rounded-full cursor-pointer transition-colors font-medium ${
+                  currentView === "settings"
+                    ? "bg-dark-secondaryContainer text-dark-onSecondaryContainer"
+                    : "hover:bg-dark-surfaceVariant text-dark-onSurfaceVariant"
+                }`}
+              >
+                Settings
+              </li>
+            </ul>
+            <section className="mt-10 relative">
+              <div className="flex items-center justify-between px-4 mb-4">
+                <h4 className="text-[10px] uppercase tracking-widest text-dark-outline font-bold">
+                  Accounts
+                </h4>
+                <IconButton
+                  icon={PlusIcon}
+                  onClick={() => setShowAddMenu(!showAddMenu)}
+                  className={`size-8 ${showAddMenu ? "bg-dark-primary/20 text-dark-primary" : ""}`}
+                />
               </div>
-              <p className="text-center text-dark-onSurfaceVariant text-xs mt-2">Tap address to copy</p>
+
+              {showAddMenu && (
+                <div className="absolute right-0 top-10 w-64 bg-dark-surfaceContainerHigh border border-dark-outlineVariant rounded-2xl shadow-2xl z-50 p-2 animate-in fade-in zoom-in duration-200">
+                  <button
+                    onClick={() => {
+                      setActiveModal("create");
+                      setShowAddMenu(false); // Close menu when modal opens
+                    }}
+                    className="w-full text-left px-4 py-3 rounded-xl hover:bg-dark-surfaceVariant flex flex-col transition-colors"
+                  >
+                    <span className="text-sm font-bold text-dark-onSurface">
+                      Create a new wallet
+                    </span>
+                    <span className="text-[10px] text-dark-outline">
+                      Generates a new 24-word seed
+                    </span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveModal("recover");
+                      setShowAddMenu(false); // Close menu when modal opens
+                    }}
+                    className="w-full text-left px-4 py-3 rounded-xl hover:bg-dark-surfaceVariant flex flex-col mt-1 transition-colors"
+                  >
+                    <span className="text-sm font-bold text-dark-onSurface">
+                      Recover wallet
+                    </span>
+                    <span className="text-[10px] text-dark-outline">
+                      Use a seed phrase or private key
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              <div className="space-y-1">
+                {wallets.map((walletName) => (
+                  <button
+                    key={walletName}
+                    onClick={() => {
+                      if (unlockedWallet === walletName) {
+                        setActiveWallet(walletName);
+                      } else {
+                        setPendingWallet(walletName);
+                      }
+                    }}
+                    className={`...`}
+                  >
+                    {walletName}
+                  </button>
+                ))}
+
+                {wallets.length === 0 && (
+                  <p className="px-4 text-xs text-dark-outline italic">
+                    No wallets found
+                  </p>
+                )}
+              </div>
+            </section>
+          </nav>
+
+          <footer className="px-4 text-xs text-dark-outline opacity-50">
+            balls
+          </footer>
+        </aside>
+
+        <main className="flex-1 p-12 overflow-y-auto pt-14">
+          {currentView === "home" ? (
+            <>
+              <header className="flex justify-between items-start mb-12">
+                <div>
+                  <h2 className="text-4xl font-medium mb-1">Wallet 1</h2>
+                  <p className="text-dark-onSurfaceVariant">
+                    Legacy address format
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {" "}
+                  {/* Container for all actions */}
+                  <div className="flex gap-3 mr-4">
+                    {" "}
+                    <Button variant="primary" icon={SendIcon}>
+                      Send
+                    </Button>
+                    <Button variant="ghost" icon={ReceiveIcon}>
+                      Receive
+                    </Button>
+                  </div>
+                  <div className="flex gap-1">
+                    <IconButton
+                      icon={RefreshIcon}
+                      onClick={handleRefresh}
+                      className={
+                        isRefreshing ? "animate-spin text-dark-primary" : ""
+                      }
+                    />
+                    <IconButton
+                      icon={SettingsIcon}
+                      onClick={() => console.log("Settings")}
+                    />
+                  </div>
+                </div>
+              </header>
+
+              <section className="mb-12">
+                <p className="text-sm text-dark-onSurfaceVariant mb-2 font-medium">
+                  Current balance:
+                </p>
+                <div className="text-6xl font-light tracking-tight">
+                  0.00{" "}
+                  <span className="text-dark-outline text-3xl ml-1">WISP</span>
+                </div>
+                <div className="mt-10 h-72 w-full bg-dark-surfaceContainer rounded-3xl border border-dark-outlineVariant flex items-center justify-center relative overflow-hidden">
+                  <div className="absolute inset-0 bg-linear-to-b from-dark-primary/5 to-transparent" />
+                  <span className="text-dark-outline font-medium">
+                    Chart visualization area
+                  </span>
+                </div>
+              </section>
+
+              <section>
+                <h3 className="text-xl font-medium mb-6">Recent Activity</h3>
+                <div className="flex flex-col">
+                  <p className="text-xs font-bold text-dark-outline uppercase tracking-widest mb-4">
+                    August 05, 2020
+                  </p>
+                  <ActivityItem
+                    type="Sent"
+                    time="10:54 PM"
+                    address="Kokot"
+                    amount="0.001"
+                  />
+                  <ActivityItem
+                    type="Received"
+                    time="09:12 AM"
+                    address="Pica"
+                    amount="0.052"
+                  />
+                </div>
+              </section>
+            </>
+          ) : (
+            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+              <header className="mb-12">
+                <h2 className="text-4xl font-medium mb-1">Settings</h2>
+                <p className="text-dark-onSurfaceVariant">
+                  Configure your Wisp node and security
+                </p>
+              </header>
+
+              <section className="space-y-6 max-w-2xl">
+                <div className="p-6 bg-dark-surfaceContainer rounded-3xl border border-dark-outlineVariant">
+                  <h4 className="text-lg font-bold mb-4">Node Connection</h4>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-xs font-bold text-dark-outline uppercase ml-1">
+                        Default Node Address
+                      </label>
+                      <input
+                        className="w-full mt-1 bg-dark-surfaceContainerLow border border-dark-outlineVariant rounded-xl px-4 py-3 text-dark-onSurface focus:outline-none focus:border-dark-primary transition-colors"
+                        placeholder="0.0.0.0:9000"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-6 bg-dark-surfaceContainer rounded-3xl border border-dark-outlineVariant">
+                  <h4 className="text-lg font-bold mb-4 text-red-400">
+                    Danger Zone
+                  </h4>
+                  <Button
+                    variant="ghost"
+                    className="text-red-400 hover:bg-red-400/10"
+                  >
+                    Delete All Wallets
+                  </Button>
+                </div>
+              </section>
             </div>
-          </div>
-        </Modal>
+          )}
+        </main>
+      </div>
+
+      {activeModal === "create" && (
+        <CreateWalletModal
+          onClose={() => setActiveModal(null)}
+          onSuccess={() => {
+            loadWallets();
+          }}
+        />
       )}
-    </div>
+
+      {activeModal === "recover" && (
+        <RecoverWalletModal
+          onClose={() => setActiveModal(null)}
+          onSuccess={() => {
+            loadWallets();
+          }}
+        />
+      )}
+
+      {pendingWallet && (
+        <UnlockWalletModal
+          walletName={pendingWallet}
+          onClose={() => setPendingWallet(null)}
+          onSuccess={() => {
+            setUnlockedWallet(pendingWallet);
+            setActiveWallet(pendingWallet);
+            setPendingWallet(null);
+            handleRefresh();
+          }}
+        />
+      )}
+    </>
   );
-}
+};
 
 export default App;

@@ -53,11 +53,18 @@ pub struct Core {
     pub discovered_nodes: Arc<AsyncMutex<HashMap<String, Option<Duration>>>>,
     pub utxos: Arc<RwLock<HashMap<OutPoint, TransactionOutput>>>,
     pub transactions: Arc<RwLock<HashMap<Hash, WalletTransactionInfo>>>,
+    pub data_dir: PathBuf, // Add this to store the absolute path
     connected_node_stream: Arc<AsyncMutex<Option<TcpStream>>>,
 }
 
 impl Core {
     pub async fn load(config_path: PathBuf) -> Result<Self> {
+        // Derive the data directory from the config path's parent
+        let data_dir = config_path
+            .parent()
+            .unwrap_or(&PathBuf::from("."))
+            .to_path_buf();
+
         let config = match fs::read_to_string(&config_path) {
             Ok(content) => toml::from_str(&content)?,
             Err(_) => {
@@ -72,6 +79,7 @@ impl Core {
             discovered_nodes: Arc::new(AsyncMutex::new(HashMap::new())),
             utxos: Arc::new(RwLock::new(HashMap::new())),
             transactions: Arc::new(RwLock::new(HashMap::new())),
+            data_dir,
             connected_node_stream: Arc::new(AsyncMutex::new(None)),
         })
     }
@@ -198,15 +206,14 @@ impl Core {
             encrypted_seed_phrase,
         };
 
-        new_wallet.save_to_file(password)?;
-
+        new_wallet.save_to_file(&self.data_dir, password)?;
         {
             let mut config_guard = self.config.lock().await;
             config_guard.current_wallet_name = Some(name.to_string());
             self.save_config(config_path, &*config_guard).await?;
         }
 
-        let loaded_wallet = SavedWallet::load_from_file(name, password)?;
+        let loaded_wallet = SavedWallet::load_from_file(&self.data_dir, name, password)?;
         wallets_guard.push(loaded_wallet);
 
         info!("Wallet '{}' created successfully!", name);
@@ -247,15 +254,14 @@ impl Core {
             encrypted_seed_phrase: None,
         };
 
-        new_wallet.save_to_file(password)?;
-
+        new_wallet.save_to_file(&self.data_dir, password)?;
         {
             let mut config_guard = self.config.lock().await;
             config_guard.current_wallet_name = Some(name.to_string());
             self.save_config(config_path, &*config_guard).await?;
         }
 
-        let loaded_wallet = SavedWallet::load_from_file(name, password)?;
+        let loaded_wallet = SavedWallet::load_from_file(&self.data_dir, name, password)?;
         wallets_guard.push(loaded_wallet);
 
         info!("Wallet '{}' recovered successfully!", name);
@@ -303,15 +309,14 @@ impl Core {
             encrypted_seed_phrase,
         };
 
-        new_wallet.save_to_file(password)?;
-
+        new_wallet.save_to_file(&self.data_dir, password)?;
         {
             let mut config_guard = self.config.lock().await;
             config_guard.current_wallet_name = Some(name.to_string());
             self.save_config(config_path, &*config_guard).await?;
         }
 
-        let loaded_wallet = SavedWallet::load_from_file(name, password)?;
+        let loaded_wallet = SavedWallet::load_from_file(&self.data_dir, name, password)?;
         wallets_guard.push(loaded_wallet);
 
         info!("Wallet '{}' recovered from seed successfully!", name);
@@ -345,12 +350,13 @@ impl Core {
     ) -> Result<()> {
         info!("Loading wallet: {}", name);
 
+        let data_dir_clone = self.data_dir.clone();
         let name_clone = name.to_string();
         let password_clone = password.to_string();
 
         let loaded_wallet = tokio::task::spawn_blocking(move || {
-            SavedWallet::load_from_file(&name_clone, &password_clone)
-                .context("Failed to load wallet file in blocking task")
+            // 2. Pass the cloned path as the first argument
+            SavedWallet::load_from_file(&data_dir_clone, &name_clone, &password_clone)
         })
         .await
         .context("Failed to await wallet loading blocking task completion")?
@@ -517,10 +523,13 @@ impl Core {
 
             let wallet_clone = wallet_to_update.clone();
             let new_password_clone = new_password.to_string();
-            tokio::task::spawn_blocking(move || wallet_clone.save_to_file(&new_password_clone))
-                .await
-                .context("Failed to await wallet save blocking task completion")?
-                .context("Wallet save blocking task returned an error")?;
+            let data_dir_clone = self.data_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                wallet_clone.save_to_file(&data_dir_clone, &new_password_clone)
+            })
+            .await
+            .context("Failed to await wallet save blocking task completion")?
+            .context("Wallet save blocking task returned an error")?;
 
             info!(
                 "Wallet password for '{}' changed successfully.",
@@ -547,7 +556,7 @@ impl Core {
     }
 
     pub async fn delete_wallet(&self, name: &str, config_path: &PathBuf) -> Result<()> {
-        let path = SavedWallet::wallet_file_path(name);
+        let path = SavedWallet::wallet_file_path(&self.data_dir, name);
         if fs::remove_file(&path).is_ok() {
             info!("Wallet file '{}' deleted.", name);
             {

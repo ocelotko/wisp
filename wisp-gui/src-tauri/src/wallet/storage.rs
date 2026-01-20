@@ -32,16 +32,19 @@ pub struct SavedWallet {
 }
 
 impl SavedWallet {
-    pub fn wallet_file_path(name: &str) -> PathBuf {
-        let mut path = PathBuf::from(WALLET_DIR);
+    pub fn wallet_file_path(data_dir: &PathBuf, name: &str) -> PathBuf {
+        let mut path = data_dir.clone();
+        path.push("wallets");
         path.push(format!("{}.{}", name, WALLET_FILE_EXTENSION));
         path
     }
 
-    pub fn save_to_file(&self, password: &str) -> Result<()> {
-        let path = Self::wallet_file_path(&self.name);
-        log::info!("Saving wallet '{}' to path: {:?}", self.name, path);
-        fs::create_dir_all(WALLET_DIR)?;
+    pub fn save_to_file(&self, data_dir: &PathBuf, password: &str) -> Result<()> {
+        let path = Self::wallet_file_path(data_dir, &self.name);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         let serialized_result = serde_json::to_vec(self);
         match serialized_result {
@@ -110,11 +113,10 @@ impl SavedWallet {
         }
     }
 
-    pub fn load_from_file(name: &str, password: &str) -> Result<Self> {
-        let path = Self::wallet_file_path(name);
+    pub fn load_from_file(data_dir: &PathBuf, name: &str, password: &str) -> Result<Self> {
+        let path = Self::wallet_file_path(data_dir, name);
         log::info!("Attempting to load wallet '{}' from path: {:?}", name, path);
         let mut file = File::open(&path)?;
-
         let mut nonce_bytes = [0u8; ENCRYPTION_NONCE_SIZE];
         file.read_exact(&mut nonce_bytes)?;
         let nonce = Nonce::from(nonce_bytes);

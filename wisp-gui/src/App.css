@@ -1,3 +1,4 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap');
 @import "tailwindcss";
 
 @theme {
@@ -152,6 +153,6 @@
 
 @layer base {
   body {
-    @apply bg-dark-background text-dark-onBackground font-dmsans antialiased selection:bg-dark-primary selection:text-dark-onPrimary;
+    @apply bg-dark-background text-dark-onBackground font-dmsans;
   }
 }

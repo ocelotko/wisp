@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "wisp-gui",
-        "width": 800,
-        "height": 600
+        "title": "Wisp Wallet",
+        "width": 1000,
+        "height": 800,
+        "decorations": false,
+        "transparent": true
       }
     ],
     "security": {
