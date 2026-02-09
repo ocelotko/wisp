@@ -28,34 +28,21 @@ use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub enum AddBlockResult {
-    /// Block was successfully added to the main chain.
     Added,
-    /// Block was rejected as invalid.
     Rejected(String),
-    /// Block extends a fork that is longer (or has more work) than the current chain.
-    /// This triggers a reorganization.
     PotentialLongerForkDetected {
         common_ancestor_index: u64,
         new_block_index: u64,
         new_block_hash: Hash,
     },
-    /// Block was added to the orphan pool because its parent is missing.
     Orphaned,
-    /// Block was rejected because it is an orphan and the pool is full or other reasons.
     OrphanRejected(String),
-    /// Block is part of a fork that is shorter than the main chain.
     ShorterForkRejected(String),
 }
 
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Block {
-    pub version: u32,
-    #[bincode(with_serde)]
-    pub timestamp: DateTime<Utc>,
-    pub nonce: u64,
-    pub previous_hash: Hash,
-    pub merkle_root: MerkleRoot,
-    pub target: U256,
+    pub header: BlockHeader,
     pub index: u64,
     pub transactions: Vec<Transaction>,
 }
@@ -124,55 +111,44 @@ impl Block {
         transactions: Vec<Transaction>,
     ) -> Self {
         Block {
-            version,
-            timestamp,
-            nonce,
-            previous_hash,
-            merkle_root,
-            target,
+            header: BlockHeader {
+                version,
+                timestamp,
+                nonce,
+                previous_hash,
+                merkle_root,
+                target,
+            },
             index,
             transactions,
         }
     }
 
     pub fn header(&self) -> BlockHeader {
-        BlockHeader {
-            version: self.version,
-            timestamp: self.timestamp,
-            nonce: self.nonce,
-            previous_hash: self.previous_hash,
-            merkle_root: self.merkle_root,
-            target: self.target,
-        }
+        self.header.clone()
     }
 
     pub fn id(&self) -> Result<Hash, anyhow::Error> {
-        Ok(hash(&self.header()))
+        Ok(hash(&self.header))
     }
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Blockchain {
-    /// The current set of unspent transaction outputs.
     pub utxo_set: UtxoSet,
-    /// The current proof-of-work target for the next block.
     pub target: U256,
     #[serde(skip)]
     pub db: Db,
-    /// Transactions waiting to be included in a block.
     #[serde(default)]
     pub mempool: HashMap<Hash, MempoolEntry>,
-    /// Cache of recent block timestamps and targets for Difficulty Adjustment Algorithm.
     #[serde(skip)]
     pub daa_cache: HashMap<u64, (DateTime<Utc>, U256)>,
-    /// Cache of the current tip block to avoid DB lookups.
     #[serde(skip)]
     pub tip_cache: Option<(Hash, Block)>,
     #[serde(skip)]
     pub total_supply: Amount,
     #[serde(skip)]
     pub total_tx_count: u64,
-    /// Pool of blocks whose parents are not yet known.
     #[serde(skip)]
     pub orphan_pool: HashMap<Hash, Vec<(DateTime<Utc>, Hash, Block)>>,
     #[serde(skip)]
@@ -405,7 +381,7 @@ impl Blockchain {
         let current_chain_tip = if let Some(block) = current_tip_option {
             block
         } else {
-            if new_block.index == 0 && new_block.previous_hash == Hash::zero() {
+            if new_block.index == 0 && new_block.header.previous_hash == Hash::zero() {
                 info!("[CHAIN] Chain is empty, processing genesis block.");
                 return self.add_direct_extension(new_block, new_block_hash);
             } else {
@@ -416,7 +392,7 @@ impl Blockchain {
         };
         let current_chain_tip_hash = current_chain_tip.id()?;
 
-        if new_block.previous_hash == current_chain_tip_hash {
+        if new_block.header.previous_hash == current_chain_tip_hash {
             info!(
                 "[CHAIN] New block {} is a direct extension of the current tip.",
                 new_block_hash
@@ -427,7 +403,7 @@ impl Blockchain {
                 "[FORK] Fork detected or out-of-order block ({}). Local tip: {} (index {}), New block previous: {} (index {})",
                 new_block_hash,
                 current_chain_tip_hash, current_chain_tip.index,
-                new_block.previous_hash, new_block.index.saturating_sub(1)
+                new_block.header.previous_hash, new_block.index.saturating_sub(1)
             );
 
             if let Err(e) = new_block.validate_header_and_pow() {
@@ -437,8 +413,13 @@ impl Blockchain {
                 )));
             }
 
+            let checked_block = CheckedBlock::from_block(new_block.clone())?;
+            let checked_block_bytes = bincode::encode_to_vec(&checked_block, bincode_config())?;
+            self.db
+                .insert(DBKeys::block(&new_block_hash), checked_block_bytes)?;
+
             if let Some((common_ancestor_index, common_ancestor_hash)) =
-                self.find_common_ancestor(&new_block.previous_hash)
+                self.find_common_ancestor(&new_block.header.previous_hash)
             {
                 info!(
                     "[FORK] Found common ancestor {} at index {} for received block {}",
@@ -446,57 +427,54 @@ impl Blockchain {
                 );
 
                 if new_block.index <= current_chain_tip.index {
+                    info!(
+                        "[FORK] Stored block {} (index {}) as part of a shorter or equal fork.",
+                        new_block_hash, new_block.index
+                    );
                     return Ok(AddBlockResult::ShorterForkRejected(format!(
-                        "Received block {} is part of a shorter or equal length fork (new index {} <= current index {}). Rejecting.",
+                    "Received block {} is part of a shorter or equal length fork (new index {} <= current index {}). Stored but not active.",
                         new_block_hash, new_block.index, current_chain_tip.index,
                     )));
                 }
 
-                let checked_block = CheckedBlock::from_block(new_block.clone())?;
-                let checked_block_bytes = bincode::encode_to_vec(&checked_block, bincode_config())?;
-                self.db
-                    .insert(DBKeys::block(&new_block_hash), checked_block_bytes)?;
                 info!(
-                    "[FORK] Stored potential fork block {} (index {}) for future reorg.",
-                    new_block_hash, new_block.index
+                    "[REORG] Longer fork detected at block {}. Initiating reorg.",
+                    new_block_hash
                 );
 
-                self.db
-                    .transaction(|tx_db| {
-                        let tip_bytes = bincode::encode_to_vec(&new_block_hash, bincode_config())
-                            .map_err(|e| ReorgError::Anyhow(e.into()))?;
-                        let ancestor_bytes =
-                            bincode::encode_to_vec(&common_ancestor_index, bincode_config())
-                                .map_err(|e| ReorgError::Anyhow(e.into()))?;
-                        let ancestor_hash_bytes =
-                            bincode::encode_to_vec(&common_ancestor_hash, bincode_config())
-                                .map_err(|e| ReorgError::Anyhow(e.into()))?;
+                let mut new_chain_segment = Vec::new();
+                let mut current_backtrack = new_block.clone();
+                let mut depth = 0;
 
-                        tx_db.insert(DBKeys::PENDING_REORG_TIP, tip_bytes)?;
-                        tx_db.insert(DBKeys::PENDING_REORG_ANCESTOR, ancestor_bytes)?;
-                        tx_db.insert(DBKeys::PENDING_REORG_ANCESTOR_HASH, ancestor_hash_bytes)?;
-                        Ok(())
-                    })
-                    .map_err(|e| anyhow!("Failed to save pending reorg state: {:?}", e))?;
+                const MAX_REORG_DEPTH: u64 = 10000;
 
-                Ok(AddBlockResult::PotentialLongerForkDetected {
-                    common_ancestor_index,
-                    new_block_index: new_block.index,
-                    new_block_hash,
-                })
-            } else {
-                let orphan_result = self.add_to_orphan_pool(new_block.clone(), new_block_hash)?;
+                while current_backtrack.header.previous_hash != common_ancestor_hash {
+                    new_chain_segment.push(current_backtrack.clone());
+                    let prev_hash = current_backtrack.header.previous_hash;
 
-                if let AddBlockResult::Orphaned = orphan_result {
-                    let checked_block = CheckedBlock::from_block(new_block.clone())?;
-                    let checked_block_bytes =
-                        bincode::encode_to_vec(&checked_block, bincode_config())?;
-                    self.db
-                        .insert(DBKeys::block(&new_block_hash), checked_block_bytes)?;
-                    info!("[ORPHAN] Stored orphan block {} to disk.", new_block_hash);
+                    if let Some(prev_block) = self.get_block_by_hash(&prev_hash)? {
+                        current_backtrack = prev_block;
+                    } else {
+                        return Err(anyhow!(
+                            "CRITICAL: Missing block {} in fork chain during reorg preparation",
+                            prev_hash
+                        ));
+                    }
+
+                    depth += 1;
+                    if depth > MAX_REORG_DEPTH {
+                        return Err(anyhow!("Reorg depth exceeded limit of {}", MAX_REORG_DEPTH));
+                    }
                 }
+                new_chain_segment.push(current_backtrack);
+                new_chain_segment.reverse();
 
-                Ok(orphan_result)
+                self.reorganize_chain(new_chain_segment, common_ancestor_index)?;
+                self.process_orphans_for_parent(new_block_hash)?;
+
+                Ok(AddBlockResult::Added)
+            } else {
+                self.add_to_orphan_pool(new_block, new_block_hash)
             }
         }
     }
@@ -610,8 +588,10 @@ impl Blockchain {
             new_block_hash, new_block.index, new_block.index
         );
 
-        self.daa_cache
-            .insert(new_block.index, (new_block.timestamp, new_block.target));
+        self.daa_cache.insert(
+            new_block.index,
+            (new_block.header.timestamp, new_block.header.target),
+        );
         self.prune_daa_cache(new_block.index);
 
         self.process_orphans_for_parent(new_block_hash)?;
@@ -667,7 +647,7 @@ impl Blockchain {
             }
         }
 
-        let previous_hash = block.previous_hash;
+        let previous_hash = block.header.previous_hash;
         info!(
             "[ORPHAN] Adding block {} to orphan pool, waiting for parent {}",
             block_hash, previous_hash
@@ -684,8 +664,10 @@ impl Blockchain {
     }
 
     fn process_orphans_for_parent(&mut self, parent_hash: Hash) -> Result<()> {
-        let mut current_parent_hash = parent_hash;
-        loop {
+        let mut parents_to_process = VecDeque::new();
+        parents_to_process.push_back(parent_hash);
+
+        while let Some(current_parent_hash) = parents_to_process.pop_front() {
             if let Some(orphans_to_process) = self.orphan_pool.remove(&current_parent_hash) {
                 info!(
                     "[ORPHAN] Parent {} found. Processing {} orphan block(s).",
@@ -699,7 +681,7 @@ impl Blockchain {
 
                     match self.add_block(orphan_block) {
                         Ok(AddBlockResult::Added) => {
-                            current_parent_hash = orphan_hash;
+                            parents_to_process.push_back(orphan_hash);
                         }
                         Ok(res) => warn!(
                             "[ORPHAN] Re-submitted orphan {} was not added: {:?}",
@@ -713,8 +695,6 @@ impl Blockchain {
                         }
                     }
                 }
-            } else {
-                break;
             }
         }
         Ok(())
@@ -770,8 +750,8 @@ impl Blockchain {
                 }
             }
 
-            if let Ok(Some(block)) = self.get_block_by_hash(&current_hash) {
-                current_hash = block.previous_hash;
+            if let Ok(Some(header)) = self.get_block_header_by_hash(&current_hash) {
+                current_hash = header.previous_hash;
                 if current_hash == Hash::zero() {
                     return None;
                 }

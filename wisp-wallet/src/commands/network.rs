@@ -63,11 +63,11 @@ async fn get_latest_block_prompt(core: &Core) -> Result<(), anyhow::Error> {
             println!("\n--- Latest Block Information ---");
             println!("Height: {}", height);
             println!("Index (from block header): {}", block.index);
-            println!("Timestamp: {}", block.timestamp);
-            println!("Nonce: {}", block.nonce);
-            println!("Previous Hash: {}", block.previous_hash);
-            println!("Merkle Root: {:?}", block.merkle_root);
-            println!("Target: {}", block.target);
+            println!("Timestamp: {}", block.header.timestamp);
+            println!("Nonce: {}", block.header.nonce);
+            println!("Previous Hash: {}", block.header.previous_hash);
+            println!("Merkle Root: {:?}", block.header.merkle_root);
+            println!("Target: {}", block.header.target);
             println!("Number of Transactions: {}", block.transactions.len());
             println!("Transactions:");
             if block.transactions.is_empty() {
@@ -121,11 +121,11 @@ async fn get_block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
         Ok(Some(block)) => {
             println!("\n--- Block Information ---");
             println!("Index: {}", block.index);
-            println!("Timestamp: {}", block.timestamp);
-            println!("Nonce: {}", block.nonce);
-            println!("Previous Hash: {}", block.previous_hash);
-            println!("Merkle Root: {:?}", block.merkle_root);
-            println!("Target: {}", block.target);
+            println!("Timestamp: {}", block.header.timestamp);
+            println!("Nonce: {}", block.header.nonce);
+            println!("Previous Hash: {}", block.header.previous_hash);
+            println!("Merkle Root: {:?}", block.header.merkle_root);
+            println!("Target: {}", block.header.target);
             println!("Number of Transactions: {}", block.transactions.len());
             println!("Transactions:");
             if block.transactions.is_empty() {

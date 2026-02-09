@@ -30,70 +30,57 @@ const Button = memo(
     disabled = false,
     type = "button",
   }: ButtonProps) => {
+    // Unified base styles with WalletButton
     const baseClassName =
-      "py-3 px-6 rounded-full shadow-md text-center font-medium select-none cursor-pointer transition-all duration-300 flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed " +
+      "py-3.5 px-6 rounded-full font-bold select-none cursor-pointer transition-all duration-200 ease-in-out flex items-center justify-center gap-2 active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100 " +
       className;
 
     let variantClassName = "";
     switch (variant) {
       case "primary":
-        variantClassName = bgColorClassName
-          ? "bg-dark-primary text-dark-onPrimary"
-          : "bg-dark-primary hover:bg-primary-70 text-dark-onPrimary shadow-dark-primary/20";
+        variantClassName =
+          "bg-dark-primary text-dark-onPrimary shadow-md shadow-dark-primary/20 hover:shadow-lg hover:bg-primary-70";
         break;
       case "secondary":
-        variantClassName = bgColorClassName
-          ? "bg-dark-surfaceContainerHigh text-dark-onSurface"
-          : "bg-dark-surfaceContainerHigh hover:bg-dark-surfaceContainerHighest text-dark-onSurface";
+        variantClassName =
+          "bg-dark-surfaceContainerHigh text-dark-onSurface hover:bg-dark-surfaceContainerHighest hover:shadow-md";
         break;
       case "danger":
-        variantClassName = bgColorClassName
-          ? "bg-dark-error text-dark-onError"
-          : "bg-dark-error hover:bg-dark-errorContainer text-dark-onError";
+        variantClassName =
+          "bg-dark-error text-dark-onError shadow-md shadow-dark-error/20 hover:bg-dark-errorContainer";
         break;
       case "ghost":
-        variantClassName = bgColorClassName
-          ? "text-dark-primary bg-transparent border-2 border-dark-outline"
-          : "text-dark-primary bg-transparent border-2 border-dark-outline hover:bg-primary-15/10";
-        break;
-      default:
-        variantClassName = bgColorClassName
-          ? "bg-dark-primary text-dark-onPrimary"
-          : "bg-dark-primary hover:bg-primary-70 text-dark-onPrimary";
+        variantClassName =
+          "text-dark-onSurface bg-transparent border border-dark-outlineVariant hover:bg-dark-surfaceVariant hover:border-dark-outline";
         break;
     }
 
-    const finalClassName = `${baseClassName} ${variantClassName} ${
-      bgColorClassName || ""
-    } ${textColorClassName || ""}`;
+    const finalClassName = `${baseClassName} ${variantClassName} ${bgColorClassName || ""} ${textColorClassName || ""}`;
 
     const buttonContent = (
       <>
-        {!iconAfter && icon && icon} <span>{children}</span>
-        {iconAfter && icon && icon}
+        {!iconAfter && icon && <span className="shrink-0">{icon}</span>}
+        <span className="leading-none">{children}</span>
+        {iconAfter && icon && <span className="shrink-0">{icon}</span>}
       </>
     );
 
-    if (href && !disabled) {
+    const commonProps = {
+      className: finalClassName,
+      onClick: disabled ? undefined : onClick,
+    };
+
+    if (href && !disabled)
       return (
-        <a href={href} className={finalClassName}>
+        <a href={href} {...commonProps}>
           {buttonContent}
         </a>
       );
-    }
-
-    if (onClick || type) {
-      return (
-        <button type={type} className={finalClassName} onClick={onClick} disabled={disabled}>
-          {buttonContent}
-        </button>
-      );
-    }
 
     return (
-      <div className={finalClassName}>
+      <button type={type} {...commonProps} disabled={disabled}>
         {buttonContent}
-      </div>
+      </button>
     );
   },
 );

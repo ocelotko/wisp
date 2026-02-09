@@ -9,11 +9,6 @@ use std::fmt;
 use std::ops::{Add, Sub};
 
 /// Represents a currency amount in the smallest indivisible unit.
-///
-/// This struct wraps a `u64` and provides methods for safe arithmetic,
-/// conversion to and from the main currency unit (WISP), and string formatting.
-/// Using this struct ensures that all currency operations are handled consistently
-/// and avoids floating-point precision issues.
 #[derive(
     Encode,
     Decode,

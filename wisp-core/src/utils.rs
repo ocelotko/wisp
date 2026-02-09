@@ -128,7 +128,6 @@ pub fn genesis_block() -> AnyhowResult<Block> {
     Ok(genesis_block)
 }
 
-/// A trait for objects that can be saved to and loaded from a stream or file using `bincode`.
 pub trait Saveable
 where
     Self: Sized,

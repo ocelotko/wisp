@@ -1,10 +1,13 @@
+import { memo } from "react";
+
 interface ActivityItemProps {
   tx: any;
 }
 
-const ActivityItem = ({ tx }: ActivityItemProps) => {
+const ActivityItem = memo(({ tx }: ActivityItemProps) => {
   let netChange = 0;
 
+  // 1. Calculate value using 'is_ours' flags from enriched Rust data
   tx.transaction.outputs.forEach((out: any) => {
     if (out.is_ours) netChange += out.value;
   });
@@ -24,27 +27,14 @@ const ActivityItem = ({ tx }: ActivityItemProps) => {
     maximumFractionDigits: 8,
   });
 
+  // 2. CRITICAL FIX: Extract string from Rust enum object to prevent black screen
+  const statusRaw = tx.status;
   const statusString =
-    typeof tx.status === "string" ? tx.status : Object.keys(tx.status)[0];
+    typeof statusRaw === "string" ? statusRaw : Object.keys(statusRaw)[0];
+
   const isConfirmed = statusString === "Confirmed";
 
-  const SendIcon = (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      fill="none"
-      viewBox="0 0 24 24"
-      strokeWidth={1.5}
-      stroke="currentColor"
-      className="size-5"
-    >
-      <path
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        d="m4.5 19.5 15-15m0 0H8.25m11.25 0v11.25"
-      />
-    </svg>
-  );
-
+  // --- Static Icons ---
   const ReceiveIcon = (
     <svg
       xmlns="http://www.w3.org/2000/svg"
@@ -58,6 +48,23 @@ const ActivityItem = ({ tx }: ActivityItemProps) => {
         strokeLinecap="round"
         strokeLinejoin="round"
         d="m19.5 4.5-15 15m0 0h11.25m-11.25 0V8.25"
+      />
+    </svg>
+  );
+
+  const SendIcon = (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      fill="none"
+      viewBox="0 0 24 24"
+      strokeWidth={1.5}
+      stroke="currentColor"
+      className="size-5"
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M6 12L18 12M18 12L12.75 6.75M18 12L12.75 17.25"
       />
     </svg>
   );
@@ -79,6 +86,7 @@ const ActivityItem = ({ tx }: ActivityItemProps) => {
     </svg>
   );
 
+  // --- Dynamic Config ---
   const config = isSelf
     ? { label: "Self", color: "text-blue-400", icon: SelfIcon, sign: "" }
     : isReceived
@@ -88,18 +96,19 @@ const ActivityItem = ({ tx }: ActivityItemProps) => {
           icon: ReceiveIcon,
           sign: "+",
         }
-      : {
-          label: "Sent",
-          color: "text-red-400",
-          icon: SendIcon,
-          sign: "-",
-        };
+      : { label: "Sent", color: "text-red-400", icon: SendIcon, sign: "-" };
 
   return (
-    <div className="flex items-center justify-between p-4 bg-dark-surfaceContainerLow rounded-2xl border border-dark-outlineVariant mb-2 hover:border-dark-primary/30 hover:bg-dark-surfaceContainer transition-all group">
+    <div className="flex items-center justify-between p-4 bg-dark-surfaceContainerLow rounded-2xl border border-dark-outlineVariant mb-2 hover:border-dark-primary/30 hover:bg-dark-surfaceContainer transition-all active:scale-[0.99] group">
       <div className="flex items-center gap-4">
         <div
-          className={`p-3 rounded-full ${isReceived ? "bg-green-500/10 text-green-500" : isSelf ? "bg-blue-500/10 text-blue-400" : "bg-red-500/10 text-red-500"}`}
+          className={`p-3 rounded-full transition-colors ${
+            isReceived
+              ? "bg-green-500/10 text-green-500"
+              : isSelf
+                ? "bg-blue-500/10 text-blue-400"
+                : "bg-red-500/10 text-red-500"
+          }`}
         >
           {config.icon}
         </div>
@@ -128,6 +137,6 @@ const ActivityItem = ({ tx }: ActivityItemProps) => {
       </div>
     </div>
   );
-};
+});
 
 export default ActivityItem;

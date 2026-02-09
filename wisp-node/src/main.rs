@@ -18,7 +18,7 @@ pub mod utils;
 extern crate lazy_static;
 
 #[derive(FromArgs)]
-/// A toy blockchain node
+/// Wisp blockchain node
 struct Args {
     #[argh(option, default = "9000")]
     /// port number
@@ -38,18 +38,11 @@ struct Args {
 }
 
 lazy_static! {
-    /// A global, thread-safe map of connected peer nodes.
-    /// The key is the peer's address string, and the value is the TCP stream.
     pub static ref NODES: DashMap<String, Arc<AsyncMutex<TcpStream>>> = DashMap::new();
-
-    /// A global, thread-safe handle to the blockchain state.
-    /// `OnceCell` ensures it's initialized only once.
     pub static ref BLOCKCHAIN: OnceCell<Arc<RwLock<Blockchain>>> = OnceCell::new();
 }
 
-/// The main function that orchestrates the node's lifecycle.
 async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bool) -> Result<()> {
-    // Open or create the database for persistent storage.
     let db =
         sled::open(&db_path).with_context(|| format!("Failed to open database at {}", db_path))?;
 
@@ -60,8 +53,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
         blockchain_instance.migrate_total_supply()?;
     }
 
-    // Load the blockchain state from the database *before* any network activity.
-    // This ensures we know our own state before talking to peers.
     blockchain_instance.load_from_db()?;
 
     // Pre-warm DAA cache to speed up target calculation and API responses
@@ -75,24 +66,18 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
         if let Some(block) = blockchain_instance.get_block_by_index(i)? {
             blockchain_instance
                 .daa_cache
-                .insert(i, (block.timestamp, block.target));
+                .insert(i, (block.header.timestamp, block.header.target));
         }
     }
 
-    // Set the global BLOCKCHAIN static *before* calling functions that might access it.
     BLOCKCHAIN
         .set(Arc::new(RwLock::new(blockchain_instance)))
         .expect("BUG: BLOCKCHAIN static was already initialized.");
 
-    // Start listening for incoming P2P connections *before* we connect to others.
-    // This ensures that if a peer tries to connect back to us during our handshake,
-    // we are ready to accept their connection.
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
-    // Spawn a separate task for initial peer connection and synchronization.
-    // This allows the main task to immediately start accepting connections.
     tokio::spawn(initial_sync_and_discovery(nodes, port));
 
     let final_height = BLOCKCHAIN.get().unwrap().read().await.block_height()?; // This is now just the local height
@@ -111,7 +96,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
         }
     }
 
-    // Clone the blockchain handle for the API server.
     let blockchain_for_api = crate::BLOCKCHAIN.get().unwrap().clone();
     tokio::spawn(async move {
         api::run_api_server(blockchain_for_api).await;
@@ -119,7 +103,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
 
     tokio::spawn(utils::cleanup());
 
-    // The main server loop for accepting new peer connections.
     tokio::select! {
         _ = async {
             loop {
@@ -158,7 +141,6 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
 /// A separate async function to handle the initial connection and sync logic.
 /// This is spawned as a background task so it doesn't block the main connection listener.
 async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
-    // A small delay to ensure the listener is fully up.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     if let Err(e) = utils::populate_connections(&nodes, self_port).await {
@@ -167,7 +149,6 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
 
     info!("Total amount of known nodes: {}", crate::NODES.len());
 
-    // If initial peer nodes were provided, check if we need to sync from them.
     if !nodes.is_empty() {
         info!("Checking for longer chain against initial nodes...");
         let (longest_name, longest_count) = match {
@@ -215,11 +196,8 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
         }
     }
 }
-/// The application entry point.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Use try_init to avoid panics if the logger is already initialized,
-    // which can happen in a workspace with multiple binaries.
     let _ = env_logger::builder()
         .filter_module("wisp_node", log::LevelFilter::Info)
         .try_init();

@@ -27,8 +27,6 @@ pub const MAX_MEMPOOL_TRANSACTION_AGE: u64 = 172800; // Two days in seconds
 
 impl Blockchain {
     pub fn add_to_mempool(&mut self, transaction: Transaction) -> Result<()> {
-        // Do not persist on every transaction addition to prevent DoS via disk I/O.
-        // Persistence should be handled periodically or on shutdown.
         self.add_transaction_to_mempool(transaction, false)
     }
 
@@ -42,9 +40,8 @@ impl Blockchain {
         }
 
         let tx_hash = transaction.txid()?;
-
-        // 0. Validate transaction size
         let serialized_size = bincode::encode_to_vec(&transaction, bincode_config())?.len();
+
         if serialized_size > crate::MAX_TRANSACTION_SIZE_BYTES {
             return Err(anyhow!(
                 "Transaction size ({} bytes) exceeds maximum allowed size ({} bytes)",
@@ -53,7 +50,6 @@ impl Blockchain {
             ));
         }
 
-        // 1. Check if transaction is already in mempool
         if self.mempool.contains_key(&tx_hash) {
             debug!(
                 "Transaction {} already exists in mempool. Ignoring.",
@@ -66,7 +62,6 @@ impl Blockchain {
         let mut inputs_checked_in_tx: HashSet<OutPoint> = HashSet::new();
 
         let mut output_sum = Amount::zero();
-        // 2. Validate outputs (dust limit)
         for output in &transaction.outputs {
             if output.value.as_smallest_unit() < crate::MIN_OUTPUT_VALUE {
                 return Err(anyhow!(
@@ -81,16 +76,13 @@ impl Blockchain {
         }
 
         let transaction_hash_for_verification = transaction.txid()?;
-        // 3. Validate inputs
         for input in &transaction.inputs {
             let outpoint = &input.outpoint;
 
-            // Check for duplicate inputs within the transaction
             if !inputs_checked_in_tx.insert(*outpoint) {
                 return Err(anyhow!("Transaction has duplicate inputs: {}", outpoint));
             }
 
-            // Check for double spend against other mempool transactions
             if self.mempool_spent_utxos.contains(outpoint) {
                 return Err(anyhow!(
                     "Double spend: input {} already spent by a transaction in mempool",
@@ -98,7 +90,6 @@ impl Blockchain {
                 ));
             }
 
-            // Check if UTXO exists in the main chain or mempool (chained tx)
             let prev_output = if let Some(output) = self.utxo_set.utxos.get(outpoint) {
                 output.clone()
             } else if let Some(parent_entry) = self.mempool.get(&outpoint.txid) {
@@ -118,7 +109,6 @@ impl Blockchain {
                 ));
             };
 
-            // Verify signature
             let is_signature_valid = match input.signature.as_ref() {
                 Some(sig) => prev_output
                     .pubkey
@@ -238,17 +228,37 @@ impl Blockchain {
             .filter_map(|tx| tx.txid().ok())
             .collect();
 
+        let inputs_spent_by_block: HashSet<OutPoint> = block
+            .transactions
+            .iter()
+            .flat_map(|tx| tx.inputs.iter().map(|i| i.outpoint))
+            .collect();
+
         let initial_mempool_size = self.mempool.len();
 
         let mut outpoints_to_unmark = Vec::new();
+        let mut txs_to_remove = Vec::new();
+
         for (txid, entry) in self.mempool.iter() {
             if txids_in_block.contains(txid) {
+                txs_to_remove.push(*txid);
                 outpoints_to_unmark.extend(entry.transaction.inputs.iter().map(|i| i.outpoint));
+            } else {
+                // Check for conflicts (double spends)
+                for input in &entry.transaction.inputs {
+                    if inputs_spent_by_block.contains(&input.outpoint) {
+                        txs_to_remove.push(*txid);
+                        outpoints_to_unmark
+                            .extend(entry.transaction.inputs.iter().map(|i| i.outpoint));
+                        break;
+                    }
+                }
             }
         }
 
-        self.mempool
-            .retain(|txid, _| !txids_in_block.contains(txid));
+        for txid in txs_to_remove {
+            self.mempool.remove(&txid);
+        }
 
         for outpoint in outpoints_to_unmark {
             self.mempool_spent_utxos.remove(&outpoint);

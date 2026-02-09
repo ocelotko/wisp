@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 impl Block {
     pub fn check_proof_of_work(&self) -> bool {
         let hash = self.id().expect("Failed to hash block for PoW check");
-        hash.matches_target(self.target)
+        hash.matches_target(self.header.target)
     }
 }
 
@@ -22,15 +22,21 @@ pub fn mine_block_parallel(
     max_attempts_per_call: usize,
     mining_active: &AtomicBool,
 ) -> Result<(bool, u64)> {
-    block.nonce = block.nonce.wrapping_add(start_nonce);
+    block.header.nonce = block.header.nonce.wrapping_add(start_nonce);
 
     let mut base_hasher = sha2::Sha256::new();
-    block.version.update_hasher(&mut base_hasher);
-    base_hasher.update(&block.timestamp.timestamp().to_be_bytes());
-    base_hasher.update(&block.timestamp.timestamp_subsec_nanos().to_be_bytes());
-    block.previous_hash.update_hasher(&mut base_hasher);
-    block.merkle_root.update_hasher(&mut base_hasher);
-    block.target.update_hasher(&mut base_hasher);
+    block.header.version.update_hasher(&mut base_hasher);
+    base_hasher.update(&block.header.timestamp.timestamp().to_be_bytes());
+    base_hasher.update(
+        &block
+            .header
+            .timestamp
+            .timestamp_subsec_nanos()
+            .to_be_bytes(),
+    );
+    block.header.previous_hash.update_hasher(&mut base_hasher);
+    block.header.merkle_root.update_hasher(&mut base_hasher);
+    block.header.target.update_hasher(&mut base_hasher);
 
     for i in 0..max_attempts_per_call {
         if !mining_active.load(Ordering::Relaxed) {
@@ -38,7 +44,7 @@ pub fn mine_block_parallel(
         }
 
         let mut hasher = base_hasher.clone();
-        block.nonce.update_hasher(&mut hasher);
+        block.header.nonce.update_hasher(&mut hasher);
         let first_pass = hasher.finalize();
 
         let mut hasher2 = sha2::Sha256::new();
@@ -46,11 +52,11 @@ pub fn mine_block_parallel(
         let hash_bytes: [u8; 32] = hasher2.finalize().into();
         let hash_u256 = U256::from_big_endian(&hash_bytes);
 
-        if hash_u256 <= block.target {
+        if hash_u256 <= block.header.target {
             return Ok((true, (i + 1) as u64));
         }
 
-        block.nonce = block.nonce.wrapping_add(nonce_step);
+        block.header.nonce = block.header.nonce.wrapping_add(nonce_step);
     }
     Ok((false, max_attempts_per_call as u64))
 }
@@ -66,12 +72,10 @@ impl Blockchain {
         let window_size = (DAA_WINDOW - 1) as u64;
         let first_block_index = height.saturating_sub(window_size);
 
-        // If we haven't processed enough blocks for a full window, return max target (min difficulty)
         if first_block_index == 0 {
             return Ok(crate::MAX_TARGET);
         }
 
-        // Retrieve timestamps and targets for the window boundaries
         let (last_block_timestamp, current_target) =
             if let Some((ts, tgt)) = self.daa_cache.get(&last_block_index) {
                 (*ts, *tgt)
@@ -82,7 +86,7 @@ impl Blockchain {
                         last_block_index
                     )
                 })?;
-                (block.timestamp, block.target)
+                (block.header.timestamp, block.header.target)
             };
 
         let first_block_timestamp = if let Some((ts, _)) = self.daa_cache.get(&first_block_index) {
@@ -94,7 +98,7 @@ impl Blockchain {
                     first_block_index
                 )
             })?;
-            block.timestamp
+            block.header.timestamp
         };
 
         // Calculate actual timespan

@@ -10,10 +10,6 @@ use wisp_core::{
 };
 
 /// Handles a `SubmitTransaction` message from a peer.
-///
-/// This function attempts to add the transaction to the mempool. If successful,
-/// it broadcasts the transaction to other peers and sends a confirmation.
-/// If it fails, it sends a rejection message back to the sender.
 pub async fn handle_submit_transaction(
     stream: &mut TcpStream,
     tx: Transaction,
@@ -23,29 +19,24 @@ pub async fn handle_submit_transaction(
     let tx_hash = tx.txid()?;
     info!("Received transaction {} for submission.", tx_hash);
 
-    // Acquire a write lock to modify the mempool.
     let mut blockchain_lock = blockchain.write().await;
 
     match blockchain_lock.add_to_mempool(tx.clone()) {
         Ok(_) => {
             info!("Transaction {} accepted into mempool.", tx_hash);
 
-            // Drop the lock before performing network I/O.
             drop(blockchain_lock);
 
-            // Send confirmation back to the original sender.
             Message::Wallet(WalletMessage::TransactionAcceptedConfirmation)
                 .send_async(stream)
                 .await?;
 
-            // Broadcast the new transaction to all other peers.
             tokio::spawn(async move {
                 broadcast_transaction(tx, sender_addr).await;
             });
         }
         Err(e) => {
             warn!("Transaction {} rejected: {}", tx_hash, e);
-            // Send a rejection message back to the original sender.
             Message::Wallet(WalletMessage::TransactionRejected(tx_hash, e.to_string()))
                 .send_async(stream)
                 .await?;
@@ -56,9 +47,6 @@ pub async fn handle_submit_transaction(
 }
 
 /// Handles a `FetchWalletState` request from a peer (typically a wallet client).
-///
-/// It queries the blockchain for all UTXOs and transaction history related to the
-/// provided public key and sends a `WalletStateSnapshot` back.
 pub async fn handle_fetch_wallet_state(
     stream: &mut TcpStream,
     pubkey: PublicKey,
@@ -69,9 +57,7 @@ pub async fn handle_fetch_wallet_state(
         pubkey.fingerprint()
     );
 
-    // Acquire a read lock to query the blockchain state.
     let blockchain_lock = blockchain.read().await;
-
     let utxos = blockchain_lock.get_utxos_for_pubkey(&pubkey);
     let transactions = blockchain_lock.get_wallet_transaction_history(&pubkey)?;
 
@@ -93,7 +79,6 @@ async fn broadcast_transaction(tx: Transaction, original_sender: SocketAddr) {
 
     for mut peer in crate::NODES.iter_mut() {
         let addr = peer.key().clone();
-        // Don't send the transaction back to the peer who sent it to us.
         if addr == original_sender.to_string() {
             continue;
         }
@@ -108,7 +93,6 @@ async fn broadcast_transaction(tx: Transaction, original_sender: SocketAddr) {
         }
     }
 
-    // Clean up connections that failed during the broadcast.
     for addr in peers_to_remove {
         crate::NODES.remove(&addr);
     }

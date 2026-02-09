@@ -112,7 +112,11 @@ impl Blockchain {
                     .iter()
                     .find(|t| t.txid().ok() == Some(*tx_hash))
                 {
-                    return Ok(Some((tx.clone(), Some(block.index), block.timestamp)));
+                    return Ok(Some((
+                        tx.clone(),
+                        Some(block.index),
+                        block.header.timestamp,
+                    )));
                 } else {
                     log::warn!("Transaction {} not found in block {} despite tx_location entry pointing to it.", tx_hash, block_index);
                     return Ok(None);

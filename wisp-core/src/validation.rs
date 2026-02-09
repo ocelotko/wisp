@@ -29,16 +29,17 @@ impl Block {
         let block_hash = self
             .id()
             .context("Failed to get block hash for PoW validation")?;
-        if !block_hash.matches_target(self.target) {
+        if !block_hash.matches_target(self.header.target) {
             return Err(anyhow!(
                 "Block hash ({}) does not meet its own target ({}) (PoW failed)",
                 block_hash,
-                self.target
+                self.header.target
             ));
         }
 
         let now = Utc::now();
-        if self.timestamp > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
+        if self.header.timestamp
+            > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
         {
             return Err(anyhow!("Block timestamp is too far in the future"));
         }
@@ -74,20 +75,20 @@ impl Block {
             .context("Failed to get block hash for validation")?;
 
         // 1. Validate Proof of Work
-        if !block_hash.matches_target(self.target) {
+        if !block_hash.matches_target(self.header.target) {
             return Err(anyhow!(
                 "Block hash ({}) does not meet its own target ({}) (PoW failed)",
                 block_hash,
-                self.target
+                self.header.target
             ));
         }
         debug!("PoW valid against block's own target.");
 
         // 2. Validate Target Difficulty
-        if self.target != *expected_target {
+        if self.header.target != *expected_target {
             return Err(anyhow!(
                 "Block's declared target ({}) does not match expected target ({}) for index {}",
-                self.target,
+                self.header.target,
                 expected_target,
                 self.index
             ));
@@ -97,10 +98,10 @@ impl Block {
         // 3. Validate Merkle Root
         let calculated_merkle_root = MerkleRoot::calculate(&self.transactions)
             .context("Failed to calculate Merkle root during block validation")?;
-        if calculated_merkle_root != self.merkle_root {
+        if calculated_merkle_root != self.header.merkle_root {
             return Err(anyhow!(
                 "Merkle root mismatch. Expected: {:?}, Calculated: {:?}",
-                self.merkle_root,
+                self.header.merkle_root,
                 calculated_merkle_root
             ));
         }
@@ -108,7 +109,8 @@ impl Block {
 
         // 4. Validate Timestamp (Future Limit)
         let now = Utc::now();
-        if self.timestamp > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
+        if self.header.timestamp
+            > now + ChronoDuration::seconds(crate::MAX_BLOCK_FUTURE_TIMESTAMP as i64)
         {
             return Err(anyhow!("Block timestamp is too far in the future"));
         }
@@ -125,10 +127,10 @@ impl Block {
                 }
             };
 
-            if self.timestamp.timestamp() <= mtp {
+            if self.header.timestamp.timestamp() <= mtp {
                 return Err(anyhow!(
                     "Block timestamp ({}) is not greater than the median time of past 11 blocks ({}).",
-                    self.timestamp.timestamp(), mtp
+                    self.header.timestamp.timestamp(), mtp
                 ));
             }
         }
@@ -359,7 +361,6 @@ impl Block {
 
     pub fn verify_coinbase_transaction(&self, total_fees_in_block: Amount) -> Result<()> {
         if self.transactions.is_empty() {
-            // This check is technically redundant if verify_transactions is called, but good for defense-in-depth.
             return Err(anyhow!("Block has no transactions (missing coinbase)"));
         }
 
@@ -451,7 +452,7 @@ impl Block {
                 }
             };
             if let Some(block) = block_opt {
-                timestamps.push(block.timestamp.timestamp());
+                timestamps.push(block.header.timestamp.timestamp());
                 if block.index == 0 {
                     break;
                 }

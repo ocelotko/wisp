@@ -20,12 +20,8 @@ pub async fn handle_fetch_block(
     drop(blockchain_lock);
 
     let response = if let Some(b) = block {
-        // The convention for a direct block request is to respond with a `NewBlock` message.
-        // This is what the `download_blockchain` utility function expects.
         Message::Chain(ChainMessage::NewBlock(b))
     } else {
-        // If the block is not found, we respond with `BlockInfo(None)` to explicitly
-        // signal that the block is missing, which is better than a timeout.
         warn!(
             "Block at index {} not found, sending negative response.",
             index
@@ -118,7 +114,6 @@ pub async fn handle_get_block_headers(
         if let Some(block) = blockchain_lock.get_block_by_index(from_index + i as u64)? {
             headers.push(block.header());
         } else {
-            // Stop if we reach the end of the chain
             break;
         }
     }

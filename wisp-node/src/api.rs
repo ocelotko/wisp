@@ -117,7 +117,6 @@ struct ApiNetworkVitals {
 
 impl From<Block> for ApiBlock {
     fn from(block: Block) -> Self {
-        // Use the bincode 2.x API for serialization.
         let block_size = bincode::encode_to_vec(&block, bincode::config::standard())
             .map(|v| v.len())
             .unwrap_or(0);
@@ -134,19 +133,19 @@ impl From<Block> for ApiBlock {
                     output_count: tx.outputs.len(),
                     is_coinbase: tx.is_coinbase(),
                     total_output_wisp: total_output.to_string_wisp(),
-                    timestamp: block.timestamp.timestamp(),
+                    timestamp: block.header.timestamp.timestamp(),
                 }
             })
             .collect();
 
-        let difficulty_str = if block.target.is_zero() {
+        let difficulty_str = if block.header.target.is_zero() {
             "inf".to_string()
         } else {
             let scaling_factor = wisp_core::U256::from(1_000_000u64);
             let max_target = wisp_core::MAX_TARGET;
 
             if let Some(scaled_max) = max_target.checked_mul(scaling_factor) {
-                let difficulty_scaled = scaled_max / block.target;
+                let difficulty_scaled = scaled_max / block.header.target;
                 format!("{:.2}", difficulty_scaled.as_u64() as f64 / 1_000_000.0)
             } else {
                 "inf".to_string()
@@ -154,19 +153,19 @@ impl From<Block> for ApiBlock {
         };
 
         ApiBlock {
-            version: block.version,
+            version: block.header.version,
             height: block.index,
             hash: block.id().unwrap_or_default(),
-            timestamp: block.timestamp.timestamp(),
+            timestamp: block.header.timestamp.timestamp(),
             difficulty: difficulty_str,
             transactions: transactions_summary,
             size: block_size,
-            nonce: block.nonce,
-            previous_hash: block.previous_hash,
+            nonce: block.header.nonce,
+            previous_hash: block.header.previous_hash,
             time_to_mine_secs: None,
             mined_by: block
                 .transactions
-                .first() // The coinbase transaction is always first
+                .first()
                 .filter(|tx| tx.is_coinbase())
                 .and_then(|coinbase_tx| {
                     coinbase_tx
@@ -236,8 +235,6 @@ async fn get_network_vitals(
     };
 
     let avg_block_time_secs = if current_height > 0 {
-        // If the chain is mature enough, use the full DAA window for the average.
-        // Otherwise, average over the blocks that do exist (from genesis to current).
         let (start_block_index, window_size) = if current_height >= DAA_WINDOW as u64 {
             (current_height - (DAA_WINDOW - 1) as u64, DAA_WINDOW)
         } else {
@@ -249,12 +246,10 @@ async fn get_network_vitals(
             blockchain.get_block_by_index(current_height),
         ) {
             let actual_timespan =
-                last_block.timestamp.timestamp() - first_block.timestamp.timestamp();
-            // For a window of N blocks, there are N-1 intervals.
-            let num_intervals = (window_size - 1).max(1); // Avoid division by zero if only 1 block exists
-            (actual_timespan as f64 / num_intervals as f64).max(1.0) // Ensure avg time is at least 1.0
+                last_block.header.timestamp.timestamp() - first_block.header.timestamp.timestamp();
+            let num_intervals = (window_size - 1).max(1);
+            (actual_timespan as f64 / num_intervals as f64).max(1.0)
         } else {
-            // Fallback if blocks can't be fetched, which is unlikely for a valid chain.
             IDEAL_BLOCK_TIME as f64
         }
     } else {
@@ -266,17 +261,16 @@ async fn get_network_vitals(
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
 
-    // Improved hashrate calculation over the DAA window for more stability.
     let network_hashrate_hps = if current_height >= DAA_WINDOW as u64 {
         let window_start_index = current_height - (DAA_WINDOW as u64 - 1);
         if let (Ok(Some(start_block)), Ok(Some(end_block))) = (
             blockchain.get_block_by_index(window_start_index),
             blockchain.get_block_by_index(current_height),
         ) {
-            let time_span_secs =
-                (end_block.timestamp.timestamp() - start_block.timestamp.timestamp()).max(1);
+            let time_span_secs = (end_block.header.timestamp.timestamp()
+                - start_block.header.timestamp.timestamp())
+            .max(1);
 
-            // Sum the work done over the window. Work is MAX_TARGET / target.
             let total_work: wisp_core::U256 = (window_start_index..=current_height)
                 .filter_map(|i| {
                     if let Some((_, target)) = blockchain.daa_cache.get(&i) {
@@ -286,21 +280,24 @@ async fn get_network_vitals(
                             .get_block_by_index(i)
                             .ok()
                             .flatten()
-                            .map(|b| b.target)
+                            .map(|b| b.header.target)
                     }
                 })
                 .map(|target| wisp_core::MAX_TARGET / target.max(wisp_core::MIN_TARGET))
                 .fold(wisp_core::U256::zero(), |acc, work| acc + work);
 
-            // Hashrate = (Total Hashes) / (Time). Total Hashes = Total Work * 2^32 (approx)
-            // This is a more accurate estimation of hashrate.
-            let total_hashes = u256_to_f64(total_work) * 2.0_f64.powi(32);
+            let total_hashes = u256_to_f64(total_work) * 2.0_f64.powi(24);
             total_hashes / time_span_secs as f64
         } else {
             0.0
         }
     } else {
-        0.0
+        let diff_val = if current_target.is_zero() {
+            0.0
+        } else {
+            u256_to_f64(wisp_core::MAX_TARGET) / u256_to_f64(current_target)
+        };
+        (diff_val * 2.0_f64.powi(24)) / IDEAL_BLOCK_TIME as f64
     };
     let confirmed_tx_count = blockchain
         .get_total_transaction_count_from_db()
@@ -323,7 +320,6 @@ async fn get_network_vitals(
 }
 
 /// Converts a U256 into an f64.
-/// This is an approximation, as f64 has limited precision.
 fn u256_to_f64(val: wisp_core::U256) -> f64 {
     let words = val.0;
     let mut result = 0.0;
@@ -378,7 +374,8 @@ fn process_and_enrich_block(
     let mut api_block: ApiBlock = block.clone().into();
     if api_block.height > 0 {
         if let Ok(Some(prev_block)) = blockchain.get_block_by_index(api_block.height - 1) {
-            let time_diff = block.timestamp.timestamp() - prev_block.timestamp.timestamp();
+            let time_diff =
+                block.header.timestamp.timestamp() - prev_block.header.timestamp.timestamp();
             api_block.time_to_mine_secs = Some(time_diff);
         } else {
             log::warn!(
@@ -455,8 +452,6 @@ async fn get_transaction_by_hash(
                     .first()
                     .and_then(|i| i.coinbase_data.as_ref())
                     .and_then(|data| {
-                        // The first 8 bytes are the block height. The message is the rest.
-                        // We must check if there are any bytes beyond the height.
                         let message_bytes =
                             data.get(std::mem::size_of::<u64>()..).unwrap_or_default();
                         String::from_utf8(message_bytes.to_vec()).ok()
@@ -475,14 +470,12 @@ async fn get_transaction_by_hash(
             let total_output: Amount = tx.outputs.iter().map(|o| o.value).sum();
 
             let inputs = if is_coinbase {
-                // For coinbase, the input is special and contains the message.
                 vec![ApiTransactionInput {
                     outpoint: "Coinbase (New Coins)".to_string(),
                     signature: None,
                 }]
             } else {
                 tx.inputs
-                    // For regular transactions, map the inputs normally.
                     .iter()
                     .map(|i| ApiTransactionInput {
                         outpoint: i.outpoint.to_string(),
@@ -563,7 +556,8 @@ async fn get_blocks_paginated(
                     if i > 0 {
                         if let Ok(Some(prev_block)) = blockchain.get_block_by_index(i - 1) {
                             api_block.time_to_mine_secs = Some(
-                                block.timestamp.timestamp() - prev_block.timestamp.timestamp(),
+                                block.header.timestamp.timestamp()
+                                    - prev_block.header.timestamp.timestamp(),
                             );
                         }
                     }
@@ -644,7 +638,7 @@ async fn get_recent_transactions(
                     is_coinbase: tx.is_coinbase(),
                     output_count: tx.outputs.len(),
                     total_output_wisp: total_output.to_string_wisp(),
-                    timestamp: block.timestamp.timestamp(),
+                    timestamp: block.header.timestamp.timestamp(),
                 });
 
                 if api_transactions.len() >= max_recent_txs {

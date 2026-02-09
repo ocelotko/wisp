@@ -114,8 +114,8 @@ fn main() -> Result<()> {
 
     if let Some(block) = found_block.lock().unwrap().clone() {
         println!("\n🎉 Found valid genesis block! 🎉");
-        println!("Nonce:      {}", block.nonce);
-        println!("Timestamp:  {}", block.timestamp);
+        println!("Nonce:      {}", block.header.nonce);
+        println!("Timestamp:  {}", block.header.timestamp);
         println!("Hash:       {}", block.id()?.to_string());
         println!("\nACTION: Copy the 'Nonce' and 'Timestamp' values into the `genesis_block` function in `wisp-core/src/utils.rs`.");
     }

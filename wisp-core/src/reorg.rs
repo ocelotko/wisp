@@ -33,7 +33,6 @@ impl Blockchain {
         let mut rolled_back_blocks: Vec<Block> = Vec::new();
         let mut current_height = self.block_height()?;
 
-        // 1. Rollback: Revert blocks from current tip down to the common ancestor
         while current_height > common_ancestor_index {
             if let Some(block_to_revert) = self.get_block_by_index(current_height)? {
                 rolled_back_blocks.push(block_to_revert);
@@ -55,7 +54,6 @@ impl Blockchain {
                 |tx_db| -> Result<(), ConflictableTransactionError<ReorgError>> {
                     let mut new_supply = self.total_supply.as_smallest_unit();
                     let mut new_tx_count = self.total_tx_count;
-                    // Remove rolled back blocks from DB and update indices
                     for block_to_revert in &rolled_back_blocks {
                         let hash = block_to_revert.id().map_err(ReorgError::Anyhow)?;
 
@@ -66,7 +64,7 @@ impl Blockchain {
                         tx_db.remove(DBKeys::block(&hash))?;
                         tx_db.remove(DBKeys::index_to_hash(block_to_revert.index))?;
                         tx_db.remove(DBKeys::hash_to_index(&hash))?;
-                        tx_db.remove(DBKeys::prev_to_current(&block_to_revert.previous_hash))?;
+                        tx_db.remove(DBKeys::prev_to_current(&block_to_revert.header.previous_hash))?;
 
                         for tx in block_to_revert.transactions.iter().rev() {
                             let tx_hash = tx.txid().map_err(ReorgError::Anyhow)?;
@@ -102,8 +100,7 @@ impl Blockchain {
                         }
                     }
 
-                    // 2. Rebuild UTXO set state at the common ancestor
-                    // We load the last snapshot and apply blocks up to the ancestor
+
                     let (mut temp_utxos, last_snapshot_height) =
                         if let Some(snapshot_ivec) = tx_db.get(DBKeys::UTXO_SNAPSHOT)? {
                             let decompressed_bytes = zstd::decode_all(&snapshot_ivec[..])
@@ -122,7 +119,13 @@ impl Blockchain {
                             let (height, _) =
                                 bincode::decode_from_slice(&height_ivec, bincode_config())
                                     .map_err(|e| ReorgError::Anyhow(e.into()))?;
-                            (snapshot, height)
+                            
+                            if height <= common_ancestor_index {
+                                (snapshot, height)
+                            } else {
+                                warn!("[REORG] UTXO snapshot height {} is ahead of common ancestor {}. Rebuilding from genesis.", height, common_ancestor_index);
+                                (crate::utxo::UtxoSet::new(), 0)
+                            }
                         } else {
                             (crate::utxo::UtxoSet::new(), 0)
                         };
@@ -140,13 +143,10 @@ impl Blockchain {
                         temp_utxos.apply_block(&block).map_err(ReorgError::Anyhow)?;
                     }
 
-                    // 3. Apply new chain segment
                     for block_to_apply in &new_chain_segment {
-                        // Validate block in the context of the reorg (using temp_utxos)
                         let expected_target = self.calculate_next_target_from_height(block_to_apply.index - 1).map_err(ReorgError::Anyhow)?;
                         block_to_apply.validate_block_for_reorg(&temp_utxos.utxos, &expected_target, tx_db).map_err(ReorgError::Anyhow)?;
 
-                        // Update DB with new block data
                         Self::apply_block_to_db(
                             tx_db,
                             block_to_apply,
@@ -155,7 +155,6 @@ impl Blockchain {
                             new_tx_count,
                         )?;
 
-                        // Update temp UTXO set
                         temp_utxos.apply_block(block_to_apply)
                             .map_err(ReorgError::Anyhow)?;
                     }
@@ -204,8 +203,6 @@ impl Blockchain {
             self.rebuild_utxos()?;
         }
 
-        // 4. Re-add transactions from rolled back blocks to mempool
-        // This ensures valid txs from the old chain aren't lost
         let mut txs_to_readd_to_mempool = Vec::new();
         for block_to_revert in rolled_back_blocks.iter().rev() {
             for tx in &block_to_revert.transactions {
@@ -219,7 +216,7 @@ impl Blockchain {
             .retain(|&index, _| index <= common_ancestor_index);
         for block in &new_chain_segment {
             self.daa_cache
-                .insert(block.index, (block.timestamp, block.target));
+                .insert(block.index, (block.header.timestamp, block.header.target));
         }
 
         for tx in txs_to_readd_to_mempool {
@@ -285,7 +282,7 @@ impl Blockchain {
                     })?;
 
                 if let Some(block_ivec) = tx_db.get(DBKeys::block(&block_hash))? {
-                    let (checked_block, _): (crate::blockchain::CheckedBlock, _) = // This line is now valid
+                    let (checked_block, _): (crate::blockchain::CheckedBlock, _) =
                         bincode::decode_from_slice(&block_ivec, bincode_config()).map_err(|e| {
                             ConflictableTransactionError::Abort(ReorgError::Anyhow(e.into()))
                         })?;
@@ -381,7 +378,7 @@ impl Blockchain {
             block_to_apply.index.to_be_bytes().to_vec(),
         )?;
         tx_db.insert(
-            DBKeys::prev_to_current(&block_to_apply.previous_hash),
+            DBKeys::prev_to_current(&block_to_apply.header.previous_hash),
             hash_bytes,
         )?;
 

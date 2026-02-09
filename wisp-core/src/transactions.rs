@@ -13,9 +13,7 @@ use std::hash::Hash as StdHash;
 /// Represents a transaction, which is a collection of inputs and outputs.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
-    /// Inputs spending previous outputs.
     pub inputs: Vec<TransactionInput>,
-    /// New outputs created by this transaction.
     pub outputs: Vec<TransactionOutput>,
 }
 
@@ -24,9 +22,7 @@ pub struct Transaction {
     Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash, Copy, Default,
 )]
 pub struct OutPoint {
-    /// The hash of the transaction containing the output.
     pub txid: Hash,
-    /// The index of the output in that transaction's output list.
     pub vout: u32,
 }
 
@@ -38,11 +34,8 @@ impl fmt::Display for OutPoint {
 
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransactionInput {
-    /// The output being spent.
     pub outpoint: OutPoint,
-    /// The signature proving ownership of the output.
     pub signature: Option<Signature>,
-    /// Data for coinbase transactions (e.g., block height, extra nonce).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub coinbase_data: Option<Vec<u8>>,
@@ -50,9 +43,7 @@ pub struct TransactionInput {
 
 #[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash, Default)]
 pub struct TransactionOutput {
-    /// The amount of currency being transferred.
     pub value: Amount,
-    /// The public key of the recipient (locking script).
     pub pubkey: PublicKey,
 }
 

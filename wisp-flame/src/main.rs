@@ -184,8 +184,7 @@ impl Miner {
                     }
 
                     let mut block_to_mine = template_block;
-                    // CRITICAL: Update the timestamp before each mining cycle.
-                    block_to_mine.timestamp = Utc::now();
+                    block_to_mine.header.timestamp = Utc::now();
 
                     let nonce_step = num_threads as u64;
                     let start_nonce = i as u64;
@@ -205,7 +204,7 @@ impl Miner {
                                 if let Ok(block_hash) = block_to_mine.id() {
                                     println!(
                                         "Block Found!\n  - Index: {}\n  - Nonce: {}\n  - Hash:  {}\n  - Thread: {}",
-                                        block_to_mine.index, block_to_mine.nonce, block_hash, i
+                                        block_to_mine.index, block_to_mine.header.nonce, block_hash, i
                                     );
                                 }
                                 // Stop all other threads from mining and send the block for submission.
@@ -243,11 +242,11 @@ impl Miner {
         {
             Ok(Ok(Message::Mining(MiningMessage::Template(mut template)))) => {
                 let now = Utc::now();
-                if template.timestamp
+                if template.header.timestamp
                     > now + ChronoDuration::seconds(MAX_BLOCK_FUTURE_TIMESTAMP as i64)
                 {
                     warn!("Received template with timestamp too far in the future. Adjusting to current time.");
-                    template.timestamp = now;
+                    template.header.timestamp = now;
                 }
 
                 info!(

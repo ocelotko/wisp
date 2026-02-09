@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    blockchain::{Block, Blockchain},
+    blockchain::{Block, BlockHeader, Blockchain},
     currency::Amount,
     mempool::MempoolEntry,
     sha256::Hash,
@@ -20,17 +20,11 @@ pub struct DBKeys;
 
 impl DBKeys {
     // --- Singleton Keys ---
-    /// Stores the current height of the blockchain (u64)
     pub const CHAIN_HEIGHT: &'static [u8] = b"chain_height";
-    /// Stores the hash of the current tip block
     pub const TIP_HASH: &'static [u8] = b"tip_hash";
-    /// Stores the total number of transactions in the chain (u64)
     pub const TOTAL_TX_COUNT: &'static [u8] = b"total_tx_count";
-    /// Stores the total supply of currency (u64)
     pub const TOTAL_SUPPLY: &'static [u8] = b"total_supply";
-    /// Stores the compressed UTXO set snapshot
     pub const UTXO_SNAPSHOT: &'static [u8] = b"utxo_snapshot";
-    /// Stores the height at which the last UTXO snapshot was taken
     pub const LAST_UTXO_SNAPSHOT_HEIGHT: &'static [u8] = b"last_utxo_snapshot_height";
     pub const UTXO_SNAPSHOT_CHECKSUM: &'static [u8] = b"utxo_snapshot_checksum";
     pub const MEMPOOL_SNAPSHOT: &'static [u8] = b"mempool_snapshot";
@@ -154,6 +148,20 @@ impl Blockchain {
                 checked_block
                     .into_block()
                     .context("Failed to deserialize block")
+            })
+            .transpose()
+    }
+
+    pub fn get_block_header_by_hash(&self, hash: &Hash) -> Result<Option<BlockHeader>> {
+        self.db
+            .get(DBKeys::block(hash))?
+            .map(|ivec| {
+                // Optimization: CheckedBlock starts with Block, which starts with BlockHeader.
+                // We can decode just the header to avoid parsing transactions.
+                let (header, _): (BlockHeader, _) =
+                    bincode::decode_from_slice(&ivec, bincode_config())
+                        .context("Failed to deserialize BlockHeader")?;
+                Ok(header)
             })
             .transpose()
     }
@@ -455,14 +463,12 @@ impl Blockchain {
             ));
         }
 
-        // Replay blocks from snapshot height (or genesis) to current tip
         if height >= start_height {
             info!(
                 "Rebuilding UTXOs from block {} to {}...",
                 start_height, height
             );
 
-            // Process in chunks to manage memory usage
             const CHUNK_SIZE: u64 = 1000;
             let mut i = start_height;
             while i <= height {
@@ -573,7 +579,7 @@ impl Blockchain {
                 }
 
                 new_chain_segment.push(block.clone());
-                current_hash = block.previous_hash;
+                current_hash = block.header.previous_hash;
 
                 if current_hash == Hash::zero() && common_ancestor_index > 0 {
                     return Err(anyhow!(

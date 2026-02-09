@@ -7,22 +7,15 @@ use tokio::time;
 use wisp_core::blockchain::AddBlockResult;
 use wisp_core::network::{ChainMessage, Message, P2PMessage};
 
-/// Connects to a list of initial seed nodes.
 pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()> {
     info!("Attempting to connect to nodes: {:?}", nodes);
     for node in nodes {
         info!("Connecting to node: {}", node);
         match time::timeout(Duration::from_secs(5), TcpStream::connect(&node)).await {
             Ok(Ok(stream)) => {
-                // The stream is now owned by this scope. We will pass it to the handshake
-                // and then move it into the NODES map if successful.
                 if let Err(e) = perform_handshake(stream, node, self_port).await {
                     warn!("Handshake with {} failed: {}", node, e);
                 }
-                // Note: The stream is consumed by perform_handshake. If the handshake is
-                // successful, the stream is now living in the NODES map. If it fails,
-                // the stream is dropped, and the connection is closed, which is the
-                // desired behavior.
             }
             Ok(Err(e)) => {
                 warn!("Failed to connect to {}: {}", node, e);
@@ -35,19 +28,14 @@ pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()
     Ok(())
 }
 
-/// Performs a structured handshake with a newly connected peer.
-/// This function is called by the node that *initiates* the connection.
 async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u16) -> Result<()> {
     info!("Performing handshake with {}", node_addr);
 
-    // --- Step 1: Announce ourselves ---
-    // We assume our IP is the one the peer sees. We tell them our listening port.
     let self_addr = format!("{}:{}", stream.local_addr()?.ip(), self_port);
     Message::P2P(P2PMessage::Hello(self_addr))
         .send_async(&mut stream)
         .await?;
 
-    // --- Step 2: Two-Way Height Exchange ---
     Message::Chain(ChainMessage::FetchLatestBlock)
         .send_async(&mut stream)
         .await?;
@@ -83,7 +71,6 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
         ));
     };
 
-    // --- Step 3: Node Discovery ---
     Message::P2P(P2PMessage::DiscoverNodes)
         .send_async(&mut stream)
         .await?;
@@ -92,8 +79,13 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     match time::timeout(Duration::from_secs(5), Message::receive_async(&mut stream)).await {
         Ok(Ok(Message::P2P(P2PMessage::NodeList(child_nodes)))) => {
             info!("Received NodeList from {}: {:?}", node_addr, child_nodes);
-            // In a real-world scenario, you might want to connect to these child nodes here.
-            // For now, we just log them.
+
+            for child in child_nodes {
+                if child != node_addr && !crate::NODES.contains_key(&child) {
+                    let child_addr = child.clone();
+                    let p_port = self_port;
+                }
+            }
         }
         Ok(Ok(other)) => {
             return Err(anyhow!(
@@ -106,9 +98,6 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
         Err(_) => return Err(anyhow!("Timeout receiving NodeList from {}", node_addr)),
     }
 
-    // --- Step 4: Finalize Connection ---
-    // If the handshake was successful, add the peer to our global map.
-    // We move the stream into the map, giving it a permanent home.
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
     if !crate::NODES.contains_key(node_addr) {
@@ -116,7 +105,6 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
         crate::NODES.insert(node_addr.to_string(), stream_arc);
         info!("Handshake successful. Added initial node: {}", node_addr);
 
-        // Spawn the connection handler for this outgoing connection so we can receive messages.
         let stream_clone = crate::NODES.get(node_addr).unwrap().clone();
         let addr_clone = node_addr.to_string();
         let socket_addr = stream_clone.lock().await.peer_addr()?;
@@ -130,31 +118,26 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     Ok(())
 }
 
-/// Queries all known peers to find out which one has the longest blockchain.
 pub async fn find_longest_chain_node(
     blockchain: &wisp_core::blockchain::Blockchain,
 ) -> Result<(String, u64)> {
     info!("Finding node with the longest blockchain...");
     let mut longest_name = String::new();
-    // Initialize with our own chain length. If no peer has a longer one, we won't sync.
     let mut longest_count = blockchain.block_height()?.saturating_add(1);
     info!(
         "Local chain length is {}. Searching for peers with longer chains...",
         longest_count
     );
 
-    // Create a list of peers to query to avoid holding the DashMap lock.
     let peers_to_query: Vec<String> = crate::NODES.iter().map(|p| p.key().clone()).collect();
 
     for node_addr in peers_to_query {
-        // Re-acquire a mutable reference to the stream for this peer.
         if let Some(mut peer) = crate::NODES.get_mut(&node_addr) {
             let mut stream_lock = peer.value_mut().lock().await;
 
             debug!("Querying {} for blockchain length", node_addr);
             let message = Message::Chain(ChainMessage::FetchLatestBlock);
 
-            // Send a message asking for the peer's chain height.
             if let Err(e) = message.send_async(&mut *stream_lock).await {
                 warn!(
                     "Failed to send FetchLatestBlock to {}: {}. Skipping.",
@@ -165,7 +148,6 @@ pub async fn find_longest_chain_node(
 
             debug!("Sent FetchLatestBlock to {}", node_addr);
 
-            // Wait for the peer's response.
             match time::timeout(
                 Duration::from_secs(5),
                 Message::receive_async(&mut *stream_lock),
@@ -210,8 +192,6 @@ pub async fn find_longest_chain_node(
     Ok((longest_name, longest_count))
 }
 
-/// Downloads the blockchain from a specified peer up to a target block count.
-/// This is used for initial chain synchronization.
 pub async fn download_blockchain_from_new_connection(
     node_addr: &str,
     target_block_count: u64,
@@ -221,7 +201,6 @@ pub async fn download_blockchain_from_new_connection(
         node_addr
     );
 
-    // Establish a dedicated connection for the download process.
     let mut stream =
         match time::timeout(Duration::from_secs(10), TcpStream::connect(node_addr)).await {
             Ok(Ok(s)) => s,
@@ -267,13 +246,11 @@ pub async fn download_blockchain_with_existing_stream(
         target_block_count - 1
     );
 
-    // Loop from our current height to the target height, fetching one block at a time.
     for i in (local_chain_height + 1)..=(target_block_count - 1) {
         debug!("Attempting to fetch block index {} from {}", i, node_addr);
 
         let message = Message::Chain(ChainMessage::FetchBlock(i as u64));
 
-        // Request the block.
         if let Err(e) = message.send_async(stream).await {
             error!("Failed to send FetchBlock({}) to {}: {}", i, node_addr, e);
             return Err(anyhow!(
@@ -284,7 +261,6 @@ pub async fn download_blockchain_with_existing_stream(
             ));
         }
 
-        // Wait for the block to be sent back.
         match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
             Ok(Ok(Message::Chain(ChainMessage::NewBlock(block)))) => {
                 debug!(
@@ -308,7 +284,6 @@ pub async fn download_blockchain_with_existing_stream(
                     ));
                 }
 
-                // Add the received block to our local blockchain.
                 let add_result = blockchain.add_block(block);
                 match add_result? {
                     AddBlockResult::Added => debug!(
@@ -317,9 +292,6 @@ pub async fn download_blockchain_with_existing_stream(
                         blockchain.block_height()?
                     ),
                     other_result => {
-                        // During initial sync, we expect a clean series of `Added` results.
-                        // Any other result (Rejected, Orphaned, ForkDetected) indicates a desync or a malicious peer.
-                        // It's safest to abort the download.
                         error!(
                             "Failed to add block {} from {}: {:?}. Aborting blockchain download.",
                             i, node_addr, other_result
@@ -371,7 +343,6 @@ pub async fn download_blockchain_with_existing_stream(
     Ok(())
 }
 
-/// A background task that periodically cleans up the mempool by removing old transactions.
 pub async fn cleanup() {
     let mut interval = time::interval(time::Duration::from_secs(30));
     info!("Cleanup task started");
@@ -380,7 +351,6 @@ pub async fn cleanup() {
         debug!("Cleaning the mempool from old transactions");
         let mut blockchain = crate::BLOCKCHAIN.get().unwrap().write().await;
         blockchain.clear_mempool();
-        // Explicitly save snapshot to ensure persistence even if no txs were removed
         if let Err(e) = blockchain.save_mempool_snapshot() {
             warn!("Failed to save mempool snapshot during cleanup: {}", e);
         }
