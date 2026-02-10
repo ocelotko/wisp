@@ -38,10 +38,10 @@ pub async fn handle_new_block(block: Block, blockchain: Arc<RwLock<Blockchain>>)
         AddBlockResult::Orphaned => {
             info!(
                 "Received orphan block {} (index {}), parent {} is unknown. It has been stored.",
-                block_hash_for_log, block_index_for_log, block.previous_hash
+                block_hash_for_log, block_index_for_log, block.header.previous_hash
             );
             tokio::spawn(async move {
-                broadcast_request_for_block(block.previous_hash).await;
+                broadcast_request_for_block(block.header.previous_hash).await;
             });
         }
         AddBlockResult::Rejected(reason) => {

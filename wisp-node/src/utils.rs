@@ -31,7 +31,13 @@ pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()
 async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u16) -> Result<()> {
     info!("Performing handshake with {}", node_addr);
 
-    let self_addr = format!("{}:{}", stream.local_addr()?.ip(), self_port);
+    let self_addr = if let Some(public_addr) = crate::PUBLIC_ADDR.get() {
+        public_addr.clone()
+    } else {
+        let local_ip = stream.local_addr()?.ip();
+        format!("{}:{}", local_ip, self_port)
+    };
+
     Message::P2P(P2PMessage::Hello(self_addr))
         .send_async(&mut stream)
         .await?;
@@ -82,8 +88,7 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
 
             for child in child_nodes {
                 if child != node_addr && !crate::NODES.contains_key(&child) {
-                    let child_addr = child.clone();
-                    let p_port = self_port;
+                    debug!("Discovered new peer: {}", child);
                 }
             }
         }

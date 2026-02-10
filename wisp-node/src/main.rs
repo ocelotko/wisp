@@ -40,6 +40,7 @@ struct Args {
 lazy_static! {
     pub static ref NODES: DashMap<String, Arc<AsyncMutex<TcpStream>>> = DashMap::new();
     pub static ref BLOCKCHAIN: OnceCell<Arc<RwLock<Blockchain>>> = OnceCell::new();
+    pub static ref PUBLIC_ADDR: OnceCell<String> = OnceCell::new();
 }
 
 async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bool) -> Result<()> {
@@ -68,6 +69,42 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
                 .daa_cache
                 .insert(i, (block.header.timestamp, block.header.target));
         }
+    }
+
+    // Pokus o otvorenie portu cez UPnP a zistenie verejnej IP
+    info!("Attempting UPnP port forwarding...");
+    let port_mapping_result =
+        tokio::task::spawn_blocking(move || match igd_next::search_gateway(Default::default()) {
+            Ok(gateway) => {
+                let ip = gateway.get_external_ip()?;
+
+                // Zistíme lokálnu IP adresu, na ktorú má router presmerovať port.
+                let local_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+                    .and_then(|s| {
+                        s.connect("8.8.8.8:80")?;
+                        s.local_addr()
+                    })
+                    .map(|addr| addr.ip())
+                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+                gateway.add_port(
+                    igd_next::PortMappingProtocol::TCP,
+                    port,
+                    std::net::SocketAddr::new(local_ip, port),
+                    0,
+                    "wisp-node",
+                )?;
+                Ok::<_, anyhow::Error>(ip)
+            }
+            Err(e) => Err(anyhow::anyhow!(e)),
+        })
+        .await?;
+
+    if let Ok(ip) = port_mapping_result {
+        info!("UPnP successful. External IP: {}", ip);
+        let _ = PUBLIC_ADDR.set(format!("{}:{}", ip, port));
+    } else {
+        warn!("UPnP failed. Node might not be reachable from the internet without manual port forwarding.");
     }
 
     BLOCKCHAIN
