@@ -119,14 +119,27 @@ impl Miner {
                 // Branch 2: Listen for messages from the node, like a new template.
                 msg_res = async { let mut stream = self.stream.lock().await; Message::receive_async(&mut *stream).await } => {
                     match msg_res {
-                        Ok(Message::Mining(MiningMessage::NewTemplate(template))) => {
-                            info!("Received new template from node for block #{}. Updating...", template.index);
+                        Ok(Message::Mining(MiningMessage::Template(mut template))) => {
+                            let now = Utc::now();
+                            if template.header.timestamp
+                                > now + ChronoDuration::seconds(MAX_BLOCK_FUTURE_TIMESTAMP as i64)
+                            {
+                                warn!("Received template with timestamp too far in the future. Adjusting to current time.");
+                                template.header.timestamp = now;
+                            }
+
+                            info!(
+                                "Received new template for block #{}. Updating miner.",
+                                template.index
+                            );
                             let mut current_template_guard = self.current_template.lock().unwrap();
-                            *current_template_guard = Some(template.clone());
+                            *current_template_guard = Some(template);
                             self.new_template_counter.fetch_add(1, Ordering::Relaxed);
-                            self.mining.store(true, Ordering::Relaxed); // Ensure mining is active
-                        },
-                        Ok(other) => trace!("Received other message from node: {:?}", other),
+                            self.mining.store(true, Ordering::Relaxed);
+                        }
+                        Ok(other) => {
+                            trace!("Received unexpected unsolicited message from node: {:?}", other);
+                        }
                         Err(e) => {
                             warn!("Error reading message from node: {}. Pausing mining and attempting recovery.", e);
                             self.mining.store(false, Ordering::Relaxed);
@@ -307,12 +320,6 @@ impl Miner {
                 *current_template_guard = Some(new_template);
                 self.new_template_counter.fetch_add(1, Ordering::Relaxed);
                 self.mining.store(true, Ordering::Relaxed);
-                Ok(())
-            }
-            // Legacy confirmation for compatibility, though our new node won't send this.
-            Ok(Ok(Message::Mining(MiningMessage::BlockSubmittedConfirmation))) => {
-                // Fallback path
-                info!("Submission successful: Block accepted by node (legacy confirmation).");
                 Ok(())
             }
             Ok(Ok(Message::Mining(MiningMessage::BlockRejected(reason)))) => {

@@ -155,10 +155,6 @@ pub async fn handle_connection(
             Message::Chain(ChainMessage::NewBlock(block)) => {
                 blocks::handle_new_block(block, blockchain.clone(), stream_arc.clone()).await
             }
-            Message::Chain(ChainMessage::FetchBlock(index)) => {
-                let mut stream_lock = stream_arc.lock().await;
-                sync::handle_fetch_block(&mut *stream_lock, index, blockchain.clone()).await
-            }
             Message::Chain(ChainMessage::FetchBlockByHash(hash)) => {
                 let mut stream_lock = stream_arc.lock().await;
                 sync::handle_fetch_block_by_hash(&mut *stream_lock, hash, blockchain.clone()).await

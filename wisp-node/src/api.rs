@@ -118,7 +118,6 @@ struct ApiNetworkVitals {
     mempool_size: usize,
     #[serde(with = "serde_str")]
     current_target: wisp_core::U256,
-    network_hashrate: String,
     total_transactions: u64,
 }
 
@@ -260,57 +259,6 @@ async fn get_network_vitals(
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
 
-    let network_hashrate = if current_height >= DAA_WINDOW as u64 {
-        let window_start_index = current_height - (DAA_WINDOW as u64 - 1);
-        if let (Ok(Some(start_block)), Ok(Some(end_block))) = (
-            blockchain.get_block_by_index(window_start_index),
-            blockchain.get_block_by_index(current_height),
-        ) {
-            let time_span_secs = (end_block.header.timestamp.timestamp()
-                - start_block.header.timestamp.timestamp())
-            .max(1);
-
-            let total_work: wisp_core::U256 = (window_start_index..=current_height)
-                .filter_map(|i| {
-                    if let Some((_, target)) = blockchain.daa_cache.get(&i) {
-                        Some(*target)
-                    } else {
-                        blockchain
-                            .get_block_by_index(i)
-                            .ok()
-                            .flatten()
-                            .map(|b| b.header.target)
-                    }
-                })
-                .map(|target| wisp_core::MAX_TARGET / target.max(wisp_core::MIN_TARGET))
-                .fold(wisp_core::U256::zero(), |acc, work| acc + work);
-
-            // Use U256 arithmetic for precision. 1 work unit is approx. 2^24 hashes.
-            let hashes_per_work_unit = wisp_core::U256::from(1u64 << 24);
-            if let Some(total_hashes) = total_work.checked_mul(hashes_per_work_unit) {
-                let hps = total_hashes / wisp_core::U256::from(time_span_secs as u64);
-                format_hashrate(hps)
-            } else {
-                "overflow".to_string()
-            }
-        } else {
-            "0 H/s".to_string()
-        }
-    } else {
-        // Fallback for early blocks before the first DAA window is full.
-        let work_per_block = if current_target.is_zero() {
-            wisp_core::U256::zero()
-        } else {
-            wisp_core::MAX_TARGET / current_target.max(wisp_core::MIN_TARGET)
-        };
-        let hashes_per_work_unit = wisp_core::U256::from(1u64 << 24);
-        if let Some(total_hashes) = work_per_block.checked_mul(hashes_per_work_unit) {
-            let hps = total_hashes / wisp_core::U256::from(IDEAL_BLOCK_TIME);
-            format_hashrate(hps)
-        } else {
-            "overflow".to_string()
-        }
-    };
     let confirmed_tx_count = blockchain
         .get_total_transaction_count_from_db()
         .unwrap_or(0);
@@ -324,7 +272,6 @@ async fn get_network_vitals(
         next_halving_in_blocks,
         mempool_size,
         current_target,
-        network_hashrate,
         total_transactions,
     };
 
@@ -336,27 +283,6 @@ async fn get_network_vitals(
     });
 
     Json(vitals).into_response()
-}
-
-/// Converts a U256 into an f64.
-/// Formats a hashrate in H/s into a human-readable string with appropriate units (kH/s, MH/s, etc.).
-fn format_hashrate(hashrate_hps: wisp_core::U256) -> String {
-    let ghps = wisp_core::U256::from(1_000_000_000u64);
-    let mhps = wisp_core::U256::from(1_000_000u64);
-    let khps = wisp_core::U256::from(1_000u64);
-
-    if hashrate_hps >= ghps {
-        let value = hashrate_hps * 100 / ghps; // scale for 2 decimal places
-        format!("{}.{:02} GH/s", value / 100, value % 100)
-    } else if hashrate_hps >= mhps {
-        let value = hashrate_hps * 100 / mhps;
-        format!("{}.{:02} MH/s", value / 100, value % 100)
-    } else if hashrate_hps >= khps {
-        let value = hashrate_hps * 100 / khps;
-        format!("{}.{:02} KH/s", value / 100, value % 100)
-    } else {
-        format!("{} H/s", hashrate_hps)
-    }
 }
 
 /// Calculates a human-readable difficulty string from a target.

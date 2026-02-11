@@ -146,106 +146,6 @@ async fn perform_handshake(
     Ok(())
 }
 
-pub async fn find_longest_chain_node(local_height: u64) -> Result<(String, u64)> {
-    info!("Finding node with the longest blockchain...");
-    let mut longest_name = String::new();
-    let mut longest_count = local_height.saturating_add(1);
-    info!(
-        "Local chain length is {}. Searching for peers with longer chains...",
-        longest_count
-    );
-
-    let peers_to_query: Vec<String> = crate::NODES.iter().map(|p| p.key().clone()).collect();
-
-    for node_addr in peers_to_query {
-        if let Some(mut peer) = crate::NODES.get_mut(&node_addr) {
-            let mut stream_lock = peer.value_mut().lock().await;
-
-            debug!("Querying {} for blockchain length", node_addr);
-            let message = Message::Chain(ChainMessage::FetchLatestBlock);
-
-            if let Err(e) = message.send_async(&mut *stream_lock).await {
-                warn!(
-                    "Failed to send FetchLatestBlock to {}: {}. Skipping.",
-                    node_addr, e
-                );
-                continue;
-            }
-
-            debug!("Sent FetchLatestBlock to {}", node_addr);
-
-            match time::timeout(
-                Duration::from_secs(5),
-                Message::receive_async(&mut *stream_lock),
-            )
-            .await
-            {
-                Ok(Ok(Message::Chain(ChainMessage::LatestBlock(Some((_, remote_height)))))) => {
-                    let remote_block_count = remote_height + 1;
-                    debug!(
-                        "Received LatestBlock with height {} from {}",
-                        remote_height, node_addr
-                    );
-                    if remote_block_count > longest_count {
-                        info!(
-                            "New longest blockchain: {} blocks from {}",
-                            remote_block_count, node_addr
-                        );
-                        longest_count = remote_block_count;
-                        longest_name = node_addr.clone();
-                    }
-                }
-                Ok(Ok(Message::Chain(ChainMessage::LatestBlock(None)))) => {
-                    debug!("Peer {} reported an empty chain.", node_addr);
-                }
-                Ok(Ok(message)) => {
-                    warn!("Unexpected message from {}: {:?}", node_addr, message);
-                }
-                Ok(Err(e)) => {
-                    warn!("Error receiving latest block from {}: {:?}", node_addr, e);
-                }
-                Err(_) => {
-                    warn!("Timeout waiting for LatestBlock from {}", node_addr);
-                }
-            }
-        }
-    }
-
-    info!(
-        "Longest chain found on node: {} with length: {}",
-        longest_name, longest_count
-    );
-    Ok((longest_name, longest_count))
-}
-
-pub async fn download_blockchain_from_new_connection(
-    node_addr: &str,
-    target_block_count: u64,
-) -> Result<()> {
-    info!(
-        "Establishing new connection to {} for blockchain download.",
-        node_addr
-    );
-
-    let mut stream =
-        match time::timeout(Duration::from_secs(10), TcpStream::connect(node_addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(anyhow!(
-                    "Failed to establish new connection for blockchain download: {}",
-                    e
-                ));
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "Timeout establishing new connection for blockchain download."
-                ));
-            }
-        };
-
-    download_blockchain_with_existing_stream(&mut stream, node_addr, target_block_count).await
-}
-
 pub async fn download_blockchain_with_existing_stream(
     stream: &mut TcpStream,
     node_addr: &str,
@@ -288,10 +188,10 @@ pub async fn download_blockchain_with_existing_stream(
 
         // --- Send a batch of requests (pipelining) ---
         for i in next_block_to_process..batch_end {
-            let message = Message::Chain(ChainMessage::FetchBlock(i));
+            let message = Message::Chain(ChainMessage::FetchBlockInfo(i));
             if let Err(e) = message.send_async(stream).await {
                 return Err(anyhow!(
-                    "Failed to send FetchBlock({}) to {}: {}",
+                    "Failed to send FetchBlockInfo({}) to {}: {}",
                     i,
                     node_addr,
                     e
@@ -308,8 +208,17 @@ pub async fn download_blockchain_with_existing_stream(
             )
             .await
             {
-                Ok(Ok(Message::Chain(ChainMessage::NewBlock(block)))) => {
+                Ok(Ok(Message::Chain(ChainMessage::BlockInfo(Some(block))))) => {
                     received_blocks.push(block);
+                }
+                Ok(Ok(Message::Chain(ChainMessage::BlockInfo(None)))) => {
+                    // The peer doesn't have a block we requested. This is a fatal error for the sync process with this peer.
+                    let failed_index = next_block_to_process + received_blocks.len() as u64;
+                    return Err(anyhow!(
+                        "Sync failed: Peer {} does not have block at index {}. Try syncing from another peer.",
+                        node_addr,
+                        failed_index
+                    ));
                 }
                 Ok(Ok(other_msg)) => {
                     return Err(anyhow!(

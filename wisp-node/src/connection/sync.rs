@@ -8,31 +8,6 @@ use wisp_core::{
     sha256::Hash,
 };
 
-/// Handles a `FetchBlock` request from a peer by sending back the requested block if it exists.
-pub async fn handle_fetch_block(
-    stream: &mut TcpStream,
-    index: u64,
-    blockchain: Arc<RwLock<Blockchain>>,
-) -> Result<()> {
-    debug!("Handling FetchBlock request for index {}", index);
-    let blockchain_lock = blockchain.read().await;
-    let block = blockchain_lock.get_block_by_index(index)?;
-    drop(blockchain_lock);
-
-    let response = if let Some(b) = block {
-        Message::Chain(ChainMessage::NewBlock(b))
-    } else {
-        warn!(
-            "Block at index {} not found, sending negative response.",
-            index
-        );
-        Message::Chain(ChainMessage::BlockInfo(None))
-    };
-
-    response.send_async(stream).await?;
-    Ok(())
-}
-
 /// Handles a `FetchBlockByHash` request from a peer by sending back the requested block if it exists.
 pub async fn handle_fetch_block_by_hash(
     stream: &mut TcpStream,

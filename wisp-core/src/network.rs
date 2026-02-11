@@ -49,7 +49,6 @@ pub enum Message {
 #[derive(Encode, Decode, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ChainMessage {
     NewBlock(Block),
-    FetchBlock(u64),
     FetchBlockByHash(Hash),
     FetchBlockInfo(u64),
     BlockInfo(Option<Block>),
@@ -83,11 +82,7 @@ pub enum WalletMessage {
 pub enum MiningMessage {
     FetchTemplate(PublicKey, Option<String>),
     Template(Block),
-    NewTemplate(Block),
-    ValidateTemplate(Block),
-    TemplateValidity(bool),
     SubmitTemplate(PublicKey, Block, Option<String>),
-    BlockSubmittedConfirmation,
     BlockRejected(String),
 }
 
