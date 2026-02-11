@@ -1,7 +1,10 @@
 use anyhow::Result;
 use log::{debug, info, warn};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::{
+    net::TcpStream,
+    sync::{Mutex as AsyncMutex, RwLock},
+};
 use wisp_core::{
     blockchain::{AddBlockResult, Block, Blockchain},
     network::{ChainMessage, Message},
@@ -9,7 +12,11 @@ use wisp_core::{
 };
 
 /// Handles the `NewBlock` message from a peer.
-pub async fn handle_new_block(block: Block, blockchain: Arc<RwLock<Blockchain>>) -> Result<()> {
+pub async fn handle_new_block(
+    block: Block,
+    blockchain: Arc<RwLock<Blockchain>>,
+    sender_stream_arc: Arc<AsyncMutex<TcpStream>>,
+) -> Result<()> {
     let block_hash_for_log = block.id().unwrap_or_default();
     let block_index_for_log = block.index;
     let mut blockchain_lock = blockchain.write().await;
@@ -23,7 +30,7 @@ pub async fn handle_new_block(block: Block, blockchain: Arc<RwLock<Blockchain>>)
                 "Successfully added new block {} (index {}). Broadcasting to peers.",
                 block_hash_for_log, block_index_for_log
             );
-            super::mining::broadcast_block(block).await;
+            broadcast_new_block_from_peer(block, sender_stream_arc).await;
         }
         AddBlockResult::PotentialLongerForkDetected {
             common_ancestor_index,
@@ -67,19 +74,24 @@ pub async fn handle_new_block(block: Block, blockchain: Arc<RwLock<Blockchain>>)
     Ok(())
 }
 
+/// Broadcasts a new valid block to all peers except the one it was received from.
+async fn broadcast_new_block_from_peer(
+    block: Block,
+    original_sender_arc: Arc<AsyncMutex<TcpStream>>,
+) {
+    let message = Message::Chain(ChainMessage::NewBlock(block));
+    let filter = crate::connection::BroadcastFilter::AllExcept(original_sender_arc);
+    crate::connection::broadcast(&message, filter, "new block").await;
+}
+
 /// Broadcasts a `FetchBlockByHash` message to all connected peers.
 async fn broadcast_request_for_block(hash: Hash) {
     info!("Broadcasting request for missing block: {}", hash);
     let message = Message::Chain(ChainMessage::FetchBlockByHash(hash));
-
-    for mut peer in crate::NODES.iter_mut() {
-        let addr = peer.key().clone();
-        let mut stream_lock = peer.value_mut().lock().await;
-        if let Err(e) = message.send_async(&mut *stream_lock).await {
-            warn!(
-                "Failed to send block request to {}: {}. Connection may be stale.",
-                addr, e
-            );
-        }
-    }
+    crate::connection::broadcast(
+        &message,
+        crate::connection::BroadcastFilter::All,
+        "block request",
+    )
+    .await;
 }

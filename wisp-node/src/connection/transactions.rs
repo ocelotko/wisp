@@ -1,6 +1,7 @@
 use anyhow::Result;
 use log::{debug, info, warn};
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::{net::TcpStream, sync::RwLock};
 use wisp_core::{
     blockchain::Blockchain,
@@ -11,15 +12,15 @@ use wisp_core::{
 
 /// Handles a `SubmitTransaction` message from a peer.
 pub async fn handle_submit_transaction(
-    stream: &mut TcpStream,
+    sender_stream_arc: Arc<AsyncMutex<TcpStream>>,
     tx: Transaction,
-    sender_addr: SocketAddr,
     blockchain: Arc<RwLock<Blockchain>>,
 ) -> Result<()> {
     let tx_hash = tx.txid()?;
     info!("Received transaction {} for submission.", tx_hash);
 
     let mut blockchain_lock = blockchain.write().await;
+    let mut sender_stream_lock = sender_stream_arc.lock().await;
 
     match blockchain_lock.add_to_mempool(tx.clone()) {
         Ok(_) => {
@@ -28,17 +29,18 @@ pub async fn handle_submit_transaction(
             drop(blockchain_lock);
 
             Message::Wallet(WalletMessage::TransactionAcceptedConfirmation)
-                .send_async(stream)
+                .send_async(&mut *sender_stream_lock)
                 .await?;
 
+            let sender_for_broadcast = Arc::clone(&sender_stream_arc);
             tokio::spawn(async move {
-                broadcast_transaction(tx, sender_addr).await;
+                broadcast_transaction(tx, sender_for_broadcast).await;
             });
         }
         Err(e) => {
             warn!("Transaction {} rejected: {}", tx_hash, e);
             Message::Wallet(WalletMessage::TransactionRejected(tx_hash, e.to_string()))
-                .send_async(stream)
+                .send_async(&mut *sender_stream_lock)
                 .await?;
         }
     }
@@ -73,27 +75,10 @@ pub async fn handle_fetch_wallet_state(
 }
 
 /// Broadcasts a new, valid transaction to all connected peers except the one it came from.
-async fn broadcast_transaction(tx: Transaction, original_sender: SocketAddr) {
+async fn broadcast_transaction(tx: Transaction, original_sender_arc: Arc<AsyncMutex<TcpStream>>) {
+    let tx_hash = tx.txid().unwrap_or_default();
+    info!("Broadcasting transaction {} to other peers.", tx_hash);
     let message = Message::Wallet(WalletMessage::NewTransaction(tx));
-    let mut peers_to_remove = Vec::new();
-
-    for mut peer in crate::NODES.iter_mut() {
-        let addr = peer.key().clone();
-        if addr == original_sender.to_string() {
-            continue;
-        }
-
-        let mut stream_lock = peer.value_mut().lock().await;
-        if let Err(e) = message.send_async(&mut *stream_lock).await {
-            warn!(
-                "Failed to broadcast transaction to {}: {}. Marking for removal.",
-                addr, e
-            );
-            peers_to_remove.push(addr);
-        }
-    }
-
-    for addr in peers_to_remove {
-        crate::NODES.remove(&addr);
-    }
+    let filter = crate::connection::BroadcastFilter::AllExcept(original_sender_arc);
+    crate::connection::broadcast(&message, filter, "transaction").await;
 }

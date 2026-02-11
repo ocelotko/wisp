@@ -21,20 +21,44 @@ extern crate lazy_static;
 /// Wisp blockchain node
 struct Args {
     #[argh(option, default = "9000")]
-    /// port number
+    /// port number for P2P communication.
     port: u16,
 
-    #[argh(option, default = "String::from(\"./wisp_db\")")]
-    /// sled database directory location
-    db_path: String,
-
-    #[argh(positional)]
-    /// addresses of initial nodes
-    nodes: Vec<String>,
+    #[argh(option, default = "String::from(\"0.0.0.0\")")]
+    /// address to bind the P2P listener to.
+    bind_addr: String,
 
     #[argh(switch)]
-    /// perform database migration to fix total supply
+    /// disable UPnP port forwarding.
+    no_upnp: bool,
+
+    #[argh(option, default = "3001")]
+    /// port number for the JSON-RPC API server.
+    api_port: u16,
+
+    #[argh(option, default = "String::from(\"0.0.0.0\")")]
+    /// address to bind the API server to.
+    api_bind_addr: String,
+
+    #[argh(switch)]
+    /// disable the JSON-RPC API server.
+    disable_api: bool,
+
+    #[argh(option, default = "String::from(\"./wisp_db\")")]
+    /// sled database directory location.
+    db_path: String,
+
+    #[argh(switch)]
+    /// perform database migration to fix total supply.
     migrate_db: bool,
+
+    #[argh(positional)]
+    /// addresses of initial nodes to connect to.
+    nodes: Vec<String>,
+
+    #[argh(option, default = "30")]
+    /// interval in seconds for cleaning up old transactions from the mempool (0 to disable).
+    mempool_cleanup_interval: u64,
 }
 
 lazy_static! {
@@ -43,20 +67,20 @@ lazy_static! {
     pub static ref PUBLIC_ADDR: OnceCell<String> = OnceCell::new();
 }
 
-async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bool) -> Result<()> {
-    let db =
-        sled::open(&db_path).with_context(|| format!("Failed to open database at {}", db_path))?;
+async fn run_node(args: Args) -> Result<()> {
+    let db = sled::open(&args.db_path)
+        .with_context(|| format!("Failed to open database at {}", args.db_path))?;
 
     let mut blockchain_instance = Blockchain::new(db);
 
-    if migrate_db {
+    if args.migrate_db {
         info!("Starting database migration...");
         blockchain_instance.migrate_total_supply()?;
     }
 
     blockchain_instance.load_from_db()?;
 
-    // Pre-warm DAA cache to speed up target calculation and API responses
+    // Pre-warm DAA cache to speed up target calculation and API responses.
     let height = blockchain_instance.block_height()?;
     let start = height.saturating_sub(wisp_core::DAA_WINDOW as u64);
     info!(
@@ -71,53 +95,59 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
         }
     }
 
-    // Pokus o otvorenie portu cez UPnP a zistenie verejnej IP
-    info!("Attempting UPnP port forwarding...");
-    let port_mapping_result =
-        tokio::task::spawn_blocking(move || match igd_next::search_gateway(Default::default()) {
-            Ok(gateway) => {
-                let ip = gateway.get_external_ip()?;
+    // Attempt UPnP port forwarding to get a public IP address.
+    if !args.no_upnp {
+        info!("Attempting UPnP port forwarding...");
+        let port_for_upnp = args.port;
+        let port_mapping_result = tokio::task::spawn_blocking(move || {
+            match igd_next::search_gateway(Default::default()) {
+                Ok(gateway) => {
+                    let ip = gateway.get_external_ip()?;
 
-                // Zistíme lokálnu IP adresu, na ktorú má router presmerovať port.
-                let local_ip = std::net::UdpSocket::bind("0.0.0.0:0")
-                    .and_then(|s| {
-                        s.connect("8.8.8.8:80")?;
-                        s.local_addr()
-                    })
-                    .map(|addr| addr.ip())
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+                    // Discover local IP to forward to.
+                    let local_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+                        .and_then(|s| {
+                            s.connect("8.8.8.8:80")?;
+                            s.local_addr()
+                        })
+                        .map(|addr| addr.ip())
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
 
-                gateway.add_port(
-                    igd_next::PortMappingProtocol::TCP,
-                    port,
-                    std::net::SocketAddr::new(local_ip, port),
-                    0,
-                    "wisp-node",
-                )?;
-                Ok::<_, anyhow::Error>(ip)
+                    gateway.add_port(
+                        igd_next::PortMappingProtocol::TCP,
+                        port_for_upnp,
+                        std::net::SocketAddr::new(local_ip, port_for_upnp),
+                        0,
+                        "wisp-node",
+                    )?;
+                    Ok::<_, anyhow::Error>(ip)
+                }
+                Err(e) => Err(anyhow::anyhow!(e)),
             }
-            Err(e) => Err(anyhow::anyhow!(e)),
         })
         .await?;
 
-    if let Ok(ip) = port_mapping_result {
-        info!("UPnP successful. External IP: {}", ip);
-        let _ = PUBLIC_ADDR.set(format!("{}:{}", ip, port));
+        if let Ok(ip) = port_mapping_result {
+            info!("UPnP successful. External IP: {}", ip);
+            let _ = PUBLIC_ADDR.set(format!("{}:{}", ip, args.port));
+        } else {
+            warn!("UPnP failed. Node might not be reachable from the internet without manual port forwarding.");
+        }
     } else {
-        warn!("UPnP failed. Node might not be reachable from the internet without manual port forwarding.");
+        info!("UPnP is disabled by configuration.");
     }
 
     BLOCKCHAIN
         .set(Arc::new(RwLock::new(blockchain_instance)))
         .expect("BUG: BLOCKCHAIN static was already initialized.");
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", args.bind_addr, args.port);
     let listener = TcpListener::bind(&addr).await?;
     info!("Listening on {}", addr);
 
-    tokio::spawn(initial_sync_and_discovery(nodes, port));
+    tokio::spawn(initial_sync_and_discovery(args.nodes, args.port));
 
-    let final_height = BLOCKCHAIN.get().unwrap().read().await.block_height()?; // This is now just the local height
+    let final_height = BLOCKCHAIN.get().unwrap().read().await.block_height()?;
     info!(
         "Successfully loaded blockchain with height: {}",
         final_height
@@ -133,12 +163,21 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
         }
     }
 
-    let blockchain_for_api = crate::BLOCKCHAIN.get().unwrap().clone();
-    tokio::spawn(async move {
-        api::run_api_server(blockchain_for_api).await;
-    });
+    if !args.disable_api {
+        let blockchain_for_api = crate::BLOCKCHAIN.get().unwrap().clone();
+        let api_addr_str = format!("{}:{}", args.api_bind_addr, args.api_port);
+        let api_addr: std::net::SocketAddr = api_addr_str
+            .parse()
+            .with_context(|| format!("Invalid API address format: {}", api_addr_str))?;
 
-    tokio::spawn(utils::cleanup());
+        tokio::spawn(async move {
+            api::run_api_server(blockchain_for_api, api_addr).await;
+        });
+    } else {
+        info!("API server is disabled by configuration.");
+    }
+
+    tokio::spawn(utils::cleanup(args.mempool_cleanup_interval));
 
     tokio::select! {
         _ = async {
@@ -180,55 +219,51 @@ async fn run_node(port: u16, db_path: String, nodes: Vec<String>, migrate_db: bo
 async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16) {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    if let Err(e) = utils::populate_connections(&nodes, self_port).await {
-        warn!("Error during initial peer population: {}", e);
-    }
-
-    info!("Total amount of known nodes: {}", crate::NODES.len());
-
     if !nodes.is_empty() {
-        info!("Checking for longer chain against initial nodes...");
-        let (longest_name, longest_count) = match {
-            let bc = BLOCKCHAIN.get().unwrap().read().await;
-            utils::find_longest_chain_node(&bc).await
-        } {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to find longest chain node: {}", e);
-                return;
-            }
-        };
+        let blockchain = BLOCKCHAIN.get().unwrap().read().await;
+        let local_chain_height = blockchain.block_height().unwrap_or(0);
 
-        let local_chain_length = match BLOCKCHAIN.get().unwrap().read().await.block_height() {
-            Ok(h) => h + 1,
-            Err(e) => {
-                error!("Failed to get local chain height: {}", e);
-                return;
-            }
-        };
-
-        if longest_count > local_chain_length {
-            info!(
-                "Peer {} has a longer chain ({} blocks), preparing to download...",
-                longest_name, longest_count
-            );
-
-            if let Some(mut peer) = crate::NODES.get_mut(&longest_name) {
-                let mut stream = peer.value_mut().lock().await;
-                if let Err(e) = utils::download_blockchain_with_existing_stream(
-                    &mut stream,
-                    &longest_name,
-                    longest_count,
-                )
-                .await
-                {
-                    error!("Initial blockchain download failed: {:?}", e);
+        let longest_peer_info =
+            match utils::populate_connections(&nodes, self_port, &blockchain).await {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!("Error during initial peer population: {}", e);
+                    None
                 }
-            } else {
-                warn!(
-                    "Could not find peer {} in connection map to start download.",
-                    longest_name
+            };
+
+        info!(
+            "Finished initial peer discovery. Total known nodes: {}",
+            crate::NODES.len()
+        );
+
+        if let Some((longest_name, longest_height)) = longest_peer_info {
+            let longest_count = longest_height + 1;
+            let local_chain_length = local_chain_height + 1;
+
+            if longest_count > local_chain_length {
+                info!(
+                    "Peer {} has a longer chain ({} blocks), preparing to download...",
+                    longest_name, longest_count
                 );
+
+                if let Some(mut peer) = crate::NODES.get_mut(&longest_name) {
+                    let mut stream = peer.value_mut().lock().await;
+                    if let Err(e) = utils::download_blockchain_with_existing_stream(
+                        &mut stream,
+                        &longest_name,
+                        longest_count,
+                    )
+                    .await
+                    {
+                        error!("Initial blockchain download failed: {:?}", e);
+                    }
+                } else {
+                    warn!(
+                        "Could not find peer {} in connection map to start download.",
+                        longest_name
+                    );
+                }
             }
         }
     }
@@ -241,5 +276,5 @@ async fn main() -> Result<()> {
 
     let args: Args = argh::from_env();
 
-    run_node(args.port, args.db_path, args.nodes, args.migrate_db).await
+    run_node(args).await
 }

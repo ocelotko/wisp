@@ -4,8 +4,10 @@ use axum::{
     response::{IntoResponse, Json},
     Router,
 };
+use lazy_static::lazy_static;
 use serde::Deserialize;
 use serde::Serialize;
+use std::time::{Duration, Instant};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
@@ -13,6 +15,11 @@ use wisp_core::{
     blockchain::Block, currency::Amount, sha256::Hash, signatures::PublicKey,
     utils::calculate_block_reward, DAA_WINDOW, HALVING_INTERVAL, IDEAL_BLOCK_TIME,
 };
+
+lazy_static! {
+    static ref VITALS_CACHE: RwLock<Option<VitalsCache>> = RwLock::new(None);
+}
+const VITALS_CACHE_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Serialize, Clone)]
 struct ApiBlock {
@@ -100,7 +107,7 @@ struct PaginatedTransactionsResponse {
     total_transactions: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ApiNetworkVitals {
     current_height: u64,
     difficulty: String,
@@ -111,8 +118,14 @@ struct ApiNetworkVitals {
     mempool_size: usize,
     #[serde(with = "serde_str")]
     current_target: wisp_core::U256,
-    network_hashrate_hps: f64,
+    network_hashrate: String,
     total_transactions: u64,
+}
+
+#[derive(Clone)]
+struct VitalsCache {
+    vitals: ApiNetworkVitals,
+    timestamp: Instant,
 }
 
 impl From<Block> for ApiBlock {
@@ -138,26 +151,12 @@ impl From<Block> for ApiBlock {
             })
             .collect();
 
-        let difficulty_str = if block.header.target.is_zero() {
-            "inf".to_string()
-        } else {
-            let scaling_factor = wisp_core::U256::from(1_000_000u64);
-            let max_target = wisp_core::MAX_TARGET;
-
-            if let Some(scaled_max) = max_target.checked_mul(scaling_factor) {
-                let difficulty_scaled = scaled_max / block.header.target;
-                format!("{:.2}", difficulty_scaled.as_u64() as f64 / 1_000_000.0)
-            } else {
-                "inf".to_string()
-            }
-        };
-
         ApiBlock {
             version: block.header.version,
             height: block.index,
             hash: block.id().unwrap_or_default(),
             timestamp: block.header.timestamp.timestamp(),
-            difficulty: difficulty_str,
+            difficulty: calculate_difficulty_string(block.header.target),
             transactions: transactions_summary,
             size: block_size,
             nonce: block.header.nonce,
@@ -193,9 +192,11 @@ pub fn app_router(blockchain_state: Arc<RwLock<wisp_core::blockchain::Blockchain
         .with_state(blockchain_state)
 }
 
-pub async fn run_api_server(blockchain: Arc<RwLock<wisp_core::blockchain::Blockchain>>) {
+pub async fn run_api_server(
+    blockchain: Arc<RwLock<wisp_core::blockchain::Blockchain>>,
+    addr: SocketAddr,
+) {
     let app = app_router(blockchain);
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
     log::info!("API server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -205,6 +206,17 @@ pub async fn run_api_server(blockchain: Arc<RwLock<wisp_core::blockchain::Blockc
 async fn get_network_vitals(
     State(blockchain_lock): State<Arc<RwLock<wisp_core::blockchain::Blockchain>>>,
 ) -> impl IntoResponse {
+    // Check cache first. If a valid cache entry exists, return it immediately.
+    let cache_read_lock = VITALS_CACHE.read().await;
+    if let Some(cache) = &*cache_read_lock {
+        if cache.timestamp.elapsed() < VITALS_CACHE_DURATION {
+            log::debug!("Returning cached network vitals.");
+            return Json(cache.vitals.clone()).into_response();
+        }
+    }
+    drop(cache_read_lock);
+
+    log::debug!("Recalculating network vitals (cache miss or stale).");
     let blockchain = blockchain_lock.read().await;
 
     let current_height = match blockchain.block_height() {
@@ -220,20 +232,7 @@ async fn get_network_vitals(
     };
 
     let current_target = blockchain.get_target();
-    let difficulty = if current_target.is_zero() {
-        "inf".to_string()
-    } else {
-        let scaling_factor = wisp_core::U256::from(1_000_000u64);
-        let max_target = wisp_core::MAX_TARGET;
-
-        if let Some(scaled_max) = max_target.checked_mul(scaling_factor) {
-            let difficulty_scaled = scaled_max / current_target;
-            format!("{:.2}", difficulty_scaled.as_u64() as f64 / 1_000_000.0)
-        } else {
-            "inf".to_string()
-        }
-    };
-
+    let difficulty = calculate_difficulty_string(current_target);
     let avg_block_time_secs = if current_height > 0 {
         let (start_block_index, window_size) = if current_height >= DAA_WINDOW as u64 {
             (current_height - (DAA_WINDOW - 1) as u64, DAA_WINDOW)
@@ -261,7 +260,7 @@ async fn get_network_vitals(
     let next_halving_in_blocks = HALVING_INTERVAL - (current_height % HALVING_INTERVAL);
     let mempool_size = blockchain.mempool().len();
 
-    let network_hashrate_hps = if current_height >= DAA_WINDOW as u64 {
+    let network_hashrate = if current_height >= DAA_WINDOW as u64 {
         let window_start_index = current_height - (DAA_WINDOW as u64 - 1);
         if let (Ok(Some(start_block)), Ok(Some(end_block))) = (
             blockchain.get_block_by_index(window_start_index),
@@ -286,18 +285,31 @@ async fn get_network_vitals(
                 .map(|target| wisp_core::MAX_TARGET / target.max(wisp_core::MIN_TARGET))
                 .fold(wisp_core::U256::zero(), |acc, work| acc + work);
 
-            let total_hashes = u256_to_f64(total_work) * 2.0_f64.powi(24);
-            total_hashes / time_span_secs as f64
+            // Use U256 arithmetic for precision. 1 work unit is approx. 2^24 hashes.
+            let hashes_per_work_unit = wisp_core::U256::from(1u64 << 24);
+            if let Some(total_hashes) = total_work.checked_mul(hashes_per_work_unit) {
+                let hps = total_hashes / wisp_core::U256::from(time_span_secs as u64);
+                format_hashrate(hps)
+            } else {
+                "overflow".to_string()
+            }
         } else {
-            0.0
+            "0 H/s".to_string()
         }
     } else {
-        let diff_val = if current_target.is_zero() {
-            0.0
+        // Fallback for early blocks before the first DAA window is full.
+        let work_per_block = if current_target.is_zero() {
+            wisp_core::U256::zero()
         } else {
-            u256_to_f64(wisp_core::MAX_TARGET) / u256_to_f64(current_target)
+            wisp_core::MAX_TARGET / current_target.max(wisp_core::MIN_TARGET)
         };
-        (diff_val * 2.0_f64.powi(24)) / IDEAL_BLOCK_TIME as f64
+        let hashes_per_work_unit = wisp_core::U256::from(1u64 << 24);
+        if let Some(total_hashes) = work_per_block.checked_mul(hashes_per_work_unit) {
+            let hps = total_hashes / wisp_core::U256::from(IDEAL_BLOCK_TIME);
+            format_hashrate(hps)
+        } else {
+            "overflow".to_string()
+        }
     };
     let confirmed_tx_count = blockchain
         .get_total_transaction_count_from_db()
@@ -312,22 +324,64 @@ async fn get_network_vitals(
         next_halving_in_blocks,
         mempool_size,
         current_target,
-        network_hashrate_hps,
+        network_hashrate,
         total_transactions,
     };
+
+    // Update the cache with the newly calculated vitals.
+    let mut cache_write_lock = VITALS_CACHE.write().await;
+    *cache_write_lock = Some(VitalsCache {
+        vitals: vitals.clone(),
+        timestamp: Instant::now(),
+    });
 
     Json(vitals).into_response()
 }
 
 /// Converts a U256 into an f64.
-fn u256_to_f64(val: wisp_core::U256) -> f64 {
-    let words = val.0;
-    let mut result = 0.0;
-    result += words[0] as f64;
-    result += (words[1] as f64) * 2.0_f64.powi(64);
-    result += (words[2] as f64) * 2.0_f64.powi(128);
-    result += (words[3] as f64) * 2.0_f64.powi(192);
-    result
+/// Formats a hashrate in H/s into a human-readable string with appropriate units (kH/s, MH/s, etc.).
+fn format_hashrate(hashrate_hps: wisp_core::U256) -> String {
+    let ghps = wisp_core::U256::from(1_000_000_000u64);
+    let mhps = wisp_core::U256::from(1_000_000u64);
+    let khps = wisp_core::U256::from(1_000u64);
+
+    if hashrate_hps >= ghps {
+        let value = hashrate_hps * 100 / ghps; // scale for 2 decimal places
+        format!("{}.{:02} GH/s", value / 100, value % 100)
+    } else if hashrate_hps >= mhps {
+        let value = hashrate_hps * 100 / mhps;
+        format!("{}.{:02} MH/s", value / 100, value % 100)
+    } else if hashrate_hps >= khps {
+        let value = hashrate_hps * 100 / khps;
+        format!("{}.{:02} KH/s", value / 100, value % 100)
+    } else {
+        format!("{} H/s", hashrate_hps)
+    }
+}
+
+/// Calculates a human-readable difficulty string from a target.
+fn calculate_difficulty_string(target: wisp_core::U256) -> String {
+    if target.is_zero() {
+        return "inf".to_string();
+    }
+    // Use a scaling factor to preserve precision during integer division.
+    const SCALING_FACTOR_U64: u64 = 1_000_000;
+    let scaling_factor = wisp_core::U256::from(SCALING_FACTOR_U64);
+    let max_target = wisp_core::MAX_TARGET;
+
+    // difficulty = max_target / target
+    // To get decimal places, we calculate (max_target * scaling_factor) / target
+    // and then divide the result by scaling_factor as a float.
+    if let Some(scaled_max) = max_target.checked_mul(scaling_factor) {
+        let difficulty_scaled = scaled_max / target;
+        format!(
+            "{:.2}",
+            difficulty_scaled.as_u64() as f64 / SCALING_FACTOR_U64 as f64
+        )
+    } else {
+        // This case is unlikely unless max_target is very large, but good to handle.
+        "inf".to_string()
+    }
 }
 
 mod serde_hash_str {

@@ -1,20 +1,49 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use tokio::net::TcpStream;
 use tokio::time;
 use wisp_core::blockchain::AddBlockResult;
-use wisp_core::network::{ChainMessage, Message, P2PMessage};
+use wisp_core::{
+    blockchain::Blockchain,
+    network::{ChainMessage, Message, P2PMessage},
+};
 
-pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()> {
+pub async fn populate_connections(
+    nodes: &[String],
+    self_port: u16,
+    blockchain: &Blockchain,
+) -> Result<Option<(String, u64)>> {
     info!("Attempting to connect to nodes: {:?}", nodes);
+    let mut longest_peer: Option<(String, u64)> = None;
+
     for node in nodes {
         info!("Connecting to node: {}", node);
         match time::timeout(Duration::from_secs(5), TcpStream::connect(&node)).await {
-            Ok(Ok(stream)) => {
-                if let Err(e) = perform_handshake(stream, node, self_port).await {
+            Ok(Ok(mut stream)) => {
+                if let Err(e) =
+                    perform_handshake(&mut stream, node, self_port, blockchain, &mut longest_peer)
+                        .await
+                {
                     warn!("Handshake with {} failed: {}", node, e);
+                } else if !crate::NODES.contains_key(node) {
+                    // Handshake was successful, move the stream into the global map
+                    // and spawn a handler for it.
+                    let stream_arc = std::sync::Arc::new(tokio::sync::Mutex::new(stream));
+                    crate::NODES.insert(node.to_string(), stream_arc.clone());
+                    info!("Handshake successful. Added initial node: {}", node);
+
+                    let addr_clone = node.to_string();
+                    let socket_addr = stream_arc.lock().await.peer_addr()?;
+                    tokio::spawn(async move {
+                        let _ = crate::connection::handle_connection(
+                            stream_arc,
+                            socket_addr,
+                            Some(addr_clone),
+                        )
+                        .await;
+                    });
                 }
             }
             Ok(Err(e)) => {
@@ -25,10 +54,16 @@ pub async fn populate_connections(nodes: &[String], self_port: u16) -> Result<()
             }
         }
     }
-    Ok(())
+    Ok(longest_peer)
 }
 
-async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u16) -> Result<()> {
+async fn perform_handshake(
+    stream: &mut TcpStream,
+    node_addr: &str,
+    self_port: u16,
+    blockchain: &Blockchain,
+    longest_peer: &mut Option<(String, u64)>,
+) -> Result<()> {
     info!("Performing handshake with {}", node_addr);
 
     let self_addr = if let Some(public_addr) = crate::PUBLIC_ADDR.get() {
@@ -39,18 +74,17 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     };
 
     Message::P2P(P2PMessage::Hello(self_addr))
-        .send_async(&mut stream)
+        .send_async(stream)
         .await?;
 
     Message::Chain(ChainMessage::FetchLatestBlock)
-        .send_async(&mut stream)
+        .send_async(stream)
         .await?;
 
     // Wait for their response and send our height
     if let Ok(Ok(Message::Chain(ChainMessage::LatestBlock(Some((_, height)))))) =
-        time::timeout(Duration::from_secs(5), Message::receive_async(&mut stream)).await
+        time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await
     {
-        let blockchain = crate::BLOCKCHAIN.get().unwrap().read().await;
         let our_height = blockchain.block_height()?;
 
         if height > our_height {
@@ -60,14 +94,20 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
             );
         }
 
+        // Track the peer with the longest chain discovered so far.
+        let current_longest_height = longest_peer.as_ref().map(|(_, h)| *h).unwrap_or(our_height);
+        if height > current_longest_height {
+            *longest_peer = Some((node_addr.to_string(), height));
+        }
+
         // Send our height so they can decide if they need to sync from us.
         if let Some(tip) = blockchain.get_tip_block()? {
             Message::Chain(ChainMessage::LatestBlock(Some((tip, our_height))))
-                .send_async(&mut stream)
+                .send_async(stream)
                 .await?;
         } else {
             Message::Chain(ChainMessage::LatestBlock(None))
-                .send_async(&mut stream)
+                .send_async(stream)
                 .await?;
         }
     } else {
@@ -78,11 +118,11 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
     };
 
     Message::P2P(P2PMessage::DiscoverNodes)
-        .send_async(&mut stream)
+        .send_async(stream)
         .await?;
     info!("Sent DiscoverNodes to {}", node_addr);
 
-    match time::timeout(Duration::from_secs(5), Message::receive_async(&mut stream)).await {
+    match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
         Ok(Ok(Message::P2P(P2PMessage::NodeList(child_nodes)))) => {
             info!("Received NodeList from {}: {:?}", node_addr, child_nodes);
 
@@ -103,32 +143,13 @@ async fn perform_handshake(mut stream: TcpStream, node_addr: &str, self_port: u1
         Err(_) => return Err(anyhow!("Timeout receiving NodeList from {}", node_addr)),
     }
 
-    use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
-    if !crate::NODES.contains_key(node_addr) {
-        let stream_arc = Arc::new(AsyncMutex::new(stream));
-        crate::NODES.insert(node_addr.to_string(), stream_arc);
-        info!("Handshake successful. Added initial node: {}", node_addr);
-
-        let stream_clone = crate::NODES.get(node_addr).unwrap().clone();
-        let addr_clone = node_addr.to_string();
-        let socket_addr = stream_clone.lock().await.peer_addr()?;
-        tokio::spawn(async move {
-            let _ =
-                crate::connection::handle_connection(stream_clone, socket_addr, Some(addr_clone))
-                    .await;
-        });
-    }
-
     Ok(())
 }
 
-pub async fn find_longest_chain_node(
-    blockchain: &wisp_core::blockchain::Blockchain,
-) -> Result<(String, u64)> {
+pub async fn find_longest_chain_node(local_height: u64) -> Result<(String, u64)> {
     info!("Finding node with the longest blockchain...");
     let mut longest_name = String::new();
-    let mut longest_count = blockchain.block_height()?.saturating_add(1);
+    let mut longest_count = local_height.saturating_add(1);
     info!(
         "Local chain length is {}. Searching for peers with longer chains...",
         longest_count
@@ -251,96 +272,102 @@ pub async fn download_blockchain_with_existing_stream(
         target_block_count - 1
     );
 
-    for i in (local_chain_height + 1)..=(target_block_count - 1) {
-        debug!("Attempting to fetch block index {} from {}", i, node_addr);
+    const BATCH_SIZE: u64 = 100;
+    const BATCH_TIMEOUT_SECS: u64 = 30;
+    let mut next_block_to_process = local_chain_height + 1;
 
-        let message = Message::Chain(ChainMessage::FetchBlock(i as u64));
+    while next_block_to_process < target_block_count {
+        let batch_end = (next_block_to_process + BATCH_SIZE).min(target_block_count);
+        let num_to_request = batch_end - next_block_to_process;
 
-        if let Err(e) = message.send_async(stream).await {
-            error!("Failed to send FetchBlock({}) to {}: {}", i, node_addr, e);
-            return Err(anyhow!(
-                "Failed to send FetchBlock({}) to {}: {}",
-                i,
-                node_addr,
-                e
-            ));
-        }
+        info!(
+            "Requesting block batch from {} to {}...",
+            next_block_to_process,
+            batch_end - 1
+        );
 
-        match time::timeout(Duration::from_secs(5), Message::receive_async(stream)).await {
-            Ok(Ok(Message::Chain(ChainMessage::NewBlock(block)))) => {
-                debug!(
-                    "Received NewBlock for index {} from {}",
-                    block.index, node_addr
-                );
-
-                let mut blockchain = crate::BLOCKCHAIN.get().unwrap().write().await;
-
-                if block.index != i as u64 {
-                    error!(
-                        "Received block with unexpected index. Expected {}, got {}. Block Hash: {}",
-                        i,
-                        block.index,
-                        block.id().unwrap_or_default()
-                    );
-                    return Err(anyhow!(
-                        "Received block with unexpected index. Expected {}, got {}.",
-                        i,
-                        block.index
-                    ));
-                }
-
-                let add_result = blockchain.add_block(block);
-                match add_result? {
-                    AddBlockResult::Added => debug!(
-                        "Block with index {} successfully added during download. Current chain height: {}",
-                        i,
-                        blockchain.block_height()?
-                    ),
-                    other_result => {
-                        error!(
-                            "Failed to add block {} from {}: {:?}. Aborting blockchain download.",
-                            i, node_addr, other_result
-                        );
-                        return Err(anyhow!(
-                            "Unexpected result while adding block {} from {}: {:?}",
-                            i,
-                            node_addr,
-                            other_result
-                        ));
-                    }
-                }
-            }
-            Ok(Ok(message)) => {
-                error!(
-                    "Unexpected message {:?} from {} while downloading block {}",
-                    message, node_addr, i
-                );
+        // --- Send a batch of requests (pipelining) ---
+        for i in next_block_to_process..batch_end {
+            let message = Message::Chain(ChainMessage::FetchBlock(i));
+            if let Err(e) = message.send_async(stream).await {
                 return Err(anyhow!(
-                    "Unexpected message {:?} from {} while downloading block {}",
-                    message,
-                    node_addr,
-                    i,
-                ));
-            }
-            Ok(Err(e)) => {
-                error!("Error receiving block {} from {}: {}", i, node_addr, e);
-                return Err(anyhow!(
-                    "Error receiving block {} from {}: {}",
+                    "Failed to send FetchBlock({}) to {}: {}",
                     i,
                     node_addr,
                     e
                 ));
             }
-            Err(_) => {
-                error!("Timeout downloading block {} from {}", node_addr, i);
-                return Err(anyhow!(
-                    "Timeout downloading block {} from {}",
-                    node_addr,
-                    i
-                ));
+        }
+
+        // --- Receive a batch of responses ---
+        let mut received_blocks = Vec::with_capacity(num_to_request as usize);
+        for _ in 0..num_to_request {
+            match time::timeout(
+                Duration::from_secs(BATCH_TIMEOUT_SECS),
+                Message::receive_async(stream),
+            )
+            .await
+            {
+                Ok(Ok(Message::Chain(ChainMessage::NewBlock(block)))) => {
+                    received_blocks.push(block);
+                }
+                Ok(Ok(other_msg)) => {
+                    return Err(anyhow!(
+                        "Unexpected message {:?} from {} while downloading block batch",
+                        other_msg,
+                        node_addr
+                    ));
+                }
+                Ok(Err(e)) => {
+                    return Err(anyhow!(
+                        "Network error receiving block batch from {}: {}",
+                        node_addr,
+                        e
+                    ));
+                }
+                Err(_) => {
+                    return Err(anyhow!("Timeout receiving block batch from {}", node_addr));
+                }
             }
         }
+
+        // Blocks can arrive out of order, so sort them before processing.
+        received_blocks.sort_by_key(|b| b.index);
+
+        // --- Process the batch of blocks ---
+        let mut blockchain = crate::BLOCKCHAIN.get().unwrap().write().await;
+        for (i, block) in received_blocks.into_iter().enumerate() {
+            let expected_index = next_block_to_process + i as u64;
+            if block.index != expected_index {
+                return Err(anyhow!(
+                    "Received out-of-sequence block. Expected index {}, got {}.",
+                    expected_index,
+                    block.index
+                ));
+            }
+
+            match blockchain.add_block(block)? {
+                AddBlockResult::Added => {
+                    debug!(
+                        "Block {} added during batch sync. Chain height: {}",
+                        expected_index,
+                        blockchain.block_height()?
+                    );
+                }
+                other_result => {
+                    return Err(anyhow!(
+                        "Failed to add block {} from {}: {:?}. Aborting sync.",
+                        expected_index,
+                        node_addr,
+                        other_result
+                    ));
+                }
+            }
+        }
+
+        next_block_to_process = batch_end;
     }
+
     info!(
         "Blockchain download from {} completed successfully.",
         node_addr
@@ -348,9 +375,16 @@ pub async fn download_blockchain_with_existing_stream(
     Ok(())
 }
 
-pub async fn cleanup() {
-    let mut interval = time::interval(time::Duration::from_secs(30));
-    info!("Cleanup task started");
+pub async fn cleanup(interval_secs: u64) {
+    if interval_secs == 0 {
+        info!("Mempool cleanup task is disabled.");
+        return;
+    }
+    let mut interval = time::interval(time::Duration::from_secs(interval_secs));
+    info!(
+        "Mempool cleanup task started with {}s interval",
+        interval_secs
+    );
     loop {
         interval.tick().await;
         debug!("Cleaning the mempool from old transactions");

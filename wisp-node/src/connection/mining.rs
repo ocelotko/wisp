@@ -103,23 +103,8 @@ pub async fn handle_submit_template(
 
 /// Broadcasts a block to all connected peers.
 pub async fn broadcast_block(block: Block) {
+    let block_id = block.id().unwrap_or_default();
+    info!("Broadcasting new block {} to all peers.", block_id);
     let message = Message::Chain(ChainMessage::NewBlock(block));
-    let mut peers_to_remove = Vec::new();
-
-    for mut peer in crate::NODES.iter_mut() {
-        let addr = peer.key().clone();
-        let mut stream_lock = peer.value_mut().lock().await;
-        if let Err(e) = message.send_async(&mut *stream_lock).await {
-            warn!(
-                "Failed to broadcast block to {}: {}. Marking for removal.",
-                addr, e
-            );
-            peers_to_remove.push(addr);
-        }
-    }
-
-    // Clean up connections that failed during the broadcast.
-    for addr in peers_to_remove {
-        crate::NODES.remove(&addr);
-    }
+    super::broadcast(&message, super::BroadcastFilter::All, "block").await;
 }

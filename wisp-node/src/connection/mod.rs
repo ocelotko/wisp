@@ -2,7 +2,11 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::{net::TcpStream, sync::Mutex as AsyncMutex};
+use tokio::{
+    net::TcpStream,
+    sync::Mutex as AsyncMutex,
+    time::{timeout, Duration},
+};
 use wisp_core::network::{ChainMessage, Message, MiningMessage, P2PMessage, WalletMessage};
 
 pub mod blocks;
@@ -10,6 +14,49 @@ pub mod mining;
 pub mod peers;
 pub mod sync;
 pub mod transactions;
+
+/// A filter to determine which peers a broadcast should be sent to.
+pub enum BroadcastFilter {
+    /// Send to all peers.
+    All,
+    /// Send to all peers except for the one specified by its stream Arc.
+    AllExcept(Arc<AsyncMutex<TcpStream>>),
+}
+
+/// Broadcasts a message to filtered peers.
+/// Removes peers that cause a send error.
+pub async fn broadcast(message: &Message, filter: BroadcastFilter, log_verb: &str) {
+    let mut peers_to_remove = Vec::new();
+
+    for mut peer in crate::NODES.iter_mut() {
+        let should_skip = match &filter {
+            BroadcastFilter::All => false,
+            BroadcastFilter::AllExcept(arc) => Arc::ptr_eq(peer.value(), arc),
+        };
+
+        if should_skip {
+            continue;
+        }
+
+        let addr = peer.key().clone();
+        let mut stream_lock = peer.value_mut().lock().await;
+        if let Err(e) = message.send_async(&mut *stream_lock).await {
+            warn!(
+                "Failed to broadcast {} to {}: {}. Marking for removal.",
+                log_verb, addr, e
+            );
+            peers_to_remove.push(addr);
+        }
+    }
+
+    // Clean up connections that failed during the broadcast.
+    for addr in peers_to_remove {
+        crate::NODES.remove(&addr);
+    }
+}
+
+const PEER_TIMEOUT: Duration = Duration::from_secs(120);
+const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PeerGuard {
     addr: Option<String>,
@@ -38,14 +85,54 @@ pub async fn handle_connection(
 
     loop {
         let mut stream_lock = stream_arc.lock().await;
-        let message = match Message::receive_async(&mut *stream_lock).await {
-            Ok(msg) => msg,
-            Err(e) => {
+        let message_future = Message::receive_async(&mut *stream_lock);
+
+        let message = match timeout(PEER_TIMEOUT, message_future).await {
+            Ok(Ok(msg)) => msg, // Message received within timeout
+            Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     info!("Connection closed by peer {}", addr);
                     return Ok(());
                 }
                 return Err(anyhow!("Failed to receive message from {}: {}", addr, e));
+            }
+            Err(_) => {
+                // Timeout elapsed
+                info!(
+                    "Peer {} has been idle. Sending a ping to check liveness.",
+                    addr
+                );
+                if let Err(e) = Message::P2P(P2PMessage::Ping)
+                    .send_async(&mut *stream_lock)
+                    .await
+                {
+                    warn!(
+                        "Failed to send ping to {}: {}. Closing connection.",
+                        addr, e
+                    );
+                    return Ok(());
+                }
+
+                // We expect any message back quickly, preferably a Pong.
+                let response_future = Message::receive_async(&mut *stream_lock);
+                match timeout(PING_TIMEOUT, response_future).await {
+                    Ok(Ok(Message::P2P(P2PMessage::Pong))) => {
+                        debug!("Received pong from {}. Connection is alive.", addr);
+                        continue; // Go back to waiting for a message
+                    }
+                    Ok(Ok(other_message)) => {
+                        // Any other message also proves liveness. Process it.
+                        other_message
+                    }
+                    _ => {
+                        // Timeout or error receiving response
+                        warn!(
+                            "Did not receive a timely response from {}. Closing connection.",
+                            addr
+                        );
+                        return Ok(());
+                    }
+                }
             }
         };
 
@@ -66,7 +153,7 @@ pub async fn handle_connection(
                 Ok(())
             }
             Message::Chain(ChainMessage::NewBlock(block)) => {
-                blocks::handle_new_block(block, blockchain.clone()).await
+                blocks::handle_new_block(block, blockchain.clone(), stream_arc.clone()).await
             }
             Message::Chain(ChainMessage::FetchBlock(index)) => {
                 let mut stream_lock = stream_arc.lock().await;
@@ -92,20 +179,25 @@ pub async fn handle_connection(
                         addr, their_height, our_height
                     );
 
-                    if let Some(addr_to_sync_from) = peer_guard.addr.clone() {
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::utils::download_blockchain_from_new_connection(
-                                &addr_to_sync_from,
-                                their_height + 1,
-                            )
-                            .await
-                            {
-                                warn!("Background sync from {} failed: {}", addr_to_sync_from, e);
-                            }
-                        });
-                    } else {
-                        warn!("Cannot sync from peer {} because we don't know its public address (no Hello message received).", addr);
-                    }
+                    let stream_for_sync = stream_arc.clone();
+                    let peer_addr_for_log =
+                        peer_guard.addr.clone().unwrap_or_else(|| addr.to_string());
+                    tokio::spawn(async move {
+                        info!("Starting background sync with peer {}", peer_addr_for_log);
+                        let mut stream_lock = stream_for_sync.lock().await;
+                        if let Err(e) = crate::utils::download_blockchain_with_existing_stream(
+                            &mut *stream_lock,
+                            &peer_addr_for_log,
+                            their_height + 1,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "Background sync from {} failed: {}. The connection may be closed.",
+                                peer_addr_for_log, e
+                            );
+                        }
+                    });
                 } else {
                     info!(
                         "Peer {} has chain height {}. Our height is {}.",
@@ -127,14 +219,8 @@ pub async fn handle_connection(
             }
 
             Message::Wallet(WalletMessage::SubmitTransaction(tx)) => {
-                let mut stream_lock = stream_arc.lock().await;
-                transactions::handle_submit_transaction(
-                    &mut *stream_lock,
-                    tx,
-                    addr,
-                    blockchain.clone(),
-                )
-                .await
+                transactions::handle_submit_transaction(stream_arc.clone(), tx, blockchain.clone())
+                    .await
             }
             Message::Wallet(WalletMessage::FetchWalletState(pubkey)) => {
                 let mut stream_lock = stream_arc.lock().await;
