@@ -206,10 +206,10 @@ pub async fn load_wallet(
 ) -> Result<()> {
     info!("Loading wallet: {}", name);
 
+    // Decrypt wallet file. This is the main blocking operation and also serves as password validation.
     let data_dir_clone = core.data_dir.clone();
     let name_clone = name.to_string();
     let password_clone = password.to_string();
-
     let loaded_wallet = tokio::task::spawn_blocking(move || {
         SavedWallet::load_from_file(&data_dir_clone, &name_clone, &password_clone)
     })
@@ -222,26 +222,23 @@ pub async fn load_wallet(
         name
     );
 
+    // --- Atomic State Switch ---
+    // Clear old wallet state before doing anything else. This prevents the UI from showing
+    // stale data from the previous wallet. Any queries between now and when the new state
+    // is fetched will return an empty/zero state, which is correct behavior during a switch.
+    core.utxos.write().await.clear();
+    core.transactions.write().await.clear();
+    info!("Cleared wallet state (UTXOs and transactions) for wallet switch.");
+
     let mut wallets_guard = core.wallets.lock().await;
-
-    if wallets_guard.iter().any(|w| w.name == name) {
-        info!("Wallet '{}' is already loaded.", name);
-        drop(wallets_guard);
-
-        let mut config_guard = core.config.lock().await;
-        config_guard.current_wallet_name = Some(name.to_string());
-        core.save_config(config_path, &*config_guard).await?;
-
-        return Ok(());
+    if !wallets_guard.iter().any(|w| w.name == name) {
+        wallets_guard.push(loaded_wallet);
     }
-
-    wallets_guard.push(loaded_wallet.clone());
     drop(wallets_guard);
 
     {
         let mut config_guard = core.config.lock().await;
         config_guard.current_wallet_name = Some(name.to_string());
-
         core.save_config(config_path, &*config_guard).await?;
     }
 

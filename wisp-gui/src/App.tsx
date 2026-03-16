@@ -4,10 +4,12 @@ import Button from "./components/Button";
 import IconButton from "./components/IconButton";
 import { invoke } from "@tauri-apps/api/core";
 import { CreateWalletModal } from "./components/CreateWalletModal";
+import { ReceiveModal } from "./components/ReceiveModal";
 import { RecoverWalletModal } from "./components/RecoverWalletModal";
 import { UnlockWalletModal } from "./components/UnlockWalletModal";
 import WalletButton from "./components/WalletButton";
 import BalanceChart from "./components/BalanceChart";
+import { SendModal } from "./components/SendModal";
 
 type View = "home" | "settings";
 
@@ -15,9 +17,9 @@ const App = () => {
   const [currentView, setCurrentView] = useState<View>("home");
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showAddMenu, setShowAddMenu] = useState(false);
-  const [activeModal, setActiveModal] = useState<"create" | "recover" | null>(
-    null,
-  );
+  const [activeModal, setActiveModal] = useState<
+    "create" | "recover" | "send" | "receive" | null
+  >(null);
 
   const [wallets, setWallets] = useState<string[]>([]);
   const [activeWallet, setActiveWallet] = useState<string | null>(null);
@@ -213,7 +215,7 @@ const App = () => {
             </ul>
 
             <section className="relative">
-              <div className="flex items-center justify-between px-4 mb-4">
+              <div className="flex items-center justify-between px-4 mb-4 relative">
                 <h4 className="text-[10px] uppercase tracking-widest text-dark-outline font-bold">
                   Accounts
                 </h4>
@@ -221,6 +223,28 @@ const App = () => {
                   icon={PlusIcon}
                   onClick={() => setShowAddMenu(!showAddMenu)}
                 />
+                {showAddMenu && (
+                  <div className="absolute right-4 top-8 z-50 w-48 bg-dark-surfaceContainerHigh rounded-xl shadow-xl border border-dark-outlineVariant overflow-hidden animate-in fade-in zoom-in-95 duration-100 origin-top-right">
+                    <button
+                      className="w-full text-left px-4 py-3 text-sm hover:bg-dark-surfaceContainerHighest transition-colors flex items-center gap-2 text-dark-onSurface"
+                      onClick={() => {
+                        setActiveModal("create");
+                        setShowAddMenu(false);
+                      }}
+                    >
+                      Create New Wallet
+                    </button>
+                    <button
+                      className="w-full text-left px-4 py-3 text-sm hover:bg-dark-surfaceContainerHighest transition-colors flex items-center gap-2 border-t border-dark-outlineVariant text-dark-onSurface"
+                      onClick={() => {
+                        setActiveModal("recover");
+                        setShowAddMenu(false);
+                      }}
+                    >
+                      Import Wallet
+                    </button>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-1">
@@ -263,10 +287,20 @@ const App = () => {
                   {/* Container for all actions */}
                   <div className="flex gap-3 mr-4">
                     {" "}
-                    <Button variant="primary" icon={SendIcon}>
+                    <Button
+                      variant="primary"
+                      icon={SendIcon}
+                      onClick={() => setActiveModal("send")}
+                      disabled={!unlockedWallet}
+                    >
                       Send
                     </Button>
-                    <Button variant="ghost" icon={ReceiveIcon}>
+                    <Button
+                      variant="ghost"
+                      icon={ReceiveIcon}
+                      onClick={() => setActiveModal("receive")}
+                      disabled={!unlockedWallet}
+                    >
                       Receive
                     </Button>
                   </div>
@@ -382,6 +416,26 @@ const App = () => {
           onSuccess={() => {
             loadWallets();
           }}
+        />
+      )}
+
+      {activeModal === "send" && unlockedWallet && (
+        <SendModal
+          onClose={() => setActiveModal(null)}
+          onSuccess={() => {
+            // Refresh data after sending
+            setTimeout(() => {
+              handleRefresh();
+            }, 500);
+          }}
+          currentBalance={balance}
+        />
+      )}
+
+      {activeModal === "receive" && unlockedWallet && (
+        <ReceiveModal
+          onClose={() => setActiveModal(null)}
+          address={unlockedWalletPk}
         />
       )}
 

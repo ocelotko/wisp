@@ -12,6 +12,8 @@ use wallet::account;
 use wallet::constants::WALLET_DIR;
 use wallet::core::Core;
 use wallet::network;
+use wallet::types::FeeType;
+use wisp_core::currency::Amount;
 mod wallet;
 
 struct AppState {
@@ -150,6 +152,44 @@ async fn get_wallet_balance(state: tauri::State<'_, AppState>) -> Result<u64, St
         .sum();
 
     Ok(total_balance)
+}
+
+#[tauri::command]
+async fn send_funds_command(
+    state: tauri::State<'_, AppState>,
+    is_send_max: bool,
+    recipient_public_key_str: String,
+    amount_str: String, // amount in WISP as a string, e.g., "1.23"
+    fee_type: FeeType,
+    fee_value_raw: u64,
+    password: String,
+) -> Result<(), String> {
+    let amount_to_send = if is_send_max {
+        Amount::zero() // It will be recalculated inside send_funds
+    } else {
+        // Parse from string like "1.23" to smallest unit
+        let amount_f64 = amount_str
+            .parse::<f64>()
+            .map_err(|_| "Invalid amount format. Must be a number.".to_string())?;
+        if amount_f64 < 0.0 {
+            return Err("Amount cannot be negative.".to_string());
+        }
+        let amount_smallest_unit = (amount_f64 * 100_000_000.0).round() as u64;
+        Amount::from_smallest_unit(amount_smallest_unit)
+    };
+
+    wallet::transaction::send_funds(
+        &state.core,
+        is_send_max,
+        recipient_public_key_str,
+        amount_to_send,
+        fee_type,
+        fee_value_raw,
+        &password,
+        &state.config_path,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -330,7 +370,8 @@ fn main() {
             get_wallet_balance,
             get_recent_transactions,
             get_balance_history,
-            get_current_wallet_info
+            get_current_wallet_info,
+            send_funds_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
