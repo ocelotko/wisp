@@ -1,9 +1,7 @@
 import { memo, useState } from "react";
 import Button from "./Button";
 import IconButton from "./IconButton";
-// A QR code library like 'qrcode.react' would be used here.
-// For this example, we'll just show a placeholder.
-// import QRCode from "qrcode.react";
+import { QRCodeSVG } from "qrcode.react";
 
 interface Props {
   onClose: () => void;
@@ -65,10 +63,12 @@ export const ReceiveModal = memo(({ onClose, address }: Props) => {
 
         <div className="bg-dark-surfaceContainer p-6 rounded-3xl flex flex-col items-center justify-center">
           <div className="w-48 h-48 bg-white rounded-2xl flex items-center justify-center mb-6">
-            {/* <QRCode value={address || ""} size={170} bgColor="#FFFFFF" fgColor="#000000" /> */}
-            <p className="text-black text-xs font-mono p-4 text-center">
-              Install 'qrcode.react' to show a QR code here.
-            </p>
+            <QRCodeSVG
+              value={address || ""}
+              size={176}
+              bgColor={"#FFFFFF"}
+              fgColor={"#000000"}
+            />
           </div>
 
           <div className="w-full bg-dark-surfaceContainerLow border border-dark-outlineVariant rounded-xl px-4 py-3 text-dark-onSurface flex items-center gap-2">
