@@ -137,6 +137,7 @@ async fn wallet_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()>
 
         let wallet_options = vec![
             "Funds management",
+            "Address & Watch-list management",
             "Network and blockchain",
             "Security and backup",
             "Wallet settings and info",
@@ -153,6 +154,13 @@ async fn wallet_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()>
                 }
             }
 
+            "Address & Watch-list management" => {
+                if let Err(e) = funds::address_management(Arc::clone(&core)).await {
+                    error!("Address management failed: {}", e);
+                    println!("\nError: {}", e);
+                    pause();
+                }
+            }
             "Network and blockchain" => {
                 if let Err(e) = network_and_blockchain(Arc::clone(&core), config_path).await {
                     error!("Network and blockchain failed: {}", e);

@@ -49,10 +49,6 @@ struct Args {
     /// sled database directory location.
     db_path: String,
 
-    #[argh(switch)]
-    /// perform database migration to fix total supply.
-    migrate_db: bool,
-
     #[argh(option)]
     /// connect to a Tor control port to create a hidden service (e.g. "127.0.0.1:9051").
     tor_control: Option<String>,
@@ -141,27 +137,7 @@ async fn run_node(mut args: Args) -> Result<()> {
 
     let mut blockchain_instance = Blockchain::new(db);
 
-    if args.migrate_db {
-        info!("Starting database migration...");
-        blockchain_instance.migrate_total_supply()?;
-    }
-
     blockchain_instance.load_from_db()?;
-
-    // Pre-warm DAA cache to speed up target calculation and API responses.
-    let height = blockchain_instance.block_height()?;
-    let start = height.saturating_sub(wisp_core::DAA_WINDOW as u64);
-    info!(
-        "Pre-warming DAA cache from block {} to {}...",
-        start, height
-    );
-    for i in start..=height {
-        if let Some(block) = blockchain_instance.get_block_by_index(i)? {
-            blockchain_instance
-                .daa_cache
-                .insert(i, (block.header.timestamp, block.header.target));
-        }
-    }
 
     // Attempt UPnP or use manual public address if not already set by Tor.
     if PUBLIC_ADDR.get().is_none() {

@@ -7,6 +7,8 @@ use inquire::{Confirm, Select};
 use log::{error, info};
 use std::path::PathBuf;
 use std::sync::Arc;
+use wisp_core::address::Address;
+use wisp_core::transactions::Script;
 use wisp_core::{currency::Amount, network::TransactionStatus};
 
 pub async fn settings_and_info(
@@ -68,7 +70,11 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
         Ok(wallet) => {
             println!("\n--- Wallet Info ---");
             println!("Wallet Name:         {}", wallet.name);
-            println!("Public Key:          {}", wallet.public_key.fingerprint());
+            println!("Public Key (Hex):    {}", wallet.public_key.fingerprint());
+            println!(
+                "Classic Address:     {}",
+                Address::encode(&Script::Classic(wallet.public_key))
+            );
 
             println!("\n--- Network Info ---");
             let config_guard = core.config.lock().await;
@@ -79,6 +85,7 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
             let transactions_guard = core.transactions.read().await;
             let utxos_guard = core.utxos.read().await;
             let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
+            let pk_hash_bytes = wisp_core::address::Address::hash160(&wallet.public_key);
 
             let mut pending_net_change: i128 = 0;
             let mut pending_tx_count = 0;
@@ -90,12 +97,24 @@ async fn get_info(core: &Core) -> Result<(), anyhow::Error> {
 
                     for input in &tx_info.transaction.inputs {
                         if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
-                            pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
+                            let is_mine = spent_utxo.script.is_relevant_to(
+                                &wallet.public_key,
+                                &pk_hash_bytes,
+                                &wallet.script_hashes,
+                            );
+                            if is_mine {
+                                pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
+                            }
                         }
                     }
 
                     for output in &tx.outputs {
-                        if output.pubkey == wallet.public_key {
+                        let is_mine = output.script.is_relevant_to(
+                            &wallet.public_key,
+                            &pk_hash_bytes,
+                            &wallet.script_hashes,
+                        );
+                        if is_mine {
                             pending_net_change += output.value.as_smallest_unit() as i128;
                         }
                     }

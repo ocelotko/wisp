@@ -7,8 +7,39 @@ use crate::{
 use anyhow::Result;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::hash::Hash as StdHash;
+
+#[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash)]
+pub enum Script {
+    /// Classic (P2PK): Hardcoded Public Key
+    Classic(PublicKey),
+    /// Shadow (P2PKH): Hashed Public Key
+    Shadow(Hash),
+    /// Shadow-Script (P2SH): Hashed Script
+    ShadowScript(Hash),
+    /// Aurora (P2WPKH): Modern Witness Hashed PK
+    Aurora(Hash),
+    /// Aurora-Script (P2WSH): Modern Witness Hashed Script
+    AuroraScript(Hash),
+}
+
+impl Script {
+    /// Checks if this script belongs to the given public key or is present in the set of known hashes.
+    pub fn is_relevant_to(
+        &self,
+        pubkey: &PublicKey,
+        pk_hash_bytes: &[u8],
+        known_hashes: &HashSet<Hash>,
+    ) -> bool {
+        match self {
+            Script::Classic(pk) => pk == pubkey,
+            Script::Shadow(h) | Script::Aurora(h) => h.as_bytes()[..20] == pk_hash_bytes[..20],
+            Script::ShadowScript(h) | Script::AuroraScript(h) => known_hashes.contains(h),
+        }
+    }
+}
 
 /// Represents a transaction, which is a collection of inputs and outputs.
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -36,6 +67,9 @@ impl fmt::Display for OutPoint {
 pub struct TransactionInput {
     pub outpoint: OutPoint,
     pub signature: Option<Signature>,
+    pub public_key: Option<PublicKey>, // Added to carry the PK for Shadow/Aurora
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redeem_script: Option<Vec<u8>>, // For ShadowScript/AuroraScript
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub coinbase_data: Option<Vec<u8>>,
@@ -44,7 +78,13 @@ pub struct TransactionInput {
 #[derive(Encode, Decode, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, StdHash, Default)]
 pub struct TransactionOutput {
     pub value: Amount,
-    pub pubkey: PublicKey,
+    pub script: Script,
+}
+
+impl Default for Script {
+    fn default() -> Self {
+        Script::Classic(PublicKey::default())
+    }
 }
 
 use crate::sha256::{hash, witness_hash, Hashable, WitnessHashable};
@@ -60,7 +100,13 @@ impl Hashable for OutPoint {
 impl Hashable for TransactionOutput {
     fn update_hasher(&self, hasher: &mut Sha256) {
         self.value.update_hasher(hasher);
-        self.pubkey.update_hasher(hasher);
+        match &self.script {
+            Script::Classic(pk) => pk.update_hasher(hasher),
+            Script::Shadow(h) => h.update_hasher(hasher),
+            Script::ShadowScript(h) => h.update_hasher(hasher),
+            Script::Aurora(h) => h.update_hasher(hasher),
+            Script::AuroraScript(h) => h.update_hasher(hasher),
+        }
     }
 }
 
@@ -84,6 +130,12 @@ impl WitnessHashable for Transaction {
             input.outpoint.update_hasher(hasher);
             if let Some(sig) = &input.signature {
                 hasher.update(sig.0.to_bytes());
+            }
+            if let Some(pk) = &input.public_key {
+                pk.update_hasher(hasher);
+            }
+            if let Some(rs) = &input.redeem_script {
+                hasher.update(rs);
             }
         }
         for output in &self.outputs {
@@ -112,6 +164,8 @@ impl Transaction {
                 .map(|outpoint| TransactionInput {
                     outpoint: *outpoint,
                     signature: None,
+                    public_key: Some(private_key.public_key()),
+                    redeem_script: None,
                     coinbase_data: None,
                 })
                 .collect(),
@@ -127,6 +181,8 @@ impl Transaction {
                 .map(|outpoint| TransactionInput {
                     outpoint: *outpoint,
                     signature: Some(signature.clone()),
+                    public_key: Some(private_key.public_key()),
+                    redeem_script: None,
                     coinbase_data: None,
                 })
                 .collect(),

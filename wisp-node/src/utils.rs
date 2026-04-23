@@ -136,7 +136,7 @@ async fn perform_handshake(
         Ok(Ok(Message::P2P(P2PMessage::NodeList(child_nodes)))) => {
             info!("Received NodeList from {}: {:?}", node_addr, child_nodes);
 
-            for child in child_nodes {
+            for child in child_nodes.into_iter().take(100) {
                 if child != node_addr && !crate::NODES.contains_key(&child) {
                     debug!("Discovered new peer: {}", child);
                     discovered_peers.push(child);

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use std::{fs, sync::Arc};
@@ -26,8 +26,8 @@ use wisp_core::{
     network::WalletTransactionInfo,
     network::{ChainMessage, Message, TransactionStatus, WalletMessage},
     sha256::{hash, Hash},
-    signatures::{PrivateKey, PublicKey},
-    transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
+    signatures::PrivateKey,
+    transactions::{OutPoint, Script, Transaction, TransactionInput, TransactionOutput},
 };
 
 use crate::wallet::{config::Config, constants::*, storage::SavedWallet};
@@ -196,6 +196,7 @@ impl Core {
             public_key,
             salt,
             encrypted_seed_phrase,
+            script_hashes: HashSet::new(),
         };
 
         new_wallet.save_to_file(password)?;
@@ -245,6 +246,7 @@ impl Core {
             public_key,
             salt,
             encrypted_seed_phrase: None,
+            script_hashes: HashSet::new(),
         };
 
         new_wallet.save_to_file(password)?;
@@ -301,6 +303,7 @@ impl Core {
             public_key,
             salt,
             encrypted_seed_phrase,
+            script_hashes: HashSet::new(),
         };
 
         new_wallet.save_to_file(password)?;
@@ -394,6 +397,97 @@ impl Core {
         debug!("load_wallet: Calling fetch_wallet_state...");
         self.fetch_wallet_state().await?;
         info!("Wallet '{}' loaded and state fetched.", name);
+        Ok(())
+    }
+
+    /// Adds a custom script address (Aurora/Shadow) to the wallet's watch list.
+    pub async fn add_watched_address(&self, address: &str, password: &str) -> Result<()> {
+        let script =
+            wisp_core::address::Address::decode(address).context("Invalid address format")?;
+
+        let hash = match script {
+            Script::Classic(_) => {
+                return Err(anyhow!(
+                    "Classic addresses are managed via private keys. Use 'import-key' instead."
+                ));
+            }
+            Script::Shadow(h)
+            | Script::ShadowScript(h)
+            | Script::Aurora(h)
+            | Script::AuroraScript(h) => h,
+        };
+
+        let mut wallets_guard = self.wallets.lock().await;
+        let current_wallet_name = self
+            .config
+            .lock()
+            .await
+            .current_wallet_name
+            .clone()
+            .ok_or_else(|| anyhow!("No wallet currently loaded"))?;
+
+        if let Some(wallet) = wallets_guard
+            .iter_mut()
+            .find(|w| w.name == current_wallet_name)
+        {
+            if wallet.script_hashes.insert(hash) {
+                let wallet_to_save = wallet.clone();
+                let password_clone = password.to_string();
+
+                tokio::task::spawn_blocking(move || wallet_to_save.save_to_file(&password_clone))
+                    .await??;
+
+                info!("Address {} added to watch list.", address);
+                // Refresh state immediately to show new funds
+                drop(wallets_guard);
+                self.fetch_wallet_state().await?;
+            } else {
+                warn!("Address is already in the watch list.");
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a custom script address from the wallet's watch list.
+    pub async fn remove_watched_address(&self, address: &str, password: &str) -> Result<()> {
+        let script =
+            wisp_core::address::Address::decode(address).context("Invalid address format")?;
+
+        let hash = match script {
+            Script::Classic(_) => {
+                return Err(anyhow!(
+                    "Classic addresses cannot be removed from watch-list."
+                ));
+            }
+            Script::Shadow(h)
+            | Script::ShadowScript(h)
+            | Script::Aurora(h)
+            | Script::AuroraScript(h) => h,
+        };
+
+        let mut wallets_guard = self.wallets.lock().await;
+        let current_wallet_name = self
+            .config
+            .lock()
+            .await
+            .current_wallet_name
+            .clone()
+            .ok_or_else(|| anyhow!("No wallet currently loaded"))?;
+
+        if let Some(wallet) = wallets_guard
+            .iter_mut()
+            .find(|w| w.name == current_wallet_name)
+        {
+            if wallet.script_hashes.remove(&hash) {
+                let wallet_to_save = wallet.clone();
+                let password_clone = password.to_string();
+                tokio::task::spawn_blocking(move || wallet_to_save.save_to_file(&password_clone))
+                    .await??;
+                info!("Address {} removed from watch list.", address);
+                drop(wallets_guard);
+                self.fetch_wallet_state().await?;
+            }
+        }
         Ok(())
     }
 
@@ -617,16 +711,24 @@ impl Core {
             wallet_public_key.fingerprint()
         );
 
-        debug!("fetch_wallet_state: Attempting to get connected stream.");
-        let mut stream_guard = self.get_connected_stream().await?;
+        let known_script_hashes = current_wallet.script_hashes.clone();
+
+        let mut stream_guard = self
+            .get_connected_stream()
+            .await
+            .context("Failed to get connected stream for wallet state fetch")?;
+
         debug!("fetch_wallet_state: Connected stream obtained.");
         let stream_ref = stream_guard
             .as_mut()
             .expect("Expected an active TCP stream after connection attempt");
         let response_timeout = self.get_node_response_timeout().await;
 
-        let fetch_state_msg =
-            Message::Wallet(WalletMessage::FetchWalletState(wallet_public_key.clone()));
+        let fetch_state_msg = Message::Wallet(WalletMessage::FetchWalletState(
+            wallet_public_key.clone(),
+            known_script_hashes,
+        ));
+
         if let Err(e) = fetch_state_msg.send_async(stream_ref).await {
             *stream_guard = None;
             return Err(anyhow!("Failed to send FetchWalletState message: {}", e));
@@ -687,8 +789,10 @@ impl Core {
     pub async fn get_total_balance(&self) -> Result<Amount> {
         let utxos_guard = self.utxos.read().await;
         let transactions_guard = self.transactions.read().await;
-        let wallet_public_key = self.get_current_wallet().await?.public_key;
+        let current_wallet = self.get_current_wallet().await?;
+        let wallet_public_key = current_wallet.public_key;
         let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
+        let pk_hash_bytes = wisp_core::address::Address::hash160(&wallet_public_key);
 
         let mut pending_net_change: i128 = 0;
         for tx_info in transactions_guard.values() {
@@ -697,14 +801,24 @@ impl Core {
 
                 for input in &tx.inputs {
                     if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
-                        if spent_utxo.pubkey == wallet_public_key {
+                        let is_mine = spent_utxo.script.is_relevant_to(
+                            &wallet_public_key,
+                            &pk_hash_bytes,
+                            &current_wallet.script_hashes,
+                        );
+                        if is_mine {
                             pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
                         }
                     }
                 }
 
                 for output in &tx.outputs {
-                    if output.pubkey == wallet_public_key {
+                    let is_mine = output.script.is_relevant_to(
+                        &wallet_public_key,
+                        &pk_hash_bytes,
+                        &current_wallet.script_hashes,
+                    );
+                    if is_mine {
                         pending_net_change += output.value.as_smallest_unit() as i128;
                     }
                 }
@@ -729,14 +843,14 @@ impl Core {
         _config_path: &PathBuf,
     ) -> Result<()> {
         let current_wallet = self.get_current_wallet().await?;
+        let pk_hash_bytes = wisp_core::address::Address::hash160(&current_wallet.public_key);
         let sender_private_key = self
             .decrypt_current_wallet_private_key(password)
             .await
             .context("Incorrect wallet password or decryption failed")?;
 
-        let recipient_public_key = recipient_public_key_str
-            .parse::<PublicKey>()
-            .context("Invalid recipient public key format")?;
+        let recipient_script = wisp_core::address::Address::decode(&recipient_public_key_str)
+            .context("Invalid recipient address format")?;
 
         let intended_fee = if !is_send_max {
             match fee_type {
@@ -770,6 +884,8 @@ impl Core {
                 selected_inputs.push(TransactionInput {
                     outpoint: *outpoint,
                     signature: None,
+                    public_key: Some(sender_private_key.public_key()),
+                    redeem_script: None,
                     coinbase_data: None,
                 });
                 current_input_sum = current_input_sum
@@ -807,7 +923,7 @@ impl Core {
         let mut outputs: Vec<TransactionOutput> = Vec::new();
         outputs.push(TransactionOutput {
             value: final_amount_to_send,
-            pubkey: recipient_public_key,
+            script: recipient_script,
         });
 
         let total_to_distribute = final_amount_to_send
@@ -819,9 +935,13 @@ impl Core {
 
         if change_amount > Amount::zero() {
             outputs.push(TransactionOutput {
-                // Send the change back to our own wallet.
+                // Send the change back to our own wallet using the modern Aurora format.
                 value: change_amount,
-                pubkey: current_wallet.public_key,
+                script: {
+                    let mut h_bytes = [0u8; 32];
+                    h_bytes[..20].copy_from_slice(&pk_hash_bytes);
+                    Script::Aurora(Hash::from_bytes(&h_bytes))
+                },
             });
         }
 
@@ -906,7 +1026,12 @@ impl Core {
                     utxos_guard.remove(&input.outpoint);
                 }
                 for (vout, output) in new_transaction.outputs.iter().enumerate() {
-                    if output.pubkey == current_wallet.public_key {
+                    let is_mine = output.script.is_relevant_to(
+                        &current_wallet.public_key,
+                        &pk_hash_bytes,
+                        &current_wallet.script_hashes,
+                    );
+                    if is_mine {
                         // This is our change output, add it to our spendable UTXOs.
                         utxos_guard.insert(
                             OutPoint {

@@ -1,6 +1,7 @@
 use crate::{
     blockchain::{Block, Blockchain},
     currency::Amount,
+    transactions::Script,
     transactions::{OutPoint, TransactionOutput},
     utils::calculate_block_reward,
     utils::MerkleRoot,
@@ -12,6 +13,7 @@ use bincode::config::standard as bincode_config;
 use chrono::{Duration as ChronoDuration, Utc};
 use ecdsa::signature::Verifier;
 use log::{debug, info};
+use ripemd::Digest;
 use sled::transaction::TransactionalTree;
 use std::collections::{HashMap, HashSet};
 
@@ -291,16 +293,57 @@ impl Block {
 
                 inputs_in_block.insert(*outpoint);
 
-                let is_signature_valid = match input.signature.as_ref() {
-                    Some(sig) => prev_output
-                        .pubkey
-                        .0
-                        .verify(&txid.as_bytes(), &sig.0)
-                        .is_ok(),
-                    None => false,
+                let is_spend_valid = match &prev_output.script {
+                    Script::Classic(pk) => match &input.signature {
+                        Some(sig) => pk.0.verify(&txid.as_bytes(), &sig.0).is_ok(),
+                        None => false,
+                    },
+                    Script::Shadow(hash) | Script::Aurora(hash) => {
+                        match (&input.signature, &input.public_key) {
+                            (Some(sig), Some(pk)) => {
+                                let hashed_pk = crate::address::Address::hash160(pk);
+                                if hashed_pk != hash.as_bytes()[..20] {
+                                    false
+                                } else {
+                                    pk.0.verify(&txid.as_bytes(), &sig.0).is_ok()
+                                }
+                            }
+                            _ => false,
+                        }
+                    }
+                    Script::ShadowScript(hash) | Script::AuroraScript(hash) => {
+                        match &input.redeem_script {
+                            Some(rs) => {
+                                let hashed_rs = crate::sha256::hash(rs);
+                                // ShadowScript uses 20-byte RIPEMD, AuroraScript uses 32-byte SHA
+                                let hash_matches =
+                                    if matches!(prev_output.script, Script::ShadowScript(_)) {
+                                        let mut ripemd = ripemd::Ripemd160::new();
+                                        ripemd.update(hashed_rs.as_bytes());
+                                        ripemd.finalize().to_vec() == hash.as_bytes()[..20]
+                                    } else {
+                                        hashed_rs == *hash
+                                    };
+
+                                if !hash_matches {
+                                    false
+                                } else {
+                                    // In absence of VM, verify sig against public_key if provided
+                                    match (&input.signature, &input.public_key) {
+                                        (Some(sig), Some(pk)) => {
+                                            pk.0.verify(&txid.as_bytes(), &sig.0).is_ok()
+                                        }
+                                        (None, _) => true, // Data-only lock
+                                        _ => false,
+                                    }
+                                }
+                            }
+                            None => false,
+                        }
+                    }
                 };
 
-                if !is_signature_valid {
+                if !is_spend_valid {
                     let sig_status = if input.signature.is_none() {
                         "missing"
                     } else {

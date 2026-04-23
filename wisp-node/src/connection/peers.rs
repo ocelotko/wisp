@@ -9,6 +9,7 @@ pub async fn handle_discover_nodes(stream: &mut TcpStream) -> Result<()> {
 
     let nodes: Vec<String> = crate::NODES
         .iter()
+        .take(100) // Prevent DoS by limiting shared addresses
         .map(|peer_ref| peer_ref.key().clone())
         .collect();
     Message::P2P(P2PMessage::NodeList(nodes))

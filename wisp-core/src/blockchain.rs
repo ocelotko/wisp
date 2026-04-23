@@ -5,7 +5,7 @@ use crate::{
     sha256::{hash, Hash, Hashable, Sha256},
     signatures::PublicKey,
     storage::DBKeys,
-    transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
+    transactions::{OutPoint, Script, Transaction, TransactionInput, TransactionOutput},
     utils::MerkleRoot,
     utxo::UtxoSet,
     U256,
@@ -279,11 +279,13 @@ impl Blockchain {
                     vout: u32::MAX,
                 },
                 signature: None,
+                public_key: None,
+                redeem_script: None,
                 coinbase_data: Some(coinbase_data),
             }],
             vec![TransactionOutput {
                 value: coinbase_value,
-                pubkey: *reward_pubkey,
+                script: Script::Classic(*reward_pubkey),
             }],
         );
 

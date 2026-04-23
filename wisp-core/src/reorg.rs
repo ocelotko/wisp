@@ -2,7 +2,7 @@ use crate::{
     blockchain::{Block, Blockchain},
     currency::Amount,
     sha256::Hash,
-    storage::DBKeys,
+    storage::DBKeys, transactions::{OutPoint, Script},
 };
 use anyhow::{anyhow, Result};
 use bincode::config::standard as bincode_config;
@@ -74,9 +74,24 @@ impl Blockchain {
                                 tx_db.remove(DBKeys::tx_by_order(new_tx_count))?;
                                 tx_db.remove(DBKeys::tx_location(&tx_hash))?;
 
-                                for output in &tx.outputs {
-                                    let key = DBKeys::history(&output.pubkey.fingerprint());
-                                    Self::remove_hash_from_history_list(tx_db, &key, &tx_hash)?;
+                                for (vout, output) in tx.outputs.iter().enumerate() {
+                                    let history_key = match &output.script {
+                                        Script::Classic(pk) => Some(DBKeys::history(&pk.fingerprint())),
+                                        Script::Shadow(h) | Script::ShadowScript(h) | Script::Aurora(h) | Script::AuroraScript(h) => {
+                                            Some(DBKeys::history(&h.to_string()))
+                                        }
+                                    };
+                                    if let Some(key) = history_key {
+                                        Self::remove_hash_from_history_list(tx_db, &key, &tx_hash)?;
+                                    }
+
+                                    let addr_id = match &output.script {
+                                        Script::Classic(pk) => Some(pk.fingerprint()),
+                                        Script::Shadow(h) | Script::ShadowScript(h) | Script::Aurora(h) | Script::AuroraScript(h) => Some(h.to_string()),
+                                    };
+                                    if let Some(id) = addr_id {
+                                        crate::storage::remove_outpoint_from_address_utxos(tx_db, &id, &OutPoint { txid: tx_hash, vout: vout as u32 })?;
+                                    }
                                 }
                             }
 
@@ -91,10 +106,16 @@ impl Blockchain {
                                             block_to_revert.index
                                         ))
                                     })?;
-                                    let key = DBKeys::history(&output.pubkey.fingerprint());
-                                    Self::remove_hash_from_history_list(
-                                        tx_db, &key, &tx_hash,
-                                    )?;
+
+                                    let fp = match (&output.script, &input.public_key) {
+                                        (Script::Classic(pk), _) => Some(pk.fingerprint()),
+                                        (_, Some(pk)) => Some(pk.fingerprint()),
+                                        _ => None,
+                                    };
+                                    if let Some(fingerprint) = fp {
+                                        let key = DBKeys::history(&fingerprint);
+                                        Self::remove_hash_from_history_list(tx_db, &key, &tx_hash)?;
+                                    }
                                 }
                             }
                         }
@@ -393,8 +414,27 @@ impl Blockchain {
                 .map_err(|e| ReorgError::Anyhow(e.into()))?;
 
             for output in &tx.outputs {
-                let key = DBKeys::history(&output.pubkey.fingerprint());
-                Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                let history_key = match &output.script {
+                    Script::Classic(pk) => Some(DBKeys::history(&pk.fingerprint())),
+                    Script::Shadow(h) | Script::ShadowScript(h) | Script::Aurora(h) | Script::AuroraScript(h) => {
+                        Some(DBKeys::history(&h.to_string()))
+                    }
+                };
+                if let Some(key) = history_key {
+                    Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                }
+            }
+
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                let addr_id = match &output.script {
+                    Script::Classic(pk) => Some(pk.fingerprint()),
+                    Script::Shadow(h) | Script::ShadowScript(h) | Script::Aurora(h) | Script::AuroraScript(h) => {
+                        Some(h.to_string())
+                    }
+                };
+                if let Some(id) = addr_id {
+                    crate::storage::add_outpoint_to_address_utxos(tx_db, &id, &OutPoint { txid: tx_hash, vout: vout as u32 })?;
+                }
             }
 
             if !tx.is_coinbase() {
@@ -411,8 +451,23 @@ impl Blockchain {
                         ))
                     })?;
 
-                    let key = DBKeys::history(&spent_output.pubkey.fingerprint());
-                    Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                    let addr_id = match &spent_output.script {
+                        Script::Classic(pk) => Some(pk.fingerprint()),
+                        Script::Shadow(h) | Script::ShadowScript(h) | Script::Aurora(h) | Script::AuroraScript(h) => Some(h.to_string()),
+                    };
+                    if let Some(id) = addr_id {
+                        crate::storage::remove_outpoint_from_address_utxos(tx_db, &id, &input.outpoint)?;
+                    }
+
+                    let fp = match (&spent_output.script, &input.public_key) {
+                        (Script::Classic(pk), _) => Some(pk.fingerprint()),
+                        (_, Some(pk)) => Some(pk.fingerprint()),
+                        _ => None,
+                    };
+                    if let Some(fingerprint) = fp {
+                        let key = DBKeys::history(&fingerprint);
+                        Self::add_hash_to_history_list(tx_db, &key, &tx_hash)?;
+                    }
                 }
 
                 tx_db.insert(DBKeys::tx_by_order(tx_count), tx_hash_bytes.clone())?;

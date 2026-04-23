@@ -28,18 +28,18 @@ pub enum BroadcastFilter {
 pub async fn broadcast(message: &Message, filter: BroadcastFilter, log_verb: &str) {
     let mut peers_to_remove = Vec::new();
 
-    for mut peer in crate::NODES.iter_mut() {
-        let should_skip = match &filter {
-            BroadcastFilter::All => false,
-            BroadcastFilter::AllExcept(arc) => Arc::ptr_eq(peer.value(), arc),
-        };
+    // Collect Arcs first to avoid holding DashMap shard locks during I/O
+    let peers: Vec<(String, Arc<AsyncMutex<TcpStream>>)> = crate::NODES
+        .iter()
+        .filter(|peer| match &filter {
+            BroadcastFilter::All => true,
+            BroadcastFilter::AllExcept(arc) => !Arc::ptr_eq(peer.value(), arc),
+        })
+        .map(|p| (p.key().clone(), p.value().clone()))
+        .collect();
 
-        if should_skip {
-            continue;
-        }
-
-        let addr = peer.key().clone();
-        let mut stream_lock = peer.value_mut().lock().await;
+    for (addr, stream_arc) in peers {
+        let mut stream_lock = stream_arc.lock().await;
         if let Err(e) = message.send_async(&mut *stream_lock).await {
             warn!(
                 "Failed to broadcast {} to {}: {}. Marking for removal.",
@@ -218,11 +218,12 @@ pub async fn handle_connection(
                 transactions::handle_submit_transaction(stream_arc.clone(), tx, blockchain.clone())
                     .await
             }
-            Message::Wallet(WalletMessage::FetchWalletState(pubkey)) => {
+            Message::Wallet(WalletMessage::FetchWalletState(pubkey, script_hashes)) => {
                 let mut stream_lock = stream_arc.lock().await;
                 transactions::handle_fetch_wallet_state(
                     &mut *stream_lock,
                     pubkey,
+                    script_hashes,
                     blockchain.clone(),
                 )
                 .await

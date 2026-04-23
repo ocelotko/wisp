@@ -3,7 +3,7 @@ use crate::{
     currency::Amount,
     sha256::Hash,
     signatures::PublicKey,
-    transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
+    transactions::{OutPoint, Script, Transaction, TransactionInput, TransactionOutput},
 };
 
 use anyhow::{Context, Result as AnyhowResult};
@@ -24,7 +24,8 @@ impl MerkleRoot {
         let mut layer: Vec<Hash> = vec![];
 
         for transaction in transactions {
-            layer.push(transaction.wtxid()?);
+            // Use txid (malleability resistant) for the header Merkle Root
+            layer.push(transaction.txid()?);
         }
 
         if layer.is_empty() {
@@ -101,11 +102,13 @@ pub fn genesis_block() -> AnyhowResult<Block> {
                 vout: u32::MAX,
             },
             signature: None,
+            public_key: None,
+            redeem_script: None,
             coinbase_data: Some(coinbase_data),
         }],
         vec![TransactionOutput {
             value: Amount::from_smallest_unit(crate::INITIAL_BLOCK_REWARD_SMALLEST_UNITS),
-            pubkey: PublicKey(genesis_verifying_key),
+            script: Script::Classic(PublicKey(genesis_verifying_key)),
         }],
     );
 

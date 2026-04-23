@@ -7,8 +7,11 @@ use log::error;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use wisp_core::address::Address;
 use wisp_core::currency::Amount;
 use wisp_core::network::TransactionStatus;
+use wisp_core::sha256::Hash;
+use wisp_core::transactions::Script;
 
 pub async fn funds_management(core: Arc<Core>, config_path: &PathBuf) -> Result<()> {
     loop {
@@ -50,6 +53,78 @@ pub async fn funds_management(core: Arc<Core>, config_path: &PathBuf) -> Result<
                 error!("Send/Receive menu selection error: Invalid selection or prompt error.");
                 println!("Invalid selection or prompt error.");
                 pause();
+            }
+        }
+    }
+}
+
+pub async fn address_management(core: Arc<Core>) -> Result<()> {
+    loop {
+        clear_terminal();
+        let balance_value = core.get_total_balance().await;
+        display_heading_with_wallet(
+            core.get_current_wallet()
+                .await
+                .ok()
+                .map(|w| w.name)
+                .as_deref(),
+            balance_value.ok(),
+        );
+
+        let options = vec![
+            "Show my addresses (All formats)",
+            "View current watch-list",
+            "Add address to watch-list",
+            "Remove address from watch-list",
+            "Back to wallet menu",
+        ];
+        let selection = Select::new("Address Management", options).prompt()?;
+
+        match selection {
+            "Show my addresses (All formats)" => receive_funds(&core).await?,
+            "View current watch-list" => {
+                let wallet = core.get_current_wallet().await?;
+                if wallet.script_hashes.is_empty() {
+                    println!("\nYour watch-list is empty.");
+                } else {
+                    println!("\n--- Current Watch-List ---");
+                    for h in &wallet.script_hashes {
+                        println!("- {}", Address::encode(&Script::AuroraScript(*h)));
+                    }
+                }
+                pause();
+            }
+            "Add address to watch-list" => {
+                let addr = Text::new("Enter Wisp address to watch:").prompt()?;
+                let password = prompt_password("Enter wallet password to save changes:", false)?;
+                match core.add_watched_address(&addr, &password).await {
+                    Ok(_) => {
+                        println!("Address successfully added to watch-list.");
+                        pause();
+                    }
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        pause();
+                    }
+                }
+            }
+            "Remove address from watch-list" => {
+                let addr = Text::new("Enter Wisp address to remove:").prompt()?;
+                let password = prompt_password("Enter wallet password to save changes:", false)?;
+                match core.remove_watched_address(&addr, &password).await {
+                    Ok(_) => {
+                        println!("Address successfully removed from watch-list.");
+                        pause();
+                    }
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        pause();
+                    }
+                }
+            }
+            "Back to wallet menu" => return Ok(()),
+            _ => {
+                return Ok(());
             }
         }
     }
@@ -200,8 +275,33 @@ async fn receive_funds(core: &Core) -> Result<(), anyhow::Error> {
 
     match core.get_current_wallet().await {
         Ok(wallet) => {
-            println!("\nYour public key (share this to receive funds):");
-            println!("{}", wallet.public_key.fingerprint());
+            let pk = wallet.public_key;
+            let hash_160 = wisp_core::address::Address::hash160(&pk);
+            let mut h_bytes = [0u8; 32];
+            h_bytes[..20].copy_from_slice(&hash_160);
+            let h = Hash::from_bytes(&h_bytes);
+
+            println!("\n--- Your Wallet Addresses ---");
+            println!(
+                "Aurora (Modern/SegWit):  {}",
+                Address::encode(&Script::Aurora(h))
+            );
+            println!(
+                "Shadow (Standard):       {}",
+                Address::encode(&Script::Shadow(h))
+            );
+            println!(
+                "Classic (Legacy/Keys):   {}",
+                Address::encode(&Script::Classic(pk))
+            );
+
+            println!("\nNote: Aurora is recommended for lower fees and better privacy.");
+            if !wallet.script_hashes.is_empty() {
+                println!(
+                    "(Watching {} additional custom scripts)",
+                    wallet.script_hashes.len()
+                );
+            }
         }
         Err(_) => println!("No wallet loaded."),
     }
@@ -235,6 +335,7 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
 
     let current_wallet = core.get_current_wallet().await?;
     let wallet_public_key = current_wallet.public_key.clone();
+    let pk_hash_bytes = wisp_core::address::Address::hash160(&wallet_public_key);
 
     println!(
         "Fetching transaction history for wallet: {}",
@@ -244,6 +345,8 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
     let mut display_items: Vec<TxDisplayItem> = Vec::new();
 
     let all_txs = core.transactions.read().await;
+    let script_hashes = &current_wallet.script_hashes;
+
     for tx_info in all_txs.values() {
         let tx = &tx_info.transaction;
         let tx_hash = tx.txid()?;
@@ -266,7 +369,12 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
-                    if spent_output.pubkey == wallet_public_key {
+                    let is_mine = spent_output.script.is_relevant_to(
+                        &wallet_public_key,
+                        &pk_hash_bytes,
+                        script_hashes,
+                    );
+                    if is_mine {
                         value_from_us = value_from_us
                             .checked_add(spent_output.value)
                             .context("Overflow calculating value from us in transaction history")?;
@@ -276,7 +384,11 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
         }
 
         for output in &tx.outputs {
-            if output.pubkey == wallet_public_key {
+            let is_mine =
+                output
+                    .script
+                    .is_relevant_to(&wallet_public_key, &pk_hash_bytes, script_hashes);
+            if is_mine {
                 value_to_us = value_to_us
                     .checked_add(output.value)
                     .context("value_to_us overflow")?;
@@ -300,14 +412,20 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
             let recipients: HashSet<_> = tx
                 .outputs
                 .iter()
-                .filter(|o| o.pubkey != wallet_public_key)
-                .map(|o| o.pubkey.fingerprint())
+                .filter(|o| {
+                    !o.script
+                        .is_relevant_to(&wallet_public_key, &pk_hash_bytes, script_hashes)
+                })
+                .map(|o| wisp_core::address::Address::encode(&o.script))
                 .collect();
 
             let amount_sent_to_others: Amount = tx
                 .outputs
                 .iter()
-                .filter(|o| o.pubkey != wallet_public_key)
+                .filter(|o| {
+                    !o.script
+                        .is_relevant_to(&wallet_public_key, &pk_hash_bytes, script_hashes)
+                })
                 .map(|o| o.value)
                 .sum();
 
@@ -348,8 +466,14 @@ async fn transaction_history(core: Arc<Core>) -> Result<(), anyhow::Error> {
                         .outputs
                         .get(i.outpoint.vout as usize)
                         .into_iter()
-                        .filter(|o| o.pubkey != wallet_public_key)
-                        .map(|o| o.pubkey.fingerprint())
+                        .filter(|o| {
+                            !o.script.is_relevant_to(
+                                &wallet_public_key,
+                                &pk_hash_bytes,
+                                script_hashes,
+                            )
+                        })
+                        .map(|o| wisp_core::address::Address::encode(&o.script))
                 })
                 .collect();
 

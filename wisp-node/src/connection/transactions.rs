@@ -1,11 +1,13 @@
 use anyhow::Result;
 use log::{debug, info, warn};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::{net::TcpStream, sync::RwLock};
 use wisp_core::{
     blockchain::Blockchain,
     network::{Message, WalletMessage, WalletStateSnapshot},
+    sha256::Hash,
     signatures::PublicKey,
     transactions::Transaction,
 };
@@ -52,6 +54,7 @@ pub async fn handle_submit_transaction(
 pub async fn handle_fetch_wallet_state(
     stream: &mut TcpStream,
     pubkey: PublicKey,
+    script_hashes: HashSet<Hash>,
     blockchain: Arc<RwLock<Blockchain>>,
 ) -> Result<()> {
     debug!(
@@ -60,8 +63,8 @@ pub async fn handle_fetch_wallet_state(
     );
 
     let blockchain_lock = blockchain.read().await;
-    let utxos = blockchain_lock.get_utxos_for_pubkey(&pubkey);
-    let transactions = blockchain_lock.get_wallet_transaction_history(&pubkey)?;
+    let utxos = blockchain_lock.get_utxos_for_pubkey(&pubkey, &script_hashes);
+    let transactions = blockchain_lock.get_wallet_transaction_history(&pubkey, &script_hashes)?;
 
     let snapshot = WalletStateSnapshot {
         transactions,

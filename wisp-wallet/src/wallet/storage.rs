@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 
 use crate::wallet::constants::*;
+use wisp_core::sha256::Hash;
 use wisp_core::signatures::PublicKey;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,6 +31,8 @@ pub struct SavedWallet {
     pub salt: Vec<u8>,
     #[serde(default)]
     pub encrypted_seed_phrase: Option<String>,
+    #[serde(default)]
+    pub script_hashes: HashSet<Hash>,
 }
 
 impl SavedWallet {
@@ -146,9 +150,9 @@ impl SavedWallet {
 
     pub fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<Vec<u8>> {
         let params = ParamsBuilder::new()
-            .t_cost(1)
+            .t_cost(3)
             .m_cost(65536)
-            .p_cost(1)
+            .p_cost(4)
             .build()
             .map_err(|_| anyhow::anyhow!("Failed to build Argon2 parameters"))?;
 

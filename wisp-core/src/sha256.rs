@@ -59,6 +59,12 @@ impl Hashable for [u8] {
     }
 }
 
+impl Hashable for Vec<u8> {
+    fn update_hasher(&self, hasher: &mut Sha256) {
+        hasher.update(self);
+    }
+}
+
 /// A private, generic function that performs the core double-SHA256 hashing logic.
 fn double_sha256_hash<F>(update_fn: F) -> Hash
 where

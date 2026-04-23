@@ -14,16 +14,29 @@ use crate::{
 };
 
 impl Blockchain {
-    pub fn get_utxos_for_pubkey(&self, pubkey: &PublicKey) -> Vec<(OutPoint, TransactionOutput)> {
-        self.utxo_set
-            .utxos
-            .iter()
-            .filter_map(|(outpoint, output)| {
-                if output.pubkey == *pubkey && !self.mempool_spent_utxos.contains(outpoint) {
-                    Some((*outpoint, output.clone()))
-                } else {
-                    None
-                }
+    pub fn get_utxos_for_pubkey(
+        &self,
+        pubkey: &PublicKey,
+        known_script_hashes: &HashSet<Hash>,
+    ) -> Vec<(OutPoint, TransactionOutput)> {
+        let mut outpoints = self
+            .get_utxo_outpoints_by_address_id(&pubkey.fingerprint())
+            .unwrap_or_default();
+
+        for script_hash in known_script_hashes {
+            if let Ok(list) = self.get_utxo_outpoints_by_address_id(&script_hash.to_string()) {
+                outpoints.extend(list);
+            }
+        }
+
+        outpoints
+            .into_iter()
+            .filter(|op| !self.mempool_spent_utxos.contains(op))
+            .filter_map(|op| {
+                self.utxo_set
+                    .utxos
+                    .get(&op)
+                    .map(|output| (op, output.clone()))
             })
             .collect()
     }
@@ -230,13 +243,19 @@ impl Blockchain {
     pub fn get_wallet_transaction_history(
         &self,
         pubkey: &PublicKey,
+        known_script_hashes: &HashSet<Hash>,
     ) -> Result<Vec<WalletTransactionInfo>> {
         const MAX_HISTORY_ITEMS: usize = 1000;
 
         let mut transaction_history_info = Vec::new();
         let mut seen_tx_hashes = HashSet::new();
+        let pk_hash_bytes = crate::address::Address::hash160(pubkey);
 
         let tx_hashes = self.get_transaction_hashes_by_pubkey_from_db(pubkey)?;
+        let mut tx_hashes = tx_hashes;
+        for script_hash in known_script_hashes {
+            tx_hashes.extend(self.get_transaction_hashes_by_hash_from_db(script_hash)?);
+        }
 
         for tx_hash in &tx_hashes {
             if seen_tx_hashes.insert(*tx_hash) && transaction_history_info.len() < MAX_HISTORY_ITEMS
@@ -273,17 +292,21 @@ impl Blockchain {
         }
 
         for (tx_hash, entry) in self.mempool.iter() {
-            let is_relevant = entry
-                .transaction
-                .outputs
-                .iter()
-                .any(|o| o.pubkey == *pubkey)
-                || entry.transaction.inputs.iter().any(|i| {
-                    self.utxo_set
-                        .utxos
-                        .get(&i.outpoint)
-                        .map_or(false, |o| o.pubkey == *pubkey)
-                });
+            let is_relevant = entry.transaction.outputs.iter().any(|output| {
+                output
+                    .script
+                    .is_relevant_to(pubkey, &pk_hash_bytes, known_script_hashes)
+            }) || entry.transaction.inputs.iter().any(|i| {
+                // Check if the input is spending a relevant UTXO
+                self.utxo_set
+                    .utxos
+                    .get(&i.outpoint)
+                    .map_or(false, |output| {
+                        output
+                            .script
+                            .is_relevant_to(pubkey, &pk_hash_bytes, known_script_hashes)
+                    })
+            });
 
             if is_relevant
                 && seen_tx_hashes.insert(*tx_hash)

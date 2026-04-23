@@ -9,14 +9,11 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine};
 use bip39::Mnemonic;
 use k256::ecdsa::SigningKey;
-use log::{debug, info};
+use log::info;
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 
-use wisp_core::{
-    sha256::hash,
-    signatures::{PrivateKey, PublicKey},
-};
+use wisp_core::{sha256::hash, signatures::PrivateKey};
 
 use crate::wallet::{constants::*, core::Core, network::fetch_wallet_state, storage::SavedWallet};
 

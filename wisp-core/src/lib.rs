@@ -5,12 +5,16 @@
 ///! used by node implementations, wallets, and other tools that need to
 ///! interact with the Wisp network at a low level.
 
+/// Handles Wisp address encoding (Classic, Shadow, Aurora).
+pub mod address;
 /// Manages the blockchain data structure, including blocks, headers, and chain state.
 pub mod blockchain;
 /// Defines the currency `Amount` type and handles currency-related arithmetic.
 pub mod currency;
 /// Implements the transaction memory pool for unconfirmed transactions.
 pub mod mempool;
+/// Contains database migration logic.
+pub mod migrations;
 /// Defines network messages for peer-to-peer communication.
 pub mod network;
 /// Contains proof-of-work and difficulty adjustment logic.

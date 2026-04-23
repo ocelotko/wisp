@@ -4,6 +4,7 @@ use crate::{
     blockchain::{Block, BlockHeader, Blockchain},
     currency::Amount,
     mempool::MempoolEntry,
+    reorg::ReorgError,
     sha256::Hash,
     signatures::PublicKey,
     transactions::{OutPoint, TransactionOutput},
@@ -14,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use bincode::config::standard as bincode_config;
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
-use sled::transaction::TransactionalTree;
+use sled::transaction::{ConflictableTransactionError, TransactionalTree};
 
 pub struct DBKeys;
 
@@ -24,6 +25,7 @@ impl DBKeys {
     pub const TIP_HASH: &'static [u8] = b"tip_hash";
     pub const TOTAL_TX_COUNT: &'static [u8] = b"total_tx_count";
     pub const TOTAL_SUPPLY: &'static [u8] = b"total_supply";
+    pub const DB_VERSION: &'static [u8] = b"db_version";
     pub const UTXO_SNAPSHOT: &'static [u8] = b"utxo_snapshot";
     pub const LAST_UTXO_SNAPSHOT_HEIGHT: &'static [u8] = b"last_utxo_snapshot_height";
     pub const UTXO_SNAPSHOT_CHECKSUM: &'static [u8] = b"utxo_snapshot_checksum";
@@ -52,6 +54,9 @@ impl DBKeys {
     pub fn history(pubkey_fingerprint: &str) -> Vec<u8> {
         format!("history_{}", pubkey_fingerprint).into_bytes()
     }
+    pub fn address_utxo(id: &str) -> Vec<u8> {
+        format!("addr_utxo_{}", id).into_bytes()
+    }
     pub fn prev_to_current(prev_hash: &Hash) -> Vec<u8> {
         format!("prev_to_current_{}", prev_hash).into_bytes()
     }
@@ -62,7 +67,61 @@ struct BlockUtxoChanges {
     inputs_to_remove: Vec<OutPoint>,
     outputs_to_add: Vec<(OutPoint, TransactionOutput)>,
 }
+
+pub(crate) fn add_outpoint_to_address_utxos(
+    tx_db: &TransactionalTree,
+    id: &str,
+    outpoint: &OutPoint,
+) -> Result<(), ConflictableTransactionError<ReorgError>> {
+    let key = DBKeys::address_utxo(id);
+    let mut outpoints: Vec<OutPoint> = tx_db
+        .get(&key)?
+        .and_then(|v| {
+            bincode::decode_from_slice::<Vec<OutPoint>, _>(&v, bincode_config())
+                .ok()
+                .map(|(o, _)| o)
+        })
+        .unwrap_or_default();
+
+    if !outpoints.contains(outpoint) {
+        outpoints.push(*outpoint);
+        tx_db.insert(
+            key,
+            bincode::encode_to_vec(&outpoints, bincode_config())
+                .map_err(|e| ReorgError::Anyhow(e.into()))?,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_outpoint_from_address_utxos(
+    tx_db: &TransactionalTree,
+    id: &str,
+    outpoint: &OutPoint,
+) -> Result<(), ConflictableTransactionError<ReorgError>> {
+    let key = DBKeys::address_utxo(id);
+    if let Some(mut outpoints) = tx_db.get(&key)?.and_then(|v| {
+        bincode::decode_from_slice::<Vec<OutPoint>, _>(&v, bincode_config())
+            .ok()
+            .map(|(o, _)| o)
+    }) {
+        outpoints.retain(|o| o != outpoint);
+        if outpoints.is_empty() {
+            tx_db.remove(key)?;
+        } else {
+            tx_db.insert(
+                key,
+                bincode::encode_to_vec(&outpoints, bincode_config())
+                    .map_err(|e| ReorgError::Anyhow(e.into()))?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Blockchain {
+    pub const CURRENT_DB_VERSION: u32 = 1;
+
     pub fn load_from_db(&mut self) -> Result<()> {
         if !self.db.is_empty() {
             if let Err(e) = self.recover_from_crashed_reorg() {
@@ -87,6 +146,37 @@ impl Blockchain {
             }
 
             self.rebuild_utxos()?;
+
+            // Check database version and run necessary migrations.
+            let db_version = self.get_db_version()?;
+            if db_version < Self::CURRENT_DB_VERSION {
+                info!(
+                    "Database version {} is outdated (current: {}). Running migrations...",
+                    db_version,
+                    Self::CURRENT_DB_VERSION
+                );
+
+                if db_version < 1 && self.block_height()? > 0 {
+                    // Version 1 migration: Build the Address-to-OutPoint index.
+                    self.migrate_rebuild_address_index()?;
+                    // Also fix the total supply tracking if it was incorrect.
+                    self.migrate_total_supply()?;
+                }
+
+                self.set_db_version(Self::CURRENT_DB_VERSION)?;
+                info!("Database migrated to version {}.", Self::CURRENT_DB_VERSION);
+            }
+
+            // Pre-warm DAA cache to speed up target calculation.
+            let height = self.block_height()?;
+            let start = height.saturating_sub(crate::DAA_WINDOW as u64);
+            for i in start..=height {
+                if let Some(block) = self.get_block_by_index(i)? {
+                    self.daa_cache
+                        .insert(i, (block.header.timestamp, block.header.target));
+                }
+            }
+
             if let Err(e) = self.load_mempool_snapshot() {
                 warn!(
                     "Could not load mempool from snapshot, starting with an empty one. Error: {}",
@@ -113,7 +203,31 @@ impl Blockchain {
         self.target = self.calculate_next_target()?;
         self.total_supply = Amount::from_smallest_unit(self.get_total_supply_from_db()?);
         self.total_tx_count = self.get_total_transaction_count_from_db()?;
+        self.set_db_version(Self::CURRENT_DB_VERSION)?;
 
+        Ok(())
+    }
+
+    pub fn get_db_version(&self) -> Result<u32> {
+        Ok(self
+            .db
+            .get(DBKeys::DB_VERSION)?
+            .and_then(|ivec| {
+                if ivec.len() == 4 {
+                    let mut arr = [0u8; 4];
+                    arr.copy_from_slice(&ivec);
+                    Some(u32::from_be_bytes(arr))
+                } else {
+                    bincode::decode_from_slice::<u32, _>(&ivec, bincode_config())
+                        .map(|(v, _)| v)
+                        .ok()
+                }
+            })
+            .unwrap_or(0))
+    }
+
+    pub fn set_db_version(&self, version: u32) -> Result<()> {
+        self.db.insert(DBKeys::DB_VERSION, &version.to_be_bytes())?;
         Ok(())
     }
 
@@ -411,6 +525,34 @@ impl Blockchain {
                 bincode::decode_from_slice(&ivec, bincode_config())
                     .map(|(v, _)| v)
                     .context("Failed to deserialize history list")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(result)
+    }
+
+    pub fn get_transaction_hashes_by_hash_from_db(&self, hash: &Hash) -> Result<Vec<Hash>> {
+        let result = self
+            .db
+            .get(DBKeys::history(&hash.to_string()))?
+            .map(|ivec| {
+                bincode::decode_from_slice::<Vec<Hash>, _>(&ivec, bincode_config())
+                    .map(|(v, _)| v)
+                    .context("Failed to deserialize history list")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(result)
+    }
+
+    pub fn get_utxo_outpoints_by_address_id(&self, id: &str) -> Result<Vec<OutPoint>> {
+        let result = self
+            .db
+            .get(DBKeys::address_utxo(id))?
+            .map(|ivec| {
+                bincode::decode_from_slice::<Vec<OutPoint>, _>(&ivec, bincode_config())
+                    .map(|(v, _)| v)
+                    .context("Failed to deserialize address UTXO list")
             })
             .transpose()?
             .unwrap_or_default();

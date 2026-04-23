@@ -9,6 +9,7 @@ use crate::{
 use bincode::{config::standard as bincode_config, Decode, Encode};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::{
     convert::TryFrom,
     io::{Error as IoError, Read, Write},
@@ -62,7 +63,7 @@ pub enum ChainMessage {
 pub enum WalletMessage {
     SubmitTransaction(Transaction),
     NewTransaction(Transaction),
-    FetchWalletState(PublicKey),
+    FetchWalletState(PublicKey, HashSet<Hash>),
     WalletState(WalletStateSnapshot),
     TransactionAcceptedConfirmation,
     TransactionRejected(Hash, String),

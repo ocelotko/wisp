@@ -12,8 +12,8 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use wisp_core::{
-    blockchain::Block, currency::Amount, sha256::Hash, signatures::PublicKey,
-    utils::calculate_block_reward, DAA_WINDOW, HALVING_INTERVAL, IDEAL_BLOCK_TIME,
+    blockchain::Block, currency::Amount, sha256::Hash, utils::calculate_block_reward, DAA_WINDOW,
+    HALVING_INTERVAL, IDEAL_BLOCK_TIME,
 };
 
 lazy_static! {
@@ -61,8 +61,7 @@ struct ApiTransactionInput {
 #[derive(Serialize, Clone)]
 struct ApiTransactionOutput {
     value: String,
-    #[serde(with = "serde_pubkey_str")]
-    pubkey: PublicKey,
+    address: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -169,7 +168,7 @@ impl From<Block> for ApiBlock {
                     coinbase_tx
                         .outputs
                         .first()
-                        .map(|output| output.pubkey.fingerprint())
+                        .map(|output| wisp_core::address::Address::encode(&output.script))
                 }),
         }
     }
@@ -322,18 +321,6 @@ mod serde_hash_str {
     }
 }
 
-mod serde_pubkey_str {
-    use serde::{self, Serializer};
-    use wisp_core::signatures::PublicKey;
-
-    pub fn serialize<S>(val: &PublicKey, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&val.fingerprint())
-    }
-}
-
 mod serde_str {
     use serde::{self, Serializer};
     use wisp_core::U256;
@@ -476,7 +463,7 @@ async fn get_transaction_by_hash(
                     .iter()
                     .map(|o| ApiTransactionOutput {
                         value: o.value.to_string_wisp(),
-                        pubkey: o.pubkey.clone(),
+                        address: wisp_core::address::Address::encode(&o.script),
                     })
                     .collect(),
                 coinbase_message,
