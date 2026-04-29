@@ -21,7 +21,7 @@ use crate::wallet::{
 pub async fn get_total_balance(core: &Core) -> Result<Amount> {
     let utxos_guard = core.utxos.read().await;
     let transactions_guard = core.transactions.read().await;
-    let wallet_public_key = get_current_wallet(core).await?.public_key;
+    let wallet = get_current_wallet(core).await?;
     let confirmed_balance: Amount = utxos_guard.values().map(|output| output.value).sum();
 
     let mut pending_net_change: i128 = 0;
@@ -31,14 +31,14 @@ pub async fn get_total_balance(core: &Core) -> Result<Amount> {
 
             for input in &tx.inputs {
                 if let Some(spent_utxo) = utxos_guard.get(&input.outpoint) {
-                    if spent_utxo.pubkey == wallet_public_key {
+                    if wallet.is_script_relevant(&spent_utxo.script) {
                         pending_net_change -= spent_utxo.value.as_smallest_unit() as i128;
                     }
                 }
             }
 
             for output in &tx.outputs {
-                if output.pubkey == wallet_public_key {
+                if wallet.is_script_relevant(&output.script) {
                     pending_net_change += output.value.as_smallest_unit() as i128;
                 }
             }

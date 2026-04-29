@@ -37,8 +37,6 @@ pub async fn populate_connections(
                 {
                     warn!("Handshake with {} failed: {}", node, e);
                 } else if !crate::NODES.contains_key(node) {
-                    // Handshake was successful, move the stream into the global map
-                    // and spawn a handler for it.
                     let stream_arc = std::sync::Arc::new(tokio::sync::Mutex::new(stream));
                     crate::NODES.insert(node.to_string(), stream_arc.clone());
                     info!("Handshake successful. Added initial node: {}", node);
@@ -91,7 +89,6 @@ async fn perform_handshake(
         .send_async(stream)
         .await?;
 
-    // Wait for their response and send our height
     if let Ok(Ok(Message::Chain(ChainMessage::LatestBlock(Some((_, height)))))) =
         time::timeout(Duration::from_secs(30), Message::receive_async(stream)).await
     {
@@ -104,13 +101,11 @@ async fn perform_handshake(
             );
         }
 
-        // Track the peer with the longest chain discovered so far.
         let current_longest_height = longest_peer.as_ref().map(|(_, h)| *h).unwrap_or(our_height);
         if height > current_longest_height {
             *longest_peer = Some((node_addr.to_string(), height));
         }
 
-        // Send our height so they can decide if they need to sync from us.
         if let Some(tip) = blockchain.get_tip_block()? {
             Message::Chain(ChainMessage::LatestBlock(Some((tip, our_height))))
                 .send_async(stream)

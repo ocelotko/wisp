@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{arg, command, Parser};
-use k256::ecdsa::VerifyingKey;
 use log::{debug, error, info, trace, warn};
 use num_cpus;
 use std::{
@@ -20,6 +19,8 @@ use wisp_core::{
     blockchain::Block, pow::mine_block_parallel, signatures::PublicKey, MAX_BLOCK_FUTURE_TIMESTAMP,
 };
 
+use wisp_core::address::Address;
+use wisp_core::transactions::Script;
 #[derive(Parser, Debug)]
 /// Defines the command-line arguments for the Flame miner.
 #[command(author, version, about, long_about = None)]
@@ -28,7 +29,7 @@ struct Args {
     node_address: String,
 
     #[arg(short, long)]
-    reward_address: String,
+    reward_address: String, // This will now accept Wisp address formats
 
     #[arg(long)]
     coinbase_message: Option<String>,
@@ -358,13 +359,25 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Parse the reward address (public key) from the command line.
-    let public_key_bytes = hex::decode(&args.reward_address)
-        .map_err(|e| anyhow!("Invalid reward public key format (must be hex): {}", e))?;
-    let verifying_key = VerifyingKey::from_sec1_bytes(&public_key_bytes)
-        .map_err(|e| anyhow!("Invalid public key bytes: {}", e))?;
-    let public_key = PublicKey(verifying_key);
-
+    // Parse the reward address from the command line.
+    // The miner needs a PublicKey to put into the coinbase transaction.
+    // Only Script::Classic directly contains a PublicKey.
+    let public_key = match Address::decode(&args.reward_address) {
+        Ok(Script::Classic(pk)) => pk,
+        Ok(other_script) => {
+            return Err(anyhow!(
+                "Invalid reward address format for miner. Miner only accepts Classic (P2PK) addresses, got: {:?}",
+                other_script
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "Failed to decode reward address '{}': {}",
+                args.reward_address,
+                e
+            ));
+        }
+    };
     info!(
         "Starting Wisp Flame Miner\n\
         --------------------------------------------------\n\

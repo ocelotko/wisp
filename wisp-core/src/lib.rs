@@ -13,8 +13,6 @@ pub mod blockchain;
 pub mod currency;
 /// Implements the transaction memory pool for unconfirmed transactions.
 pub mod mempool;
-/// Contains database migration logic.
-pub mod migrations;
 /// Defines network messages for peer-to-peer communication.
 pub mod network;
 /// Contains proof-of-work and difficulty adjustment logic.

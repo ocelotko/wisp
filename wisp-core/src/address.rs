@@ -6,6 +6,13 @@ use ripemd::{Digest, Ripemd160};
 
 const WISP32_ALPHABET: &[u8] = b"acdefghjkmnpqrstuvwxyz0123456789";
 
+pub const VERSION_CLASSIC: u8 = 0xC7;
+pub const VERSION_SHADOW: u8 = 0x3F;
+pub const VERSION_SHADOW_SCRIPT: u8 = 0x4A;
+
+pub const AURORA_V0: u8 = 0x00;
+pub const AURORA_PREFIX: &str = "w+";
+
 pub struct Address;
 
 impl Address {
@@ -19,29 +26,35 @@ impl Address {
     pub fn encode(script: &Script) -> String {
         match script {
             Script::Classic(pk) => {
-                let mut data = vec![0x57];
+                let mut data = vec![VERSION_CLASSIC];
                 data.extend_from_slice(&pk.to_bytes());
                 bs58::encode(data).with_check().into_string()
             }
-            Script::Shadow(h) | Script::ShadowScript(h) => {
-                let mut data = vec![0x3F];
+            Script::Shadow(h) => {
+                let mut data = vec![VERSION_SHADOW];
+                data.extend_from_slice(&h.as_bytes()[..20]);
+                bs58::encode(data).with_check().into_string()
+            }
+            Script::ShadowScript(h) => {
+                let mut data = vec![VERSION_SHADOW_SCRIPT];
                 data.extend_from_slice(&h.as_bytes()[..20]);
                 bs58::encode(data).with_check().into_string()
             }
             Script::Aurora(h) | Script::AuroraScript(h) => {
-                let prefix = "w+";
+                let mut payload = vec![AURORA_V0]; // Internal versioning
 
-                let mut to_checksum = if matches!(script, Script::Aurora(_)) {
-                    h.as_bytes()[..20].to_vec()
+                if matches!(script, Script::Aurora(_)) {
+                    payload.extend_from_slice(&h.as_bytes()[..20]);
                 } else {
-                    h.as_bytes().to_vec()
+                    payload.extend_from_slice(&h.as_bytes());
                 };
 
-                let check_hash = hash(&to_checksum);
-                to_checksum.extend_from_slice(&check_hash.as_bytes()[..4]);
+                let check_hash = hash(&payload);
+                let mut to_encode = payload;
+                to_encode.extend_from_slice(&check_hash.as_bytes()[..4]);
 
-                let encoded = Self::wisp32_encode(&to_checksum);
-                format!("{}{}", prefix, encoded)
+                let encoded = Self::wisp32_encode(&to_encode);
+                format!("{}{}", AURORA_PREFIX, encoded)
             }
         }
     }
@@ -60,21 +73,32 @@ impl Address {
                 return Err(anyhow!("Aurora address checksum failed"));
             }
 
-            if data.len() == 20 {
+            if data.is_empty() {
+                return Err(anyhow!("Missing Aurora version byte"));
+            }
+
+            let version = data[0];
+            let payload = &data[1..];
+
+            if version == AURORA_V0 && payload.len() == 20 {
                 let mut h_bytes = [0u8; 32];
-                h_bytes[..20].copy_from_slice(data);
+                h_bytes[..20].copy_from_slice(payload);
                 Ok(Script::Aurora(Hash::from_bytes(&h_bytes)))
-            } else if data.len() == 32 {
-                Ok(Script::AuroraScript(Hash::from_bytes(data.try_into()?)))
+            } else if version == AURORA_V0 && payload.len() == 32 {
+                Ok(Script::AuroraScript(Hash::from_bytes(payload.try_into()?)))
             } else {
-                Err(anyhow!("Invalid Aurora payload length: {}", data.len()))
+                Err(anyhow!(
+                    "Unsupported Aurora version {} or length {}",
+                    version,
+                    payload.len()
+                ))
             }
         } else if let Ok(decoded) = bs58::decode(address).with_check(None).into_vec() {
             if decoded.is_empty() {
                 return Err(anyhow!("Empty address payload"));
             }
             match decoded[0] {
-                0x57 => {
+                VERSION_CLASSIC => {
                     if decoded.len() != 34 {
                         return Err(anyhow!("Invalid Classic address length"));
                     }
@@ -83,7 +107,7 @@ impl Address {
                         .map_err(|e| anyhow!("Invalid public key: {}", e))?;
                     Ok(Script::Classic(pk))
                 }
-                0x3F => {
+                VERSION_SHADOW => {
                     if decoded.len() != 21 {
                         return Err(anyhow!("Invalid Shadow address length"));
                     }
@@ -91,10 +115,17 @@ impl Address {
                     h_bytes[..20].copy_from_slice(&decoded[1..21]);
                     Ok(Script::Shadow(Hash::from_bytes(&h_bytes)))
                 }
+                VERSION_SHADOW_SCRIPT => {
+                    if decoded.len() != 21 {
+                        return Err(anyhow!("Invalid ShadowScript address length"));
+                    }
+                    let mut h_bytes = [0u8; 32];
+                    h_bytes[..20].copy_from_slice(&decoded[1..21]);
+                    Ok(Script::ShadowScript(Hash::from_bytes(&h_bytes)))
+                }
                 v => Err(anyhow!("Unknown address version byte: 0x{:02x}", v)),
             }
         } else {
-            // Fallback for raw hex public keys
             use std::str::FromStr;
             let pk = PublicKey::from_str(address)?;
             Ok(Script::Classic(pk))

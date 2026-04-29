@@ -190,7 +190,6 @@ impl SubAssign for Amount {
 }
 
 /// Implements `Sum` for `Amount`, allowing an iterator of `Amount`s to be summed up.
-/// On overflow, the sum will saturate at `Amount::MAX`.
 impl Sum for Amount {
     fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
         iter.fold(Amount::zero(), |acc, x| {

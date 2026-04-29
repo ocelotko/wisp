@@ -1,25 +1,23 @@
-use crate::utils::{clear_terminal, display_heading_with_wallet, pause};
-use crate::wallet::core::Core;
 use anyhow::{Context, Result};
-use inquire::{Select, Text};
+use inquire::{Confirm, Select, Text};
 use log::error;
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-pub async fn network_and_blockchain(
+use crate::engine::session::Core;
+use crate::ui::clear_terminal;
+use crate::ui::views::layout::{display_heading_with_wallet, pause};
+
+pub async fn network_and_blockchain_loop(
     core: Arc<Core>,
     config_path: &PathBuf,
 ) -> Result<(), anyhow::Error> {
     loop {
         clear_terminal();
-        let balance_value = core.get_total_balance().await;
-        display_heading_with_wallet(
-            core.get_current_wallet()
-                .await
-                .ok()
-                .map(|w| w.name)
-                .as_deref(),
-            balance_value.ok(),
-        );
+        let summary = core.get_wallet_summary().await.ok();
+        let wallet = core.get_current_wallet().await?;
+        display_heading_with_wallet(Some(&wallet.name), summary.map(|s| s.total_balance));
+
         let blockchain_options = vec![
             "Get latest block information",
             "Get specific block information",
@@ -31,10 +29,10 @@ pub async fn network_and_blockchain(
             Select::new("Blockchain Interaction", blockchain_options).prompt()?;
 
         match blockchain_menu_selection.as_ref() {
-            "Get latest block information" => get_latest_block_prompt(&core).await?,
-            "Get specific block information" => get_block_info_prompt(&core).await?,
-            "Connect to node" => connect_node(&core, config_path).await?,
-            "List connected peers" => list_peers(&core).await?,
+            "Get latest block information" => latest_block_view(&core).await?,
+            "Get specific block information" => block_info_prompt(&core).await?,
+            "Connect to node" => connect_node_prompt(&core, config_path).await?,
+            "List connected peers" => list_peers_view(&core).await?,
             "Back to wallet menu" => return Ok(()),
             _ => {
                 error!("Blockchain interaction menu selection error: Invalid selection or prompt error.");
@@ -45,17 +43,11 @@ pub async fn network_and_blockchain(
     }
 }
 
-async fn get_latest_block_prompt(core: &Core) -> Result<(), anyhow::Error> {
+async fn latest_block_view(core: &Core) -> Result<(), anyhow::Error> {
     clear_terminal();
-    let balance_value = core.get_total_balance().await;
-    display_heading_with_wallet(
-        core.get_current_wallet()
-            .await
-            .ok()
-            .map(|w| w.name)
-            .as_deref(),
-        balance_value.ok(),
-    );
+    let summary = core.get_wallet_summary().await.ok();
+    let wallet = core.get_current_wallet().await?;
+    display_heading_with_wallet(Some(&wallet.name), summary.map(|s| s.total_balance));
     println!("Getting latest block from the node...");
 
     match core.get_latest_block().await {
@@ -100,17 +92,11 @@ async fn get_latest_block_prompt(core: &Core) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn get_block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
+async fn block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
     clear_terminal();
-    let balance_value = core.get_total_balance().await;
-    display_heading_with_wallet(
-        core.get_current_wallet()
-            .await
-            .ok()
-            .map(|w| w.name)
-            .as_deref(),
-        balance_value.ok(),
-    );
+    let summary = core.get_wallet_summary().await.ok();
+    let wallet = core.get_current_wallet().await?;
+    display_heading_with_wallet(Some(&wallet.name), summary.map(|s| s.total_balance));
 
     let index_str = Text::new("Enter the index of the block you want to view:").prompt()?;
     let index = index_str
@@ -158,31 +144,21 @@ async fn get_block_info_prompt(core: &Core) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn connect_node(core: &Core, config_path: &PathBuf) -> Result<(), anyhow::Error> {
+async fn connect_node_prompt(core: &Core, config_path: &PathBuf) -> Result<(), anyhow::Error> {
     clear_terminal();
-    let balance_value = core.get_total_balance().await;
-    display_heading_with_wallet(
-        core.get_current_wallet()
-            .await
-            .ok()
-            .map(|w| w.name)
-            .as_deref(),
-        balance_value.ok(),
-    );
+    let summary = core.get_wallet_summary().await.ok();
+    let wallet = core.get_current_wallet().await?;
+    display_heading_with_wallet(Some(&wallet.name), summary.map(|s| s.total_balance));
 
-    let current_node = {
-        let config = core.config.lock().await;
-        config.default_node.clone()
-    };
+    let current_node = core.get_default_node_address().await;
     println!("Current default node: {}", current_node);
 
-    let change_node = inquire::Confirm::new("Do you want to change the default node?")
+    let change_node = Confirm::new("Do you want to change the default node?")
         .with_default(false)
         .prompt()?;
 
     if change_node {
-        let new_node_addr =
-            inquire::Text::new("Enter new node address (e.g., 127.0.0.1:9000):").prompt()?;
+        let new_node_addr = Text::new("Enter new node address (e.g., 127.0.0.1:9000):").prompt()?;
 
         println!("Attempting to connect to new node: {}", new_node_addr);
         core.set_default_node(&new_node_addr, config_path).await?;
@@ -197,6 +173,7 @@ async fn connect_node(core: &Core, config_path: &PathBuf) -> Result<(), anyhow::
                     "\nFailed to connect to new node: {}. Reverting to previous default.",
                     e
                 );
+                // Attempt to revert to the previous default node if connection fails
                 core.set_default_node(&current_node, config_path).await?;
             }
         }
@@ -217,17 +194,11 @@ async fn connect_node(core: &Core, config_path: &PathBuf) -> Result<(), anyhow::
     Ok(())
 }
 
-async fn list_peers(core: &Core) -> Result<()> {
+async fn list_peers_view(core: &Core) -> Result<()> {
     clear_terminal();
-    let balance_value = core.get_total_balance().await;
-    display_heading_with_wallet(
-        core.get_current_wallet()
-            .await
-            .ok()
-            .map(|w| w.name)
-            .as_deref(),
-        balance_value.ok(),
-    );
+    let summary = core.get_wallet_summary().await.ok();
+    let wallet = core.get_current_wallet().await?;
+    display_heading_with_wallet(Some(&wallet.name), summary.map(|s| s.total_balance));
     println!("Fetching peer list from connected node...");
     println!("------------------");
 

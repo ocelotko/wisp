@@ -24,11 +24,9 @@ pub enum BroadcastFilter {
 }
 
 /// Broadcasts a message to filtered peers.
-/// Removes peers that cause a send error.
 pub async fn broadcast(message: &Message, filter: BroadcastFilter, log_verb: &str) {
     let mut peers_to_remove = Vec::new();
 
-    // Collect Arcs first to avoid holding DashMap shard locks during I/O
     let peers: Vec<(String, Arc<AsyncMutex<TcpStream>>)> = crate::NODES
         .iter()
         .filter(|peer| match &filter {
@@ -49,7 +47,6 @@ pub async fn broadcast(message: &Message, filter: BroadcastFilter, log_verb: &st
         }
     }
 
-    // Clean up connections that failed during the broadcast.
     for addr in peers_to_remove {
         crate::NODES.remove(&addr);
     }
@@ -88,7 +85,7 @@ pub async fn handle_connection(
         let message_future = Message::receive_async(&mut *stream_lock);
 
         let message = match timeout(PEER_TIMEOUT, message_future).await {
-            Ok(Ok(msg)) => msg, // Message received within timeout
+            Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     info!("Connection closed by peer {}", addr);
@@ -97,7 +94,6 @@ pub async fn handle_connection(
                 return Err(anyhow!("Failed to receive message from {}: {}", addr, e));
             }
             Err(_) => {
-                // Timeout elapsed
                 info!(
                     "Peer {} has been idle. Sending a ping to check liveness.",
                     addr
@@ -113,19 +109,14 @@ pub async fn handle_connection(
                     return Ok(());
                 }
 
-                // We expect any message back quickly, preferably a Pong.
                 let response_future = Message::receive_async(&mut *stream_lock);
                 match timeout(PING_TIMEOUT, response_future).await {
                     Ok(Ok(Message::P2P(P2PMessage::Pong))) => {
                         debug!("Received pong from {}. Connection is alive.", addr);
-                        continue; // Go back to waiting for a message
+                        continue;
                     }
-                    Ok(Ok(other_message)) => {
-                        // Any other message also proves liveness. Process it.
-                        other_message
-                    }
+                    Ok(Ok(other_message)) => other_message,
                     _ => {
-                        // Timeout or error receiving response
                         warn!(
                             "Did not receive a timely response from {}. Closing connection.",
                             addr

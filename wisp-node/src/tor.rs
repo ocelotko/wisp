@@ -10,8 +10,6 @@ pub struct TorService {
     _stream: BufReader<TcpStream>,
 }
 
-/// Connects to a Tor control port and creates a new v3 onion service.
-/// Returns the onion service address (e.g., "xyz.onion:9000") and the SOCKS proxy address.
 pub async fn create_hidden_service(
     control_addr: &str,
     local_port: u16,
@@ -24,14 +22,11 @@ pub async fn create_hidden_service(
 
     let mut stream = BufReader::new(stream);
 
-    // 1. Authenticate
     authenticate(&mut stream).await?;
     info!("Authenticated with Tor controller successfully.");
 
-    // 2. Get SOCKS info
     let socks_addr = get_socks_addr(&mut stream).await?;
 
-    // 3. Create Onion Service
     let (onion_addr, pk) = add_onion(&mut stream, local_port, private_key).await?;
 
     Ok(TorService {
@@ -67,7 +62,6 @@ async fn send_command(stream: &mut BufReader<TcpStream>, cmd: &str) -> Result<Ve
         let content = if trimmed.len() > 4 { &trimmed[4..] } else { "" };
 
         if code != "250" {
-            // 250 is OK. Errors are usually 4xx or 5xx.
             return Err(anyhow!("Tor control error: {}", trimmed));
         }
 
@@ -81,14 +75,12 @@ async fn send_command(stream: &mut BufReader<TcpStream>, cmd: &str) -> Result<Ve
 }
 
 async fn authenticate(stream: &mut BufReader<TcpStream>) -> Result<()> {
-    // Try PROTOCOLINFO to find auth methods
     let lines = send_command(stream, "PROTOCOLINFO 1").await?;
 
     let mut cookie_file = None;
 
     for line in lines {
         if line.starts_with("AUTH") {
-            // Example: AUTH METHODS=COOKIE,SAFECOOKIE COOKIEFILE="/var/run/tor/control.authcookie"
             if let Some(idx) = line.find("COOKIEFILE=") {
                 let remainder = &line[idx + "COOKIEFILE=".len()..];
                 if remainder.starts_with('"') {
@@ -115,7 +107,6 @@ async fn authenticate(stream: &mut BufReader<TcpStream>) -> Result<()> {
         let hex_cookie = hex::encode(cookie_bytes);
         send_command(stream, &format!("AUTHENTICATE {}", hex_cookie)).await?;
     } else {
-        // Try empty auth (no password/cookie)
         send_command(stream, "AUTHENTICATE").await?;
     }
 
@@ -124,12 +115,9 @@ async fn authenticate(stream: &mut BufReader<TcpStream>) -> Result<()> {
 
 async fn get_socks_addr(stream: &mut BufReader<TcpStream>) -> Result<String> {
     let lines = send_command(stream, "GETINFO net/listeners/socks").await?;
-    // Response: net/listeners/socks=127.0.0.1:9050
 
     for line in lines {
         if let Some(val) = line.strip_prefix("net/listeners/socks=") {
-            // val might be "127.0.0.1:9050" or "127.0.0.1:9050 [::1]:9050"
-            // We take the first one.
             let first = val.split_whitespace().next().unwrap_or("");
             return Ok(first.trim_matches('"').to_string());
         }
@@ -142,7 +130,6 @@ async fn add_onion(
     local_port: u16,
     private_key: Option<String>,
 ) -> Result<(String, String)> {
-    // If we have a key, use it. Otherwise ask for a new best key (ED25519-V3).
     let key_arg = private_key.as_deref().unwrap_or("NEW:BEST");
     let cmd = format!("ADD_ONION {} Port={1},127.0.0.1:{1}", key_arg, local_port);
     let lines = send_command(stream, &cmd).await?;
@@ -160,7 +147,6 @@ async fn add_onion(
 
     let service_id = service_id
         .ok_or_else(|| anyhow!("Failed to create onion service: No ServiceID returned"))?;
-    // If we passed a key, Tor might not return it back. If we generated one, it must return it.
     let final_pk = ret_private_key
         .or(private_key)
         .ok_or_else(|| anyhow!("No private key available"))?;

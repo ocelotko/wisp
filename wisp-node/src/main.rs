@@ -324,7 +324,6 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16, proxy: O
             }
         }
 
-        // Now that initial sync is done (or skipped), spawn the connection handlers for all new peers.
         for node_addr in new_peers {
             if let Some(peer) = crate::NODES.get(&node_addr) {
                 let stream_arc = peer.value().clone();

@@ -15,9 +15,13 @@ use base64::{engine::general_purpose, Engine as Base64Engine};
 use rand::{rngs::OsRng, TryRngCore};
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::HashSet;
 
 use crate::wallet::constants::*;
+use wisp_core::address::Address;
+use wisp_core::sha256::Hash;
 use wisp_core::signatures::PublicKey;
+use wisp_core::transactions::Script;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SavedWallet {
@@ -27,6 +31,10 @@ pub struct SavedWallet {
     pub salt: Vec<u8>,
     #[serde(default)]
     pub encrypted_seed_phrase: Option<String>,
+    #[serde(default)]
+    pub derived_public_keys: Vec<PublicKey>,
+    #[serde(default)]
+    pub script_hashes: HashSet<Hash>,
 }
 
 impl SavedWallet {

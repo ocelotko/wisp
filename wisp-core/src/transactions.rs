@@ -13,20 +13,19 @@ use std::hash::Hash as StdHash;
 
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, StdHash)]
 pub enum Script {
-    /// Classic (P2PK): Hardcoded Public Key
+    /// Classic (P2PK)
     Classic(PublicKey),
-    /// Shadow (P2PKH): Hashed Public Key
+    /// Shadow (P2PKH)
     Shadow(Hash),
-    /// Shadow-Script (P2SH): Hashed Script
+    /// Shadow-Script (P2SH)
     ShadowScript(Hash),
-    /// Aurora (P2WPKH): Modern Witness Hashed PK
+    /// Aurora (P2WPKH)
     Aurora(Hash),
-    /// Aurora-Script (P2WSH): Modern Witness Hashed Script
+    /// Aurora-Script (P2WSH)
     AuroraScript(Hash),
 }
 
 impl Script {
-    /// Checks if this script belongs to the given public key or is present in the set of known hashes.
     pub fn is_relevant_to(
         &self,
         pubkey: &PublicKey,
@@ -38,6 +37,22 @@ impl Script {
             Script::Shadow(h) | Script::Aurora(h) => h.as_bytes()[..20] == pk_hash_bytes[..20],
             Script::ShadowScript(h) | Script::AuroraScript(h) => known_hashes.contains(h),
         }
+    }
+}
+
+impl Script {
+    pub fn new_shadow(pk: &PublicKey) -> Self {
+        let hash_bytes = crate::address::Address::hash160(pk);
+        let mut h = [0u8; 32];
+        h[..20].copy_from_slice(&hash_bytes);
+        Script::Shadow(Hash::from_bytes(&h))
+    }
+
+    pub fn new_aurora(pk: &PublicKey) -> Self {
+        let hash_bytes = crate::address::Address::hash160(pk);
+        let mut h = [0u8; 32];
+        h[..20].copy_from_slice(&hash_bytes);
+        Script::Aurora(Hash::from_bytes(&h))
     }
 }
 
@@ -67,9 +82,9 @@ impl fmt::Display for OutPoint {
 pub struct TransactionInput {
     pub outpoint: OutPoint,
     pub signature: Option<Signature>,
-    pub public_key: Option<PublicKey>, // Added to carry the PK for Shadow/Aurora
+    pub public_key: Option<PublicKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub redeem_script: Option<Vec<u8>>, // For ShadowScript/AuroraScript
+    pub redeem_script: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub coinbase_data: Option<Vec<u8>>,

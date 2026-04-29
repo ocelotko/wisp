@@ -1,4 +1,3 @@
-// wisp-wallet/src/wallet/config.rs
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone)]

@@ -23,7 +23,19 @@ impl Blockchain {
             .get_utxo_outpoints_by_address_id(&pubkey.fingerprint())
             .unwrap_or_default();
 
+        // Also search for UTXOs belonging to Shadow/Aurora addresses derived from this pubkey
+        let pk_hash = crate::address::Address::hash160(pubkey);
+        let mut h_bytes = [0u8; 32];
+        h_bytes[..20].copy_from_slice(&pk_hash);
+        let derived_hash = Hash::from_bytes(&h_bytes);
+        if let Ok(list) = self.get_utxo_outpoints_by_address_id(&derived_hash.to_string()) {
+            outpoints.extend(list);
+        }
+
         for script_hash in known_script_hashes {
+            if script_hash == &derived_hash {
+                continue;
+            }
             if let Ok(list) = self.get_utxo_outpoints_by_address_id(&script_hash.to_string()) {
                 outpoints.extend(list);
             }
@@ -253,7 +265,17 @@ impl Blockchain {
 
         let tx_hashes = self.get_transaction_hashes_by_pubkey_from_db(pubkey)?;
         let mut tx_hashes = tx_hashes;
+
+        // Also fetch history for Shadow/Aurora addresses derived from this pubkey
+        let mut h_bytes = [0u8; 32];
+        h_bytes[..20].copy_from_slice(&pk_hash_bytes);
+        let derived_hash = Hash::from_bytes(&h_bytes);
+        tx_hashes.extend(self.get_transaction_hashes_by_hash_from_db(&derived_hash)?);
+
         for script_hash in known_script_hashes {
+            if script_hash == &derived_hash {
+                continue;
+            }
             tx_hashes.extend(self.get_transaction_hashes_by_hash_from_db(script_hash)?);
         }
 

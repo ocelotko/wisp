@@ -1,14 +1,15 @@
-#[path = "commands/mod.rs"]
-pub mod commands;
+mod common;
+mod engine;
+mod ui;
 mod utils;
-mod wallet;
+mod vault;
 
+use crate::engine::session::Core;
+use crate::ui::run_wallet_ui;
 use anyhow::Result;
 use clap::Parser;
 use log::info;
 use std::{path::PathBuf, sync::Arc};
-
-use crate::{commands::run_wallet_ui, wallet::core::Core};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

@@ -148,24 +148,24 @@ impl Blockchain {
             self.rebuild_utxos()?;
 
             // Check database version and run necessary migrations.
-            let db_version = self.get_db_version()?;
-            if db_version < Self::CURRENT_DB_VERSION {
-                info!(
-                    "Database version {} is outdated (current: {}). Running migrations...",
-                    db_version,
-                    Self::CURRENT_DB_VERSION
-                );
+            // let db_version = self.get_db_version()?;
+            // if db_version < Self::CURRENT_DB_VERSION {
+            //     info!(
+            //         "Database version {} is outdated (current: {}). Running migrations...",
+            //         db_version,
+            //         Self::CURRENT_DB_VERSION
+            //     );
 
-                if db_version < 1 && self.block_height()? > 0 {
-                    // Version 1 migration: Build the Address-to-OutPoint index.
-                    self.migrate_rebuild_address_index()?;
-                    // Also fix the total supply tracking if it was incorrect.
-                    self.migrate_total_supply()?;
-                }
+            //     if db_version < 1 && self.block_height()? > 0 {
+            //         // Version 1 migration: Build the Address-to-OutPoint index.
+            //         self.migrate_rebuild_address_index()?;
+            //         // Also fix the total supply tracking if it was incorrect.
+            //         self.migrate_total_supply()?;
+            //     }
 
-                self.set_db_version(Self::CURRENT_DB_VERSION)?;
-                info!("Database migrated to version {}.", Self::CURRENT_DB_VERSION);
-            }
+            //     self.set_db_version(Self::CURRENT_DB_VERSION)?;
+            //     info!("Database migrated to version {}.", Self::CURRENT_DB_VERSION);
+            // }
 
             // Pre-warm DAA cache to speed up target calculation.
             let height = self.block_height()?;

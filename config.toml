@@ -1,7 +1,0 @@
-default_node = "0.0.0.0:9000"
-current_wallet_name = "kokot"
-seed_nodes = ["0.0.0.0:9000"]
-node_discovery_interval_secs = 60
-max_nodes_to_discover_per_run = 10
-node_connect_timeout_secs = 5
-node_response_timeout_secs = 10

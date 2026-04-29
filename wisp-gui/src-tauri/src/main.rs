@@ -197,10 +197,9 @@ async fn get_balance_history(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ChartDataPoint>, String> {
     let txs_guard = state.core.transactions.read().await;
-    let wallet_pk = crate::wallet::account::get_current_wallet(&state.core)
+    let wallet = crate::wallet::account::get_current_wallet(&state.core)
         .await
-        .map_err(|e| e.to_string())?
-        .public_key;
+        .map_err(|e| e.to_string())?;
 
     let mut history: Vec<_> = txs_guard.values().cloned().collect();
     history.sort_by(|a, b| {
@@ -216,7 +215,7 @@ async fn get_balance_history(
         let mut tx_net_change: i128 = 0;
 
         for output in &tx_info.transaction.outputs {
-            if output.pubkey == wallet_pk {
+            if wallet.is_script_relevant(&output.script) {
                 tx_net_change += output.value.as_smallest_unit() as i128;
             }
         }
@@ -228,7 +227,7 @@ async fn get_balance_history(
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
-                    if prev_output.pubkey == wallet_pk {
+                    if wallet.is_script_relevant(&prev_output.script) {
                         tx_net_change -= prev_output.value.as_smallest_unit() as i128;
                     }
                 }
@@ -262,6 +261,7 @@ async fn get_recent_transactions(
 
     // Use the actual public key from the loaded wallet
     let wallet_pk = wallet.public_key;
+    let pk_hash = wisp_core::address::Address::hash160(&wallet_pk);
 
     let mut enriched_txs = Vec::new();
 
@@ -276,11 +276,10 @@ async fn get_recent_transactions(
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
-                    // CRITICAL: Compare the pubkey here
                     prev_out_json = json!({
-                        "pubkey": hex::encode(output.pubkey.0.to_encoded_point(true).as_bytes()),
+                        "address": wisp_core::address::Address::encode(&output.script),
                         "value": output.value.as_smallest_unit(),
-                        "is_ours": output.pubkey == wallet_pk // Now wallet_pk is used!
+                        "is_ours": output.script.is_relevant_to(&wallet_pk, &pk_hash, &std::collections::HashSet::new())
                     });
                 }
             }
@@ -293,9 +292,9 @@ async fn get_recent_transactions(
             .iter()
             .map(|o| {
                 json!({
-                    "pubkey": hex::encode(o.pubkey.0.to_encoded_point(true).as_bytes()),
+                    "address": wisp_core::address::Address::encode(&o.script),
                     "value": o.value.as_smallest_unit(),
-                    "is_ours": o.pubkey == wallet_pk // Now wallet_pk is used!
+                    "is_ours": o.script.is_relevant_to(&wallet_pk, &pk_hash, &std::collections::HashSet::new())
                 })
             })
             .collect();

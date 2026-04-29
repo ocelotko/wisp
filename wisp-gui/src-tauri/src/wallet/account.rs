@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -13,9 +14,24 @@ use log::info;
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 
-use wisp_core::{sha256::hash, signatures::PrivateKey};
+use wisp_core::{
+    address::Address,
+    sha256::{hash, Hash},
+    signatures::{PrivateKey, PublicKey},
+    transactions::Script,
+};
 
 use crate::wallet::{constants::*, core::Core, network::fetch_wallet_state, storage::SavedWallet};
+
+pub fn derive_key_from_mnemonic(mnemonic: &Mnemonic, index: u32) -> Result<PrivateKey> {
+    let seed = mnemonic.to_seed("");
+    let mut data = seed.to_vec();
+    data.extend_from_slice(&index.to_le_bytes());
+
+    let signing_key = SigningKey::from_slice(&hash(&data).as_bytes())
+        .map_err(|e| anyhow!("Failed to derive signing key: {}", e))?;
+    Ok(PrivateKey(signing_key))
+}
 
 pub async fn create_wallet(
     core: &Core,
@@ -36,13 +52,7 @@ pub async fn create_wallet(
         .map_err(|e| anyhow!("Failed to generate mnemonic: {}", e))?;
     let phrase = mnemonic.to_string();
 
-    let seed = mnemonic.to_seed("");
-    let private_key_hash = hash(&seed[..]);
-    let private_key_bytes = private_key_hash.as_bytes();
-
-    let signing_key = SigningKey::from_slice(&private_key_bytes)
-        .map_err(|e| anyhow!("Invalid private key derived from seed: {}", e))?;
-    let private_key = PrivateKey(signing_key);
+    let private_key = derive_key_from_mnemonic(&mnemonic, 0)?;
     let public_key = private_key.public_key();
 
     let mut local_rng = OsRng;
@@ -50,6 +60,12 @@ pub async fn create_wallet(
     local_rng
         .try_fill_bytes(&mut salt)
         .map_err(|e| anyhow!("Failed to fill bytes for salt: {}", e))?;
+
+    let hash_160 = Address::hash160(&public_key);
+    let mut h_bytes = [0u8; 32];
+    h_bytes[..20].copy_from_slice(&hash_160);
+    let mut script_hashes = HashSet::new();
+    script_hashes.insert(Hash::from_bytes(&h_bytes));
 
     let encrypted_private_key = encrypt_private_key(&private_key, password, &salt)?;
     let encrypted_seed_phrase = Some(encrypt_data(phrase.as_bytes(), password, &salt)?);
@@ -60,6 +76,8 @@ pub async fn create_wallet(
         public_key,
         salt,
         encrypted_seed_phrase,
+        derived_public_keys: vec![public_key],
+        script_hashes,
     };
 
     new_wallet.save_to_file(&core.data_dir, password)?;
@@ -95,6 +113,12 @@ pub async fn recover_wallet_with_key(
     let private_key = PrivateKey(signing_key);
     let public_key = private_key.public_key();
 
+    let hash_160 = Address::hash160(&public_key);
+    let mut h_bytes = [0u8; 32];
+    h_bytes[..20].copy_from_slice(&hash_160);
+    let mut script_hashes = HashSet::new();
+    script_hashes.insert(Hash::from_bytes(&h_bytes));
+
     let mut rng = OsRng;
     let mut salt = vec![0u8; SALT_SIZE];
     rng.try_fill_bytes(&mut salt)
@@ -108,6 +132,8 @@ pub async fn recover_wallet_with_key(
         public_key,
         salt,
         encrypted_seed_phrase: None,
+        derived_public_keys: vec![public_key],
+        script_hashes,
     };
 
     new_wallet.save_to_file(&core.data_dir, password)?;
@@ -139,14 +165,14 @@ pub async fn recover_wallet_with_seed(
     let mnemonic =
         Mnemonic::parse(seed_phrase).map_err(|e| anyhow!("Invalid seed phrase: {}", e))?;
 
-    let seed = mnemonic.to_seed("");
-    let private_key_hash = hash(&seed[..]);
-    let private_key_bytes = private_key_hash.as_bytes();
-
-    let signing_key = SigningKey::from_slice(&private_key_bytes)
-        .map_err(|e| anyhow!("Invalid private key derived from seed: {}", e))?;
-    let private_key = PrivateKey(signing_key);
+    let private_key = derive_key_from_mnemonic(&mnemonic, 0)?;
     let public_key = private_key.public_key();
+
+    let hash_160 = Address::hash160(&public_key);
+    let mut h_bytes = [0u8; 32];
+    h_bytes[..20].copy_from_slice(&hash_160);
+    let mut script_hashes = HashSet::new();
+    script_hashes.insert(Hash::from_bytes(&h_bytes));
 
     let mut rng = OsRng;
     let mut salt = vec![0u8; SALT_SIZE];
@@ -162,6 +188,8 @@ pub async fn recover_wallet_with_seed(
         public_key,
         salt,
         encrypted_seed_phrase,
+        derived_public_keys: vec![public_key],
+        script_hashes,
     };
 
     new_wallet.save_to_file(&core.data_dir, password)?;
@@ -219,6 +247,29 @@ pub async fn load_wallet(
         name
     );
 
+    // Ensure all derived keys have their hashes in the watch-list
+    let mut wallet = loaded_wallet;
+    let mut updated = false;
+    for pk in &wallet.derived_public_keys {
+        let hash_160 = Address::hash160(pk);
+        let mut h_bytes = [0u8; 32];
+        h_bytes[..20].copy_from_slice(&hash_160);
+        let h = Hash::from_bytes(&h_bytes);
+        if wallet.script_hashes.insert(h) {
+            updated = true;
+        }
+    }
+
+    if updated {
+        let wallet_to_save = wallet.clone();
+        let data_dir_clone = core.data_dir.clone();
+        let password_clone = password.to_string();
+        tokio::task::spawn_blocking(move || {
+            wallet_to_save.save_to_file(&data_dir_clone, &password_clone)
+        })
+        .await??;
+    }
+
     // --- Atomic State Switch ---
     // Clear old wallet state before doing anything else. This prevents the UI from showing
     // stale data from the previous wallet. Any queries between now and when the new state
@@ -229,7 +280,7 @@ pub async fn load_wallet(
 
     let mut wallets_guard = core.wallets.lock().await;
     if !wallets_guard.iter().any(|w| w.name == name) {
-        wallets_guard.push(loaded_wallet);
+        wallets_guard.push(wallet);
     }
     drop(wallets_guard);
 

@@ -74,6 +74,7 @@ pub async fn fetch_wallet_state(core: &Core) -> Result<()> {
         "Fetching wallet state for public key: {}",
         wallet_public_key.fingerprint()
     );
+    let script_hashes = current_wallet.script_hashes.clone();
 
     debug!("fetch_wallet_state: Attempting to get connected stream.");
     let mut stream_guard = core.get_connected_stream().await?;
@@ -83,8 +84,10 @@ pub async fn fetch_wallet_state(core: &Core) -> Result<()> {
         .expect("Expected an active TCP stream after connection attempt");
     let response_timeout = core.get_node_response_timeout().await;
 
-    let fetch_state_msg =
-        Message::Wallet(WalletMessage::FetchWalletState(wallet_public_key.clone()));
+    let fetch_state_msg = Message::Wallet(WalletMessage::FetchWalletState(
+        wallet_public_key.clone(),
+        script_hashes,
+    ));
     if let Err(e) = fetch_state_msg.send_async(stream_ref).await {
         *stream_guard = None;
         return Err(anyhow!("Failed to send FetchWalletState message: {}", e));
