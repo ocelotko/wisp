@@ -99,9 +99,14 @@ async fn unlock_wallet(
     name: String,
     password: String,
 ) -> Result<(), String> {
-    account::load_wallet(&state.core, &name, &password, &state.config_path)
-        .await
-        .map_err(|e| format!("Authentication failed: {}", e))
+    account::load_wallet(
+        Arc::clone(&state.core),
+        &name,
+        &password,
+        &state.config_path,
+    )
+    .await
+    .map_err(|e| format!("Authentication failed: {}", e))
 }
 
 #[tauri::command]
@@ -120,6 +125,41 @@ async fn get_wallet_state(
 }
 
 #[tauri::command]
+fn validate_address(address: String) -> bool {
+    wisp_core::address::Address::decode(&address).is_ok()
+}
+
+#[tauri::command]
+async fn get_node_status(state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let config = state.core.config.lock().await;
+    let stream = state.core.connected_node_stream.lock().await;
+    Ok(serde_json::json!({
+        "address": config.default_node,
+        "is_connected": stream.is_some(),
+    }))
+}
+
+#[tauri::command]
+async fn set_default_node_command(
+    state: tauri::State<'_, AppState>,
+    node_address: String,
+) -> Result<(), String> {
+    network::set_default_node(&state.core, &node_address, &state.config_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_wallet_command(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    account::delete_wallet(&state.core, &name, &state.config_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_current_wallet_info(
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
@@ -130,28 +170,86 @@ async fn get_current_wallet_info(
     // Convert the public key to hex string
     let pk_hex = hex::encode(wallet.public_key.0.to_encoded_point(true).as_bytes());
 
+    let first_aurora_address = crate::wallet::account::get_receive_addresses(&wallet)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|(label, _)| label.contains("Aurora"))
+        .map(|(_, addr)| addr);
+
     Ok(serde_json::json!({
         "name": wallet.name,
         "public_key": pk_hex,
+        "address_count": wallet.derived_public_keys.len(),
+        "first_aurora_address": first_aurora_address,
     }))
 }
 
 #[tauri::command]
-async fn refresh_wallet(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    network::fetch_wallet_state(&state.core)
+async fn get_wallet_addresses(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let wallet = crate::wallet::account::get_current_wallet(&state.core)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let addresses =
+        crate::wallet::account::get_receive_addresses(&wallet).map_err(|e| e.to_string())?;
+
+    Ok(addresses
+        .into_iter()
+        .map(|(label, address)| serde_json::json!({ "label": label, "address": address }))
+        .collect())
+}
+
+#[tauri::command]
+async fn change_password_command(
+    state: tauri::State<'_, AppState>,
+    current_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    crate::wallet::account::change_wallet_password(&state.core, &current_password, &new_password)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn get_wallet_balance(state: tauri::State<'_, AppState>) -> Result<u64, String> {
-    let utxos_guard = state.core.utxos.read().await;
-    let total_balance: u64 = utxos_guard
-        .values()
-        .map(|output| output.value.as_smallest_unit())
-        .sum();
+async fn export_seed_command(
+    state: tauri::State<'_, AppState>,
+    password: String,
+) -> Result<String, String> {
+    crate::wallet::account::export_seed_phrase(&state.core, &password)
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    Ok(total_balance)
+#[tauri::command]
+async fn generate_new_address_command(
+    state: tauri::State<'_, AppState>,
+    password: String,
+) -> Result<u32, String> {
+    crate::wallet::account::generate_new_address(Arc::clone(&state.core), &password)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn refresh_wallet(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let core_clone = Arc::clone(&state.core);
+    tokio::spawn(async move {
+        if let Err(e) = network::fetch_wallet_state(&core_clone).await {
+            log::error!("Manual refresh failed: {}", e);
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_wallet_summary(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::wallet::transaction::WalletSummary, String> {
+    crate::wallet::transaction::get_wallet_summary(&state.core)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -259,13 +357,11 @@ async fn get_recent_transactions(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Use the actual public key from the loaded wallet
-    let wallet_pk = wallet.public_key;
-    let pk_hash = wisp_core::address::Address::hash160(&wallet_pk);
-
     let mut enriched_txs = Vec::new();
 
     for tx_info in tx_guard.values() {
+        let mut value_from_us: u64 = 0;
+        let mut value_to_us: u64 = 0;
         let mut inputs_json = Vec::new();
 
         for input in &tx_info.transaction.inputs {
@@ -276,28 +372,56 @@ async fn get_recent_transactions(
                     .outputs
                     .get(input.outpoint.vout as usize)
                 {
+                    let is_ours = wallet.is_script_relevant(&output.script);
+                    if is_ours {
+                        value_from_us += output.value.as_smallest_unit();
+                    }
                     prev_out_json = json!({
                         "address": wisp_core::address::Address::encode(&output.script),
                         "value": output.value.as_smallest_unit(),
-                        "is_ours": output.script.is_relevant_to(&wallet_pk, &pk_hash, &std::collections::HashSet::new())
+                        "is_ours": is_ours,
                     });
                 }
             }
             inputs_json.push(json!({ "previous_output": prev_out_json }));
         }
 
-        let outputs_json: Vec<_> = tx_info
-            .transaction
-            .outputs
-            .iter()
-            .map(|o| {
-                json!({
-                    "address": wisp_core::address::Address::encode(&o.script),
-                    "value": o.value.as_smallest_unit(),
-                    "is_ours": o.script.is_relevant_to(&wallet_pk, &pk_hash, &std::collections::HashSet::new())
-                })
-            })
-            .collect();
+        let mut outputs_json = Vec::new();
+        for o in &tx_info.transaction.outputs {
+            let is_ours = wallet.is_script_relevant(&o.script);
+            if is_ours {
+                value_to_us += o.value.as_smallest_unit();
+            }
+            outputs_json.push(json!({
+                "address": wisp_core::address::Address::encode(&o.script),
+                "value": o.value.as_smallest_unit(),
+                "is_ours": is_ours
+            }));
+        }
+
+        // Determine the "UX" type of the transaction
+        let net_change = value_to_us as i128 - value_from_us as i128;
+        let (display_type, display_amount) = if tx_info.transaction.is_coinbase() {
+            ("Mining Reward", value_to_us)
+        } else if net_change < 0 {
+            // We sent more than we received (Outbound)
+            // The actual amount sent is the sum of outputs that are NOT ours
+            let sent_amount: u64 = tx_info
+                .transaction
+                .outputs
+                .iter()
+                .filter(|o| !wallet.is_script_relevant(&o.script))
+                .map(|o| o.value.as_smallest_unit())
+                .sum();
+            if sent_amount == 0 {
+                ("Self Transfer", (net_change.abs() as u64))
+            } else {
+                ("Sent", sent_amount)
+            }
+        } else {
+            // We received more than we spent (Inbound)
+            ("Received", net_change.abs() as u64)
+        };
 
         let tx_id = tx_info
             .transaction
@@ -310,6 +434,8 @@ async fn get_recent_transactions(
                 "id": tx_id,
                 "inputs": inputs_json,
                 "outputs": outputs_json,
+                "display_type": display_type,
+                "net_value": display_amount,
             },
             "status": tx_info.status,
             "block_timestamp": tx_info.block_timestamp,
@@ -318,9 +444,10 @@ async fn get_recent_transactions(
 
     // Sort by timestamp descending
     enriched_txs.sort_by(|a, b| {
-        b["block_timestamp"]
-            .as_str()
-            .cmp(&a["block_timestamp"].as_str())
+        let time_a = a["block_timestamp"].as_str().unwrap_or("");
+        let time_b = b["block_timestamp"].as_str().unwrap_or("");
+        // Newest first
+        time_b.cmp(time_a)
     });
 
     Ok(enriched_txs)
@@ -366,11 +493,19 @@ fn main() {
             recover_from_pk_command,
             unlock_wallet,
             refresh_wallet,
-            get_wallet_balance,
+            get_wallet_summary,
             get_recent_transactions,
             get_balance_history,
             get_current_wallet_info,
-            send_funds_command
+            send_funds_command,
+            get_wallet_addresses,
+            generate_new_address_command,
+            change_password_command,
+            export_seed_command,
+            validate_address,
+            get_node_status,
+            set_default_node_command,
+            delete_wallet_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

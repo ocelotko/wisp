@@ -15,12 +15,14 @@
     "@tauri-apps/plugin-opener": "^2",
     "qrcode.react": "^4.2.0",
     "react": "^19.1.0",
+    "react-copy-to-clipboard": "^5.1.1",
     "react-dom": "^19.1.0",
     "recharts": "^3.6.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "@types/react": "^19.1.8",
+    "@types/react-copy-to-clipboard": "^5.0.7",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
     "autoprefixer": "^10.4.23",

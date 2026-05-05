@@ -4,12 +4,12 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use k256::ecdsa::signature::Signer;
 use log::{info, warn};
+use serde::Serialize;
 
 use wisp_core::{
     currency::Amount,
     network::{Message, TransactionStatus, WalletMessage, WalletTransactionInfo},
-    signatures::PublicKey,
-    transactions::{OutPoint, Transaction, TransactionInput, TransactionOutput},
+    transactions::{OutPoint, Script, Transaction, TransactionInput, TransactionOutput},
 };
 
 use crate::wallet::{
@@ -17,6 +17,15 @@ use crate::wallet::{
     core::Core,
     types::FeeType,
 };
+
+#[derive(Serialize)]
+pub struct WalletSummary {
+    pub confirmed_balance: u64,
+    pub pending_net_change: i128,
+    pub total_balance: u64,
+    pub utxo_count: usize,
+    pub pending_tx_count: usize,
+}
 
 pub async fn get_total_balance(core: &Core) -> Result<Amount> {
     let utxos_guard = core.utxos.read().await;
@@ -51,6 +60,45 @@ pub async fn get_total_balance(core: &Core) -> Result<Amount> {
     Ok(Amount::from_smallest_unit(total_balance_units))
 }
 
+pub async fn get_wallet_summary(core: &Core) -> Result<WalletSummary> {
+    let utxos_guard = core.utxos.read().await;
+    let transactions_guard = core.transactions.read().await;
+    let wallet = get_current_wallet(core).await?;
+
+    let confirmed_balance: u64 = utxos_guard
+        .values()
+        .map(|o| o.value.as_smallest_unit())
+        .sum();
+    let mut pending_net_change: i128 = 0;
+    let mut pending_tx_count = 0;
+
+    for tx_info in transactions_guard.values() {
+        if tx_info.status == TransactionStatus::Pending {
+            pending_tx_count += 1;
+            for input in &tx_info.transaction.inputs {
+                if let Some(spent) = utxos_guard.get(&input.outpoint) {
+                    if wallet.is_script_relevant(&spent.script) {
+                        pending_net_change -= spent.value.as_smallest_unit() as i128;
+                    }
+                }
+            }
+            for output in &tx_info.transaction.outputs {
+                if wallet.is_script_relevant(&output.script) {
+                    pending_net_change += output.value.as_smallest_unit() as i128;
+                }
+            }
+        }
+    }
+
+    Ok(WalletSummary {
+        confirmed_balance,
+        pending_net_change,
+        total_balance: (confirmed_balance as i128 + pending_net_change).max(0) as u64,
+        utxo_count: utxos_guard.len(),
+        pending_tx_count,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn send_funds(
     core: &Core,
@@ -67,9 +115,8 @@ pub async fn send_funds(
         .await
         .context("Incorrect wallet password or decryption failed")?;
 
-    let recipient_public_key = recipient_public_key_str
-        .parse::<PublicKey>()
-        .context("Invalid recipient public key format")?;
+    let recipient_script = wisp_core::address::Address::decode(&recipient_public_key_str)
+        .context("Invalid recipient address format")?;
 
     let intended_fee = if !is_send_max {
         match fee_type {
@@ -102,8 +149,8 @@ pub async fn send_funds(
         if is_send_max || (current_input_sum < total_required) {
             selected_inputs.push(TransactionInput {
                 outpoint: *outpoint,
-                signature: None,
-                coinbase_data: None,
+                public_key: Some(sender_private_key.public_key()),
+                ..Default::default()
             });
             current_input_sum = current_input_sum
                 .checked_add(utxo_output.value)
@@ -139,7 +186,7 @@ pub async fn send_funds(
     let mut outputs: Vec<TransactionOutput> = Vec::new();
     outputs.push(TransactionOutput {
         value: final_amount_to_send,
-        pubkey: recipient_public_key,
+        script: recipient_script,
     });
 
     let total_to_distribute = final_amount_to_send
@@ -152,7 +199,7 @@ pub async fn send_funds(
     if change_amount > Amount::zero() {
         outputs.push(TransactionOutput {
             value: change_amount,
-            pubkey: current_wallet.public_key,
+            script: Script::new_aurora(&current_wallet.public_key),
         });
     }
 
@@ -226,7 +273,7 @@ pub async fn send_funds(
                 utxos_guard.remove(&input.outpoint);
             }
             for (vout, output) in new_transaction.outputs.iter().enumerate() {
-                if output.pubkey == current_wallet.public_key {
+                if current_wallet.is_script_relevant(&output.script) {
                     utxos_guard.insert(
                         OutPoint {
                             txid: final_txid,

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aes_gcm::{
     aead::{Aead, KeyInit},
@@ -17,7 +18,7 @@ use rand::TryRngCore;
 use wisp_core::{
     address::Address,
     sha256::{hash, Hash},
-    signatures::{PrivateKey, PublicKey},
+    signatures::PrivateKey,
     transactions::Script,
 };
 
@@ -39,9 +40,11 @@ pub async fn create_wallet(
     password: &str,
     config_path: &PathBuf,
 ) -> Result<String> {
-    let mut wallets_guard = core.wallets.lock().await;
-    if wallets_guard.iter().any(|w| w.name == name) {
-        return Err(anyhow!("Wallet with name '{}' already exists", name));
+    {
+        let wallets_guard = core.wallets.lock().await;
+        if wallets_guard.iter().any(|w| w.name == name) {
+            return Err(anyhow!("Wallet with name '{}' already exists", name));
+        }
     }
 
     let mut rng = OsRng;
@@ -61,11 +64,14 @@ pub async fn create_wallet(
         .try_fill_bytes(&mut salt)
         .map_err(|e| anyhow!("Failed to fill bytes for salt: {}", e))?;
 
-    let hash_160 = Address::hash160(&public_key);
-    let mut h_bytes = [0u8; 32];
-    h_bytes[..20].copy_from_slice(&hash_160);
     let mut script_hashes = HashSet::new();
-    script_hashes.insert(Hash::from_bytes(&h_bytes));
+
+    let mut derived_public_keys = Vec::new();
+    for i in 0..GAP_LIMIT {
+        let pk = derive_key_from_mnemonic(&mnemonic, i)?.public_key();
+        derived_public_keys.push(pk);
+        script_hashes.insert(pk_to_script_hash(&pk));
+    }
 
     let encrypted_private_key = encrypt_private_key(&private_key, password, &salt)?;
     let encrypted_seed_phrase = Some(encrypt_data(phrase.as_bytes(), password, &salt)?);
@@ -76,7 +82,7 @@ pub async fn create_wallet(
         public_key,
         salt,
         encrypted_seed_phrase,
-        derived_public_keys: vec![public_key],
+        derived_public_keys,
         script_hashes,
     };
 
@@ -88,7 +94,10 @@ pub async fn create_wallet(
     }
 
     let loaded_wallet = SavedWallet::load_from_file(&core.data_dir, name, password)?;
-    wallets_guard.push(loaded_wallet);
+    {
+        let mut wallets_guard = core.wallets.lock().await;
+        wallets_guard.push(loaded_wallet);
+    }
 
     info!("Wallet '{}' created successfully!", name);
     Ok(phrase)
@@ -101,9 +110,11 @@ pub async fn recover_wallet_with_key(
     private_key_hex: &str,
     config_path: &PathBuf,
 ) -> Result<()> {
-    let mut wallets_guard = core.wallets.lock().await;
-    if wallets_guard.iter().any(|w| w.name == name) {
-        return Err(anyhow!("Wallet with name '{}' already exists", name));
+    {
+        let wallets_guard = core.wallets.lock().await;
+        if wallets_guard.iter().any(|w| w.name == name) {
+            return Err(anyhow!("Wallet with name '{}' already exists", name));
+        }
     }
 
     let private_key_bytes =
@@ -113,11 +124,13 @@ pub async fn recover_wallet_with_key(
     let private_key = PrivateKey(signing_key);
     let public_key = private_key.public_key();
 
-    let hash_160 = Address::hash160(&public_key);
-    let mut h_bytes = [0u8; 32];
-    h_bytes[..20].copy_from_slice(&hash_160);
     let mut script_hashes = HashSet::new();
-    script_hashes.insert(Hash::from_bytes(&h_bytes));
+
+    let mut derived_public_keys = Vec::new();
+    // For key import, we only have the single key, so we add it directly.
+    // No HD derivation from a raw key.
+    derived_public_keys.push(public_key);
+    script_hashes.insert(pk_to_script_hash(&public_key));
 
     let mut rng = OsRng;
     let mut salt = vec![0u8; SALT_SIZE];
@@ -132,7 +145,7 @@ pub async fn recover_wallet_with_key(
         public_key,
         salt,
         encrypted_seed_phrase: None,
-        derived_public_keys: vec![public_key],
+        derived_public_keys,
         script_hashes,
     };
 
@@ -144,7 +157,10 @@ pub async fn recover_wallet_with_key(
     }
 
     let loaded_wallet = SavedWallet::load_from_file(&core.data_dir, name, password)?;
-    wallets_guard.push(loaded_wallet);
+    {
+        let mut wallets_guard = core.wallets.lock().await;
+        wallets_guard.push(loaded_wallet);
+    }
 
     info!("Wallet '{}' recovered successfully!", name);
     Ok(())
@@ -157,9 +173,11 @@ pub async fn recover_wallet_with_seed(
     seed_phrase: &str,
     config_path: &PathBuf,
 ) -> Result<()> {
-    let mut wallets_guard = core.wallets.lock().await;
-    if wallets_guard.iter().any(|w| w.name == name) {
-        return Err(anyhow!("Wallet with name '{}' already exists", name));
+    {
+        let wallets_guard = core.wallets.lock().await;
+        if wallets_guard.iter().any(|w| w.name == name) {
+            return Err(anyhow!("Wallet with name '{}' already exists", name));
+        }
     }
 
     let mnemonic =
@@ -168,11 +186,14 @@ pub async fn recover_wallet_with_seed(
     let private_key = derive_key_from_mnemonic(&mnemonic, 0)?;
     let public_key = private_key.public_key();
 
-    let hash_160 = Address::hash160(&public_key);
-    let mut h_bytes = [0u8; 32];
-    h_bytes[..20].copy_from_slice(&hash_160);
     let mut script_hashes = HashSet::new();
-    script_hashes.insert(Hash::from_bytes(&h_bytes));
+
+    let mut derived_public_keys = Vec::new();
+    for i in 0..GAP_LIMIT {
+        let pk = derive_key_from_mnemonic(&mnemonic, i)?.public_key();
+        derived_public_keys.push(pk);
+        script_hashes.insert(pk_to_script_hash(&pk));
+    }
 
     let mut rng = OsRng;
     let mut salt = vec![0u8; SALT_SIZE];
@@ -188,7 +209,7 @@ pub async fn recover_wallet_with_seed(
         public_key,
         salt,
         encrypted_seed_phrase,
-        derived_public_keys: vec![public_key],
+        derived_public_keys,
         script_hashes,
     };
 
@@ -200,7 +221,10 @@ pub async fn recover_wallet_with_seed(
     }
 
     let loaded_wallet = SavedWallet::load_from_file(&core.data_dir, name, password)?;
-    wallets_guard.push(loaded_wallet);
+    {
+        let mut wallets_guard = core.wallets.lock().await;
+        wallets_guard.push(loaded_wallet);
+    }
 
     info!("Wallet '{}' recovered from seed successfully!", name);
     Ok(())
@@ -224,14 +248,13 @@ pub async fn load_wallets() -> Result<Vec<String>> {
 }
 
 pub async fn load_wallet(
-    core: &Core,
+    core: Arc<Core>,
     name: &str,
     password: &str,
     config_path: &PathBuf,
 ) -> Result<()> {
     info!("Loading wallet: {}", name);
 
-    // Decrypt wallet file. This is the main blocking operation and also serves as password validation.
     let data_dir_clone = core.data_dir.clone();
     let name_clone = name.to_string();
     let password_clone = password.to_string();
@@ -247,15 +270,10 @@ pub async fn load_wallet(
         name
     );
 
-    // Ensure all derived keys have their hashes in the watch-list
     let mut wallet = loaded_wallet;
     let mut updated = false;
     for pk in &wallet.derived_public_keys {
-        let hash_160 = Address::hash160(pk);
-        let mut h_bytes = [0u8; 32];
-        h_bytes[..20].copy_from_slice(&hash_160);
-        let h = Hash::from_bytes(&h_bytes);
-        if wallet.script_hashes.insert(h) {
+        if wallet.script_hashes.insert(pk_to_script_hash(pk)) {
             updated = true;
         }
     }
@@ -270,10 +288,6 @@ pub async fn load_wallet(
         .await??;
     }
 
-    // --- Atomic State Switch ---
-    // Clear old wallet state before doing anything else. This prevents the UI from showing
-    // stale data from the previous wallet. Any queries between now and when the new state
-    // is fetched will return an empty/zero state, which is correct behavior during a switch.
     core.utxos.write().await.clear();
     core.transactions.write().await.clear();
     info!("Cleared wallet state (UTXOs and transactions) for wallet switch.");
@@ -290,9 +304,58 @@ pub async fn load_wallet(
         core.save_config(config_path, &*config_guard).await?;
     }
 
-    fetch_wallet_state(core).await?;
-    info!("Wallet '{}' loaded and state fetched.", name);
+    let core_clone = core.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fetch_wallet_state(&core_clone).await {
+            log::error!("Background fetch failed after wallet load: {}", e);
+        }
+    });
+
+    info!("Wallet '{}' loaded locally. Syncing in background.", name);
     Ok(())
+}
+
+pub async fn generate_new_address(core: Arc<Core>, password: &str) -> Result<u32> {
+    let mut wallet = get_current_wallet(&core).await?;
+
+    let phrase_enc = wallet.encrypted_seed_phrase.as_ref().ok_or_else(|| {
+        anyhow!("Wallet was imported without a seed phrase; cannot derive new addresses.")
+    })?;
+
+    let phrase_bytes = decrypt_data(phrase_enc, password, &wallet.salt)?;
+    let phrase = String::from_utf8(phrase_bytes)?;
+    let mnemonic = Mnemonic::parse(&phrase)?;
+
+    let index = wallet.derived_public_keys.len() as u32;
+    let new_pk = derive_key_from_mnemonic(&mnemonic, index)?.public_key();
+
+    wallet.derived_public_keys.push(new_pk);
+    wallet.script_hashes.insert(pk_to_script_hash(&new_pk));
+
+    let wallet_to_save = wallet.clone();
+    let data_dir_clone = core.data_dir.clone();
+    let password_clone = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        wallet_to_save.save_to_file(&data_dir_clone, &password_clone)
+    })
+    .await
+    .context("Failed to await wallet save blocking task")??;
+
+    {
+        let mut wallets = core.wallets.lock().await;
+        if let Some(w) = wallets.iter_mut().find(|w| w.name == wallet.name) {
+            *w = wallet;
+        }
+    }
+
+    let core_clone = core.clone();
+    tokio::spawn(async move {
+        if let Err(e) = fetch_wallet_state(&core_clone).await {
+            log::error!("Background fetch failed after address generation: {}", e);
+        }
+    });
+
+    Ok(index)
 }
 
 pub async fn get_current_wallet(core: &Core) -> Result<SavedWallet> {
@@ -308,6 +371,43 @@ pub async fn get_current_wallet(core: &Core) -> Result<SavedWallet> {
         }
         None => Err(anyhow!("No wallet loaded")),
     }
+}
+
+pub fn get_receive_addresses(wallet: &SavedWallet) -> Result<Vec<(String, String)>> {
+    let mut list = Vec::new();
+    for (i, pk) in wallet.derived_public_keys.iter().enumerate() {
+        list.extend(format_addresses(pk, i as u32)?);
+    }
+    Ok(list)
+}
+
+fn format_addresses(
+    pk: &wisp_core::signatures::PublicKey,
+    index: u32,
+) -> Result<Vec<(String, String)>> {
+    let h = pk_to_script_hash(pk);
+
+    Ok(vec![
+        (
+            format!("Address #{} (Aurora):", index + 1),
+            Address::encode(&Script::Aurora(h)),
+        ),
+        (
+            format!("Address #{} (Shadow):", index + 1),
+            Address::encode(&Script::Shadow(h)),
+        ),
+        (
+            format!("Address #{} (Classic):", index + 1),
+            Address::encode(&Script::Classic(*pk)),
+        ),
+    ])
+}
+
+fn pk_to_script_hash(pk: &wisp_core::signatures::PublicKey) -> Hash {
+    let hash_160 = Address::hash160(pk);
+    let mut h_bytes = [0u8; 32];
+    h_bytes[..20].copy_from_slice(&hash_160);
+    Hash::from_bytes(&h_bytes)
 }
 
 pub async fn decrypt_current_wallet_private_key(core: &Core, password: &str) -> Result<PrivateKey> {

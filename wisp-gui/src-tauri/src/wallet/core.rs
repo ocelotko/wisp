@@ -76,13 +76,13 @@ impl Core {
     }
 
     pub(crate) async fn get_connected_stream(&self) -> Result<MutexGuard<'_, Option<TcpStream>>> {
+        let node_address = self.get_default_node_address().await;
+        let connect_timeout =
+            Duration::from_secs(self.config.lock().await.node_connect_timeout_secs);
+
         let mut stream_lock = self.connected_node_stream.lock().await;
 
         if stream_lock.is_none() {
-            let node_address = self.get_default_node_address().await;
-            let connect_timeout =
-                Duration::from_secs(self.config.lock().await.node_connect_timeout_secs);
-
             info!("Attempting to connect to node at: {}", node_address);
             let stream = match timeout(connect_timeout, TcpStream::connect(&node_address)).await {
                 Ok(Ok(s)) => s,

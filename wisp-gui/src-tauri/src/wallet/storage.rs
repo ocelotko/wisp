@@ -120,6 +120,13 @@ impl SavedWallet {
         Ok(wallet)
     }
 
+    pub fn is_script_relevant(&self, script: &Script) -> bool {
+        self.derived_public_keys.iter().any(|pk| {
+            let pk_hash = Address::hash160(pk);
+            script.is_relevant_to(pk, &pk_hash, &self.script_hashes)
+        })
+    }
+
     pub fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<Vec<u8>> {
         let params = ParamsBuilder::new()
             .t_cost(1)

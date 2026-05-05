@@ -1,7 +1,6 @@
 /target
 /wisp-wallet/wallet_data
 /wisp-wallet/config.toml
-/wisp-node/wisp_db
 /wisp_wallet_app
 /wisp-wallet-old
 Cargo.lock

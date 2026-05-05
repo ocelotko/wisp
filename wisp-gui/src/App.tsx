@@ -4,12 +4,12 @@ import Button from "./components/Button";
 import IconButton from "./components/IconButton";
 import { invoke } from "@tauri-apps/api/core";
 import { CreateWalletModal } from "./components/CreateWalletModal";
-import { ReceiveModal } from "./components/ReceiveModal";
 import { RecoverWalletModal } from "./components/RecoverWalletModal";
 import { UnlockWalletModal } from "./components/UnlockWalletModal";
 import WalletButton from "./components/WalletButton";
 import BalanceChart from "./components/BalanceChart";
 import { SendModal } from "./components/SendModal";
+import { AddressManagementModal } from "./components/AddressManagementModal";
 
 type View = "home" | "settings";
 
@@ -18,15 +18,19 @@ const App = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [activeModal, setActiveModal] = useState<
-    "create" | "recover" | "send" | "receive" | null
+    "create" | "recover" | "send" | "addresses" | null
   >(null);
+
+  const closeModals = () => {
+    setActiveModal(null);
+    setPendingWallet(null);
+  };
 
   const [wallets, setWallets] = useState<string[]>([]);
   const [activeWallet, setActiveWallet] = useState<string | null>(null);
   const [pendingWallet, setPendingWallet] = useState<string | null>(null);
   const [unlockedWallet, setUnlockedWallet] = useState<string | null>(null);
-
-  const [unlockedWalletPk, setUnlockedWalletPk] = useState<string | null>(null);
+  const [, setUnlockedWalletPk] = useState<string | null>(null);
   const [balance, setBalance] = useState<number>(0);
   const [transactions, setTransactions] = useState<any[]>([]);
   const [history, setHistory] = useState<any[]>([]);
@@ -48,16 +52,16 @@ const App = () => {
   const syncUI = async () => {
     if (!unlockedWallet) return;
     try {
-      const [balance, walletInfo, historyData, enrichedTxs] = await Promise.all(
+      const [summary, walletInfo, historyData, enrichedTxs] = await Promise.all(
         [
-          invoke<number>("get_wallet_balance"),
+          invoke<any>("get_wallet_summary"),
           invoke<any>("get_current_wallet_info"),
           invoke<any[]>("get_balance_history"),
           invoke<any[]>("get_recent_transactions"),
         ],
       );
 
-      setBalance(balance);
+      setBalance(summary.total_balance);
       setUnlockedWalletPk(walletInfo.public_key);
       setHistory(historyData);
       setTransactions(enrichedTxs);
@@ -81,6 +85,14 @@ const App = () => {
 
   useEffect(() => {
     loadWallets();
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeModals();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   useEffect(() => {
@@ -222,6 +234,7 @@ const App = () => {
                 <IconButton
                   icon={PlusIcon}
                   onClick={() => setShowAddMenu(!showAddMenu)}
+                  className="focus:outline-none"
                 />
                 {showAddMenu && (
                   <div className="absolute right-4 top-8 z-50 w-48 bg-dark-surfaceContainerHigh rounded-xl shadow-xl border border-dark-outlineVariant overflow-hidden animate-in fade-in zoom-in-95 duration-100 origin-top-right">
@@ -292,14 +305,16 @@ const App = () => {
                       icon={SendIcon}
                       onClick={() => setActiveModal("send")}
                       disabled={!unlockedWallet}
+                      className="focus:outline-none"
                     >
                       Send
                     </Button>
                     <Button
                       variant="ghost"
                       icon={ReceiveIcon}
-                      onClick={() => setActiveModal("receive")}
+                      onClick={() => setActiveModal("addresses")}
                       disabled={!unlockedWallet}
+                      className="focus:outline-none"
                     >
                       Receive
                     </Button>
@@ -308,13 +323,12 @@ const App = () => {
                     <IconButton
                       icon={RefreshIcon}
                       onClick={handleRefresh}
-                      className={
-                        isRefreshing ? "animate-spin text-dark-primary" : ""
-                      }
+                      className={`focus:outline-none ${isRefreshing ? "animate-spin text-dark-primary" : ""}`}
                     />
                     <IconButton
                       icon={SettingsIcon}
                       onClick={() => console.log("Settings")}
+                      className="focus:outline-none"
                     />
                   </div>
                 </div>
@@ -401,6 +415,13 @@ const App = () => {
         </main>
       </div>
 
+      {(activeModal || pendingWallet) && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200"
+          onClick={closeModals}
+        />
+      )}
+
       {activeModal === "create" && (
         <CreateWalletModal
           onClose={() => setActiveModal(null)}
@@ -423,7 +444,6 @@ const App = () => {
         <SendModal
           onClose={() => setActiveModal(null)}
           onSuccess={() => {
-            // Refresh data after sending
             setTimeout(() => {
               handleRefresh();
             }, 500);
@@ -432,10 +452,10 @@ const App = () => {
         />
       )}
 
-      {activeModal === "receive" && unlockedWallet && (
-        <ReceiveModal
+      {activeModal === "addresses" && unlockedWallet && (
+        <AddressManagementModal
           onClose={() => setActiveModal(null)}
-          address={unlockedWalletPk}
+          walletName={unlockedWallet}
         />
       )}
 

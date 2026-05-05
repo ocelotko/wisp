@@ -144,7 +144,6 @@ pub async fn fetch_wallet_state(core: &Core) -> Result<()> {
 pub async fn fetch_incremental_state(core: &Core) -> Result<()> {
     let current_wallet = get_current_wallet(core).await?;
 
-    // 1. Determine local high-water mark
     let last_height = {
         let txs = core.transactions.read().await;
         txs.values()
@@ -156,27 +155,22 @@ pub async fn fetch_incremental_state(core: &Core) -> Result<()> {
     let mut stream_guard = core.get_connected_stream().await?;
     let stream_ref = stream_guard.as_mut().unwrap();
 
-    // 2. Request only what's new
     let msg = Message::Wallet(WalletMessage::FetchWalletUpdates {
         public_key: current_wallet.public_key.clone(),
         since_height: last_height,
     });
     msg.send_async(stream_ref).await?;
 
-    // 3. Receive and MERGE
     if let Message::Wallet(WalletMessage::WalletUpdates(updates)) =
         Message::receive_async(stream_ref).await?
     {
-        // Merge Transactions
         {
             let mut tx_lock = core.transactions.write().await;
             for tx_info in updates.transactions {
-                // This overwrites Pending with Confirmed if the ID matches
                 tx_lock.insert(tx_info.transaction.txid()?, tx_info);
             }
         }
 
-        // Merge UTXOs
         {
             let mut utxo_lock = core.utxos.write().await;
             for (outpoint, output) in updates.utxos {
