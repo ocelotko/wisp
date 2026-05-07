@@ -3,4 +3,5 @@
 /wisp-wallet/config.toml
 /wisp_wallet_app
 /wisp-wallet-old
+/wisp-node/wisp_db
 Cargo.lock

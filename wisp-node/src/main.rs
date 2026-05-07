@@ -274,7 +274,7 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16, proxy: O
         let blockchain = BLOCKCHAIN.get().unwrap().read().await;
         let local_chain_height = blockchain.block_height().unwrap_or(0);
 
-        let (longest_peer_info, new_peers) =
+        let (longest_peer_info, established_nodes) =
             match utils::populate_connections(&nodes, self_port, &blockchain, proxy.as_deref())
                 .await
             {
@@ -324,8 +324,9 @@ async fn initial_sync_and_discovery(nodes: Vec<String>, self_port: u16, proxy: O
             }
         }
 
-        for node_addr in new_peers {
+        for node_addr in established_nodes {
             if let Some(peer) = crate::NODES.get(&node_addr) {
+                info!("Starting connection handler for {}", node_addr);
                 let stream_arc = peer.value().clone();
                 let addr_clone = node_addr.clone();
                 tokio::spawn(async move {

@@ -20,37 +20,60 @@ pub async fn populate_connections(
     info!("Attempting to connect to nodes: {:?}", nodes);
     let mut longest_peer: Option<(String, u64)> = None;
     let mut discovered_peers: Vec<String> = Vec::new();
+    let mut join_set = tokio::task::JoinSet::new();
+
+    let blockchain_arc = std::sync::Arc::new(blockchain.clone());
+    let mut successful_nodes = Vec::new();
 
     for node in nodes {
-        info!("Connecting to node: {}", node);
-        match time::timeout(Duration::from_secs(60), connect_to_node(node, proxy)).await {
+        let node_addr = node.clone();
+        let proxy = proxy.map(|s| s.to_string());
+        let bc_clone = blockchain_arc.clone();
+
+        join_set.spawn(async move {
+            info!("Connecting to node: {}", node_addr);
+            let stream_res = time::timeout(
+                Duration::from_secs(60),
+                connect_to_node(&node_addr, proxy.as_deref()),
+            )
+            .await;
+            (node_addr, stream_res, bc_clone)
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        let (node, connection_res, bc) = res?;
+        match connection_res {
             Ok(Ok(mut stream)) => {
-                if let Err(e) = perform_handshake(
+                let mut peer_longest = None;
+                let mut peer_discovered = Vec::new();
+
+                match perform_handshake(
                     &mut stream,
-                    node,
+                    &node,
                     self_port,
-                    blockchain,
-                    &mut longest_peer,
-                    &mut discovered_peers,
+                    &bc,
+                    &mut peer_longest,
+                    &mut peer_discovered,
                 )
                 .await
                 {
-                    warn!("Handshake with {} failed: {}", node, e);
-                } else if !crate::NODES.contains_key(node) {
-                    let stream_arc = std::sync::Arc::new(tokio::sync::Mutex::new(stream));
-                    crate::NODES.insert(node.to_string(), stream_arc.clone());
-                    info!("Handshake successful. Added initial node: {}", node);
+                    Ok(_) => {
+                        if !crate::NODES.contains_key(&node) {
+                            let stream_arc = std::sync::Arc::new(tokio::sync::Mutex::new(stream));
+                            crate::NODES.insert(node.to_string(), stream_arc.clone());
+                            info!("Handshake successful. Added initial node: {}", node);
+                            successful_nodes.push(node.clone());
+                        }
 
-                    let addr_clone = node.to_string();
-                    let socket_addr = stream_arc.lock().await.peer_addr()?;
-                    tokio::spawn(async move {
-                        let _ = crate::connection::handle_connection(
-                            stream_arc,
-                            socket_addr,
-                            Some(addr_clone),
-                        )
-                        .await;
-                    });
+                        discovered_peers.extend(peer_discovered);
+                        if let Some((addr, height)) = peer_longest {
+                            if longest_peer.as_ref().map_or(true, |(_, h)| height > *h) {
+                                longest_peer = Some((addr, height));
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Handshake with {} failed: {}", node, e),
                 }
             }
             Ok(Err(e)) => {
@@ -61,7 +84,7 @@ pub async fn populate_connections(
             }
         }
     }
-    Ok((longest_peer, discovered_peers))
+    Ok((longest_peer, successful_nodes))
 }
 
 async fn perform_handshake(

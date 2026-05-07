@@ -166,25 +166,17 @@ pub async fn handle_connection(
                         addr, their_height, our_height
                     );
 
-                    let stream_for_sync = stream_arc.clone();
-                    let peer_addr_for_log =
-                        peer_guard.addr.clone().unwrap_or_else(|| addr.to_string());
-                    tokio::spawn(async move {
-                        info!("Starting background sync with peer {}", peer_addr_for_log);
-                        let mut stream_lock = stream_for_sync.lock().await;
-                        if let Err(e) = crate::utils::download_blockchain_with_existing_stream(
-                            &mut *stream_lock,
-                            &peer_addr_for_log,
-                            their_height + 1,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "Background sync from {} failed: {}. The connection may be closed.",
-                                peer_addr_for_log, e
-                            );
-                        }
-                    });
+                    let peer_addr_str = peer_guard.addr.clone().unwrap_or_else(|| addr.to_string());
+                    let mut stream_lock = stream_arc.lock().await;
+                    if let Err(e) = crate::utils::download_blockchain_with_existing_stream(
+                        &mut *stream_lock,
+                        &peer_addr_str,
+                        their_height + 1,
+                    )
+                    .await
+                    {
+                        warn!("Sync with {} failed: {}", peer_addr_str, e);
+                    }
                 } else {
                     info!(
                         "Peer {} has chain height {}. Our height is {}.",
